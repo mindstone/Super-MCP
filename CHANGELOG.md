@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Documentation
+- **`docs/TIMEOUT_CONFIGURATION.md` and `src/types.ts` JSDoc updated to reflect the 30-minute default**. The default tool execution timeout was raised from 300,000ms (5 minutes) to 1,800,000ms (30 minutes) in commit `035f2fb` (no version bump at the time) to align with Rebel Core's `TOOL_CALL_TIMEOUT`, but the documentation kept claiming 5 minutes. Source of truth lives in `src/clients/stdioClient.ts` and `src/clients/httpClient.ts` as the `'1800000'` env-var fallback.
+
 ### Fixed
 - **`use_tool` outer `isError` now correctly propagates the wrapped tool's `isError` verdict** (#TBD). Previously, the outer envelope hardcoded `isError: false` on all non-throwing return paths, hiding application-level tool failures from MCP-spec-compliant clients. The fix aligns with the canonical MCP spec (`CallToolResult.isError` reflects tool-level failure, not transport-level success). Clients that drilled into `result.result.isError` as a workaround can now read outer `isError` directly; the workaround still works (body content is unchanged).
 

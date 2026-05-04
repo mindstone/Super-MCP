@@ -15,7 +15,7 @@ export interface StandardServerConfig {
   type?: "stdio" | "sse" | "http";
   url?: string;
   headers?: Record<string, string>;
-  // Tool execution timeout in milliseconds (default: 300000ms = 5 minutes)
+  // Tool execution timeout in milliseconds (default: 1800000ms = 30 minutes)
   // Can be overridden by SUPER_MCP_TOOL_TIMEOUT environment variable
   timeout?: number;
 }

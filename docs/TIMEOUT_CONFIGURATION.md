@@ -17,7 +17,9 @@ Timeouts are resolved in the following order (highest priority first):
 
 1. **Per-server `timeout` field** — Set in the server configuration
 2. **`SUPER_MCP_TOOL_TIMEOUT` environment variable** — Global override
-3. **Default: 300,000ms (5 minutes)** — Fallback when neither is set
+3. **Default: 1,800,000ms (30 minutes)** — Fallback when neither is set
+
+The default lives in `src/clients/stdioClient.ts` and `src/clients/httpClient.ts` as the literal `'1800000'` env-var fallback. It was raised from 5 min to 30 min to align with Rebel Core's `TOOL_CALL_TIMEOUT` so long-running tools (deep research, browser pair waiting, large data queries, human-in-the-loop flows) aren't killed at the super-mcp layer before the outer Rebel timer fires.
 
 ---
 
@@ -109,6 +111,7 @@ When you see this error:
 
 ## History
 
+- **Post-v2.5.0** (commit `035f2fb`): Default timeout raised from 300,000ms (5 minutes) to 1,800,000ms (30 minutes) to align both stdio and HTTP client defaults with Rebel Core's `TOOL_CALL_TIMEOUT`. Long-running tools (deep research, Rebel Browser pair waiting, large data queries, human-in-the-loop flows) were being killed at the super-mcp layer before the outer Rebel timer fired.
 - **v1.4.0**: Default timeout changed from 60,000ms (1 minute) to 300,000ms (5 minutes) to better support long-running operations like research and AI generation.
 
 ---
