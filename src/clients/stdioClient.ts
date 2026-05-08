@@ -313,13 +313,14 @@ export class StdioMcpClient implements McpClient {
   }
 
   async callTool(name: string, args: any): Promise<any> {
-    // 30min default — aligned with httpClient.ts and Rebel Core's TOOL_CALL_TIMEOUT
+    // 4h sentinel — aligned with httpClient.ts and Rebel Core's TOOL_CALL_TIMEOUT
     // so long-running tools (deep research, Rebel Browser pair waiting, large data
-    // queries) are not killed by the upstream layer before the outer timers fire.
-    // RebelAppBridge is stdio-only, so raising the stdio default is required for
-    // rebel_bridge_wait_pair_event's 10min window to be honored end-to-end.
+    // queries) are never killed by the upstream layer before the outer timers fire.
+    // The agent-turn watchdog (Layer 2) is the real effective ceiling. RebelAppBridge
+    // is stdio-only, so raising the stdio default is required for rebel_bridge_wait_pair_event's
+    // 10min window to be honored end-to-end.
     const timeout = this.config.timeout ||
-                    parseInt(process.env.SUPER_MCP_TOOL_TIMEOUT || '1800000');
+                    parseInt(process.env.SUPER_MCP_TOOL_TIMEOUT || '14400000');
 
     logger.info("Calling tool on stdio MCP", {
       package_id: this.packageId,

@@ -417,12 +417,13 @@ export class HttpMcpClient implements McpClient {
       throw new Error(`Package '${this.packageId}' is not connected`);
     }
 
-    // 30min default — aligned with Rebel Core's TOOL_CALL_TIMEOUT so this upstream
-    // layer doesn't kill long-running tools (deep research, pair waiting, large
-    // data queries) before the outer layer's timer fires. Env var overrides for
-    // ops tuning. See: src/core/rebelCore/mcpClient.ts.
+    // 4h sentinel — aligned with Rebel Core's TOOL_CALL_TIMEOUT so this upstream
+    // layer never kills long-running tools (deep research, pair waiting, large
+    // data queries) before the outer layer's timer fires. The agent-turn watchdog
+    // (Layer 2) is the real effective ceiling. Env var overrides for ops tuning.
+    // See: src/core/rebelCore/mcpClient.ts.
     const timeout = this.config.timeout ||
-                    parseInt(process.env.SUPER_MCP_TOOL_TIMEOUT || '1800000');
+                    parseInt(process.env.SUPER_MCP_TOOL_TIMEOUT || '14400000');
 
     logger.info("Calling tool on HTTP MCP", {
       package_id: this.packageId,

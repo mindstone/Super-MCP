@@ -15,8 +15,9 @@ export interface StandardServerConfig {
   type?: "stdio" | "sse" | "http";
   url?: string;
   headers?: Record<string, string>;
-  // Tool execution timeout in milliseconds (default: 1800000ms = 30 minutes)
-  // Can be overridden by SUPER_MCP_TOOL_TIMEOUT environment variable
+  // Tool execution timeout in milliseconds (default: 14400000ms = 4 hours sentinel)
+  // The Rebel Core agent-turn watchdog is the real effective ceiling; this is the
+  // last-resort upstream cap. Can be overridden by SUPER_MCP_TOOL_TIMEOUT environment variable.
   timeout?: number;
 }
 
