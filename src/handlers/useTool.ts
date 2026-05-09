@@ -1210,7 +1210,9 @@ export async function handleUseTool(
         packageId: package_id,
         toolId: tool_id,
         durationMs: duration,
-        outputChars: outputJson.length,
+        outputChars: typeof result.telemetry.output_chars === "number"
+          ? result.telemetry.output_chars
+          : outputJson.length,
         ...(typeof result.telemetry.output_truncated === "boolean" ? { truncated: result.telemetry.output_truncated } : {}),
         ...(typeof result.telemetry.result_id === "string" ? { resultId: result.telemetry.result_id } : {}),
       },

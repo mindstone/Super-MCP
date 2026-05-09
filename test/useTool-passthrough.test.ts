@@ -323,25 +323,27 @@ describe("useTool passthrough contract", () => {
   });
 
   it("Case 11 — load-bearing acceptance: replay of compose-email envelope renders both structuredContent and _meta.ui", async () => {
-    // This mirrors the user-reported repro envelope captured in
-    // docs/investigations/260507_email_compose_prefill_bug.md. If this test
-    // regresses, the compose-email iframe loses pre-fill — the bug is back.
+    // This mirrors handleComposeWorkspaceEmail's production result shape. If
+    // this test regresses, the compose-email iframe loses pre-fill — the bug is
+    // back.
     const innerStructured = {
       to: ["recipient@example.com"],
-      cc: [],
-      bcc: [],
+      cc: ["copy@example.com"],
+      bcc: ["blind@example.com"],
       subject: "Project update — week 18",
-      body_markdown: "Hi team,\n\nQuick update on…",
-      attachment_paths: [],
+      body: "Hi team,\n\nQuick update on…",
+      email: "sender@example.com",
     };
     const innerUi = {
-      resourceUri: "ui://google-workspace/compose-email.html",
-      sourcePackageId: "google_workspace_demo",
-      protocolUrl: "rebel-mcp-app://google-workspace/compose-email.html",
-      visibility: "user-and-llm",
+      resourceUri: "ui://google-workspace/compose-email",
     };
     const inner = {
-      content: [{ type: "text", text: "Draft prepared. Open the inline view to send." }],
+      content: [
+        {
+          type: "text",
+          text: `Drafting email to recipient@example.com with subject "Project update — week 18"\n\n${JSON.stringify(innerStructured)}\n\n[View: ui://google-workspace/compose-email]`,
+        },
+      ],
       structuredContent: innerStructured,
       _meta: { ui: innerUi },
     };
@@ -351,7 +353,13 @@ describe("useTool passthrough contract", () => {
       {
         package_id: "google_workspace_demo",
         tool_id: "compose_workspace_email",
-        args: { to: ["recipient@example.com"], subject: "Project update — week 18", body_markdown: "Hi team,\n\nQuick update on…" },
+        args: {
+          to: ["recipient@example.com"],
+          cc: ["copy@example.com"],
+          bcc: ["blind@example.com"],
+          subject: "Project update — week 18",
+          body: "Hi team,\n\nQuick update on…",
+        },
         max_output_chars: null,
       },
       mockRegistry,
@@ -362,6 +370,8 @@ describe("useTool passthrough contract", () => {
     // Structural consumers: outer-block visibility per the contract.
     expect(response.structuredContent).toEqual(innerStructured);
     expect(response._meta.ui).toEqual(innerUi);
+    expect(response.structuredContent).not.toHaveProperty("body_markdown");
+    expect(response.structuredContent).not.toHaveProperty("attachment_paths");
 
     // Legacy consumers: the JSON envelope still carries the same fields nested
     // under `result` (parseUseToolEnvelopeJson fallback path keeps working).
@@ -494,5 +504,111 @@ describe("useTool passthrough contract", () => {
     });
     expect(continuationResponse._meta.superMcp.dryRun).toBeUndefined();
     expect(continuationResponse._meta.superMcp.staged).toBeUndefined();
+  });
+
+  it("Case 15 — oversized_output safety net preserves passthrough metadata", async () => {
+    delete process.env.REBEL_WORKSPACE_PATH;
+
+    const innerStructured = {
+      to: ["recipient@example.com"],
+      cc: [],
+      bcc: [],
+      subject: "Oversized structured payload",
+      body: "Body text survives through the outer structuredContent hoist.",
+      email: "sender@example.com",
+      oversizedPayload: "Y".repeat(220_000),
+    };
+    const innerUi = {
+      resourceUri: "ui://google-workspace/compose-email.html",
+      sourcePackageId: "google_workspace_demo",
+      protocolUrl: "rebel-mcp-app://google-workspace/compose-email.html",
+    };
+    const inner = {
+      content: [{ type: "text", text: "Draft prepared." }],
+      structuredContent: innerStructured,
+      _meta: { ui: innerUi },
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(
+      {
+        package_id: "google_workspace_demo",
+        tool_id: "compose_workspace_email",
+        args: {},
+        max_output_chars: 100_000,
+      },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    expect(response.isError).toBe(false);
+    expect(response.structuredContent).toEqual(innerStructured);
+    expect(response._meta.ui).toEqual(innerUi);
+    expect(response._meta.superMcp).toMatchObject({
+      packageId: "google_workspace_demo",
+      toolId: "compose_workspace_email",
+      truncated: true,
+    });
+    expect(typeof response._meta.superMcp.resultId).toBe("string");
+    expect(response._meta.materialization).toMatchObject({
+      status: "oversized_output",
+    });
+
+    const envelope = parseEnvelope(response);
+    const telemetry = envelope.telemetry as Record<string, unknown>;
+    expect(response._meta.superMcp.outputChars).toBe(telemetry.output_chars);
+
+    const originalOutputWithoutOutputChars = {
+      package_id: "google_workspace_demo",
+      tool_id: "compose_workspace_email",
+      args_used: {},
+      result: inner,
+      telemetry: { duration_ms: telemetry.duration_ms, status: "ok" },
+    };
+    const originalOutputWithOutputChars = {
+      ...originalOutputWithoutOutputChars,
+      telemetry: {
+        ...originalOutputWithoutOutputChars.telemetry,
+        output_chars: JSON.stringify(originalOutputWithoutOutputChars, null, 2).length,
+      },
+    };
+    expect(response._meta.materialization.originalChars).toBe(
+      JSON.stringify(originalOutputWithOutputChars, null, 2).length,
+    );
+
+    expect(envelope.result).toMatchObject({
+      status: "oversized_output",
+      result_id: response._meta.superMcp.resultId,
+    });
+  });
+
+  it("Case 16 — _meta.superMcp telemetry mirrors the JSON envelope exactly", async () => {
+    delete process.env.REBEL_WORKSPACE_PATH;
+
+    const inner = {
+      content: [{ type: "text", text: "X".repeat(200) }],
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(
+      {
+        package_id: "google_workspace_demo",
+        tool_id: "compose_workspace_email",
+        args: {},
+        max_output_chars: 20,
+      },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    const envelope = parseEnvelope(response);
+    const telemetry = envelope.telemetry as Record<string, unknown>;
+
+    expect(response._meta.superMcp.packageId).toBe(envelope.package_id);
+    expect(response._meta.superMcp.toolId).toBe(envelope.tool_id);
+    expect(response._meta.superMcp.durationMs).toBe(telemetry.duration_ms);
+    expect(response._meta.superMcp.resultId).toBe(telemetry.result_id);
   });
 });
