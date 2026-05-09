@@ -209,6 +209,82 @@ function truncateToolResultTextContent(
   };
 }
 
+interface RebelUnwrappedUiMeta {
+  resourceUri: string;
+  protocolUrl?: string;
+  csp?: unknown;
+  permissions?: unknown;
+}
+
+interface RebelUnwrappedMeta {
+  ui?: RebelUnwrappedUiMeta;
+  structuredContent?: unknown;
+}
+
+function isUsableMcpAppResourceUri(value: unknown): value is string {
+  if (typeof value !== "string") {
+    return false;
+  }
+
+  return /^ui:\/\/[^\s\/\u0000-\u001f\u007f]+(?:\/[^\s\u0000-\u001f\u007f]*)?$/.test(value);
+}
+
+function buildRebelUnwrappedMeta(toolResult: unknown): { _meta: { "rebel:unwrapped": RebelUnwrappedMeta } } | undefined {
+  if (!isRecord(toolResult)) {
+    return undefined;
+  }
+
+  if (
+    toolResult.status === "oversized_output"
+    || toolResult.status === "materialized"
+    || toolResult.dry_run === true
+    || toolResult.continuation === true
+  ) {
+    return undefined;
+  }
+
+  const structuredContent = toolResult.structuredContent;
+  const hasStructuredContent = structuredContent !== undefined;
+
+  let liftedUi: RebelUnwrappedUiMeta | undefined;
+  if (isRecord(toolResult._meta) && isRecord(toolResult._meta.ui)) {
+    const ui = toolResult._meta.ui;
+    if (isUsableMcpAppResourceUri(ui.resourceUri)) {
+      liftedUi = {
+        resourceUri: ui.resourceUri,
+      };
+
+      if (typeof ui.protocolUrl === "string") {
+        liftedUi.protocolUrl = ui.protocolUrl;
+      }
+      if ("csp" in ui) {
+        liftedUi.csp = ui.csp;
+      }
+      if ("permissions" in ui) {
+        liftedUi.permissions = ui.permissions;
+      }
+    }
+  }
+
+  if (!liftedUi && !hasStructuredContent) {
+    return undefined;
+  }
+
+  const unwrapped: RebelUnwrappedMeta = {};
+  if (liftedUi) {
+    unwrapped.ui = liftedUi;
+  }
+  if (hasStructuredContent) {
+    unwrapped.structuredContent = structuredContent;
+  }
+
+  return {
+    _meta: {
+      "rebel:unwrapped": unwrapped,
+    },
+  };
+}
+
 function getValidationAttemptKey(packageId: string, toolId: string): string {
   return `${packageId}::${toolId}`;
 }
@@ -771,6 +847,7 @@ export async function handleUseTool(
     };
 
     let dryRunJson = JSON.stringify(result, null, 2);
+    const dryRunLiftedMeta = buildRebelUnwrappedMeta(result.result);
 
     return {
       content: [
@@ -780,6 +857,7 @@ export async function handleUseTool(
         },
       ],
       isError: false,
+      ...(dryRunLiftedMeta ?? {}),
     };
   }
 
@@ -829,12 +907,14 @@ export async function handleUseTool(
           }
 
           const envelopeJson = JSON.stringify(matResult, null, 2);
+          const materializedLiftedMeta = buildRebelUnwrappedMeta(matResult.result);
           return {
             content: [
               { type: "text", text: envelopeJson },
               ...imageBlocks,
             ],
             isError: downstreamIsError,
+            ...(materializedLiftedMeta ?? {}),
           };
         }
       } catch (err: any) {
@@ -995,6 +1075,7 @@ export async function handleUseTool(
     }
 
     resetValidationAttempt(downstreamValidationAttemptKey);
+    const liftedMeta = buildRebelUnwrappedMeta(result.result);
 
     return {
       content: [
@@ -1005,6 +1086,7 @@ export async function handleUseTool(
         ...passthroughImages,
       ],
       isError: downstreamIsError,
+      ...(liftedMeta ?? {}),
     };
   } catch (error) {
     registry.notifyActivity(package_id);
