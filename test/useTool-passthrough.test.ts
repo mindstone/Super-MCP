@@ -20,6 +20,13 @@ import { PackageRegistry } from "../src/registry.js";
 import { Catalog } from "../src/catalog.js";
 import { ValidationResult } from "../src/validator.js";
 
+// Mirrors the consumer-side Method 0 prefix heuristic documented in
+// docs/project/SUPER_MCP_PASSTHROUGH_CONTRACT.md. Keep this local to the
+// standalone super-mcp package; the app exports the matching constants from
+// src/main/services/agentMessageHandler.ts.
+const SUPER_MCP_ENVELOPE_PREFIX_MARKER = "\"package_id\"";
+const SUPER_MCP_ENVELOPE_PREFIX_WINDOW_CHARS = 64;
+
 function createUseToolMocks(toolResult: unknown) {
   const mockClient = {
     callTool: vi.fn().mockResolvedValue(toolResult),
@@ -49,6 +56,7 @@ function parseEnvelope(response: { content: Array<{ type: string; text?: string 
   expect(typeof response.content[0].text).toBe("string");
   // Trim trailing continuation hint / large-output footer if present (separated by "\n\n[").
   const text = response.content[0].text as string;
+  expect(text.slice(0, SUPER_MCP_ENVELOPE_PREFIX_WINDOW_CHARS)).toContain(SUPER_MCP_ENVELOPE_PREFIX_MARKER);
   const footerStart = text.indexOf("\n\n[");
   const sliceEnd = footerStart >= 0 ? footerStart : text.length;
   return JSON.parse(text.slice(0, sliceEnd)) as Record<string, unknown>;
@@ -75,6 +83,21 @@ describe("useTool passthrough contract", () => {
     process.env.REBEL_WORKSPACE_PATH = originalWorkspacePath;
     await fs.rm(tempWorkspace, { recursive: true, force: true });
     vi.restoreAllMocks();
+  });
+
+  it("Contract — JSON use_tool envelopes expose package_id within the consumer prefix window", async () => {
+    const inner = {
+      content: [{ type: "text", text: "ok" }],
+      structuredContent: { draftId: "abc123", subject: "Hello" },
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator);
+
+    expect(response.content[0].type).toBe("text");
+    expect(response.content[0].text?.slice(0, SUPER_MCP_ENVELOPE_PREFIX_WINDOW_CHARS)).toContain(
+      SUPER_MCP_ENVELOPE_PREFIX_MARKER,
+    );
   });
 
   it("Case 1 — plain text result: outer block carries _meta.superMcp; no _meta.ui or structuredContent", async () => {
