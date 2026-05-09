@@ -18,6 +18,12 @@ interface CachedResult {
   totalChars: number;
   createdAt: number;
 }
+
+interface ContinuationResult {
+  content: Array<{ type: "text"; text: string }>;
+  isError: boolean;
+  resultId: string;
+}
 const RESULT_CACHE_MAX_SIZE = 50;
 const RESULT_CACHE_TTL_MS = 5 * 60 * 1000;
 const resultCache = new Map<string, CachedResult>();
@@ -61,16 +67,16 @@ function handleContinuation(
   resultId: string,
   offset: number,
   maxOutputChars: number | null | undefined,
-): { content: Array<{ type: string; text: string }>; isError: boolean } {
+): ContinuationResult {
   if (offset < 0 || !Number.isFinite(offset)) {
-    return { content: [{ type: "text", text: `Error: output_offset must be a non-negative number (got ${offset}).` }], isError: true };
+    return { content: [{ type: "text", text: `Error: output_offset must be a non-negative number (got ${offset}).` }], isError: true, resultId };
   }
   const cached = getCachedResult(resultId);
   if (!cached) {
-    return { content: [{ type: "text", text: "Cached result expired or not found. Please re-run the original tool call." }], isError: true };
+    return { content: [{ type: "text", text: "Cached result expired or not found. Please re-run the original tool call." }], isError: true, resultId };
   }
   if (offset >= cached.totalChars) {
-    return { content: [{ type: "text", text: `No more data (offset ${offset} >= total ${cached.totalChars} chars).` }], isError: false };
+    return { content: [{ type: "text", text: `No more data (offset ${offset} >= total ${cached.totalChars} chars).` }], isError: false, resultId };
   }
   const effectiveLimit = maxOutputChars === null ? undefined : (maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS);
   const chunkEnd = effectiveLimit !== undefined ? Math.min(offset + effectiveLimit, cached.totalChars) : cached.totalChars;
@@ -89,7 +95,7 @@ function handleContinuation(
   if (hasMore) {
     text += `\n\n[To get the next chunk: use_tool({ package_id: "_", tool_id: "_", args: {}, result_id: "${resultId}", output_offset: ${chunkEnd} })]`;
   }
-  return { content: [{ type: "text", text }], isError: false };
+  return { content: [{ type: "text", text }], isError: false, resultId };
 }
 const LARGE_OUTPUT_WARNING_THRESHOLD = 150_000;
 const DEFAULT_MAX_OUTPUT_CHARS = 100_000;
@@ -155,6 +161,9 @@ interface SuperMcpTelemetryMeta {
   outputChars?: number;
   truncated?: boolean;
   resultId?: string;
+  dryRun?: boolean;
+  continuation?: boolean;
+  staged?: boolean;
 }
 
 interface MaterializationMeta {
@@ -204,6 +213,7 @@ function extractInnerPassthroughMeta(toolResult: unknown): OuterPassthroughMeta 
  * - Conditionally emits `_meta.materialization` (only when materialisation fired).
  * - Hoists `structuredContent` to the outer block when present and not an error.
  */
+// INVARIANT: The only caller of this function is buildOuter. See SUPER_MCP_PASSTHROUGH_CONTRACT.md § Single-egress invariant.
 function applyOuterMeta(
   outer: { content: Array<unknown>; isError?: boolean; _meta?: Record<string, unknown>; structuredContent?: unknown },
   options: {
@@ -221,6 +231,9 @@ function applyOuterMeta(
       ...(options.superMcp.outputChars !== undefined ? { outputChars: options.superMcp.outputChars } : {}),
       ...(options.superMcp.truncated !== undefined ? { truncated: options.superMcp.truncated } : {}),
       ...(options.superMcp.resultId !== undefined ? { resultId: options.superMcp.resultId } : {}),
+      ...(options.superMcp.dryRun ? { dryRun: true } : {}),
+      ...(options.superMcp.continuation ? { continuation: true } : {}),
+      ...(options.superMcp.staged ? { staged: true } : {}),
     },
   };
 
@@ -240,6 +253,33 @@ function applyOuterMeta(
   if (!options.isError && options.passthrough.structuredContent !== undefined) {
     outer.structuredContent = options.passthrough.structuredContent;
   }
+}
+
+interface UseToolOuter {
+  content: Array<unknown>;
+  isError: boolean;
+  _meta?: Record<string, unknown>;
+  structuredContent?: unknown;
+}
+
+function buildOuter(args: {
+  content: Array<unknown>;
+  isError: boolean;
+  superMcp: SuperMcpTelemetryMeta & { dryRun?: boolean; continuation?: boolean; staged?: boolean };
+  passthrough?: OuterPassthroughMeta;
+  materialization?: MaterializationMeta;
+}): UseToolOuter {
+  const outer: UseToolOuter = {
+    content: args.content,
+    isError: args.isError,
+  };
+  applyOuterMeta(outer, {
+    passthrough: args.passthrough ?? {},
+    superMcp: args.superMcp,
+    ...(args.materialization ? { materialization: args.materialization } : {}),
+    isError: args.isError,
+  });
+  return outer;
 }
 
 interface TextContentBlock {
@@ -683,9 +723,16 @@ export async function handleUseTool(
   // while we return immediately without executing the underlying tool.
   // See: src/main/services/toolSafetyService.ts — staging path.
   if (input._rebel_staged) {
-    return {
+    return buildOuter({
       content: [{ type: "text", text: input._rebel_staged_message ?? "Tool call staged for approval." }],
-    };
+      isError: false,
+      superMcp: {
+        packageId: input.package_id,
+        toolId: input.tool_id,
+        durationMs: 0,
+        staged: true,
+      },
+    });
   }
 
   // Continuation: retrieve cached truncated result (before any validation/security)
@@ -706,7 +753,18 @@ export async function handleUseTool(
     if (cleanForContinuation.output_offset === undefined || cleanForContinuation.output_offset === null) {
       return { content: [{ type: "text", text: "Error: output_offset is required when using result_id." }], isError: true };
     }
-    return handleContinuation(cleanForContinuation.result_id, cleanForContinuation.output_offset, cleanForContinuation.max_output_chars);
+    const continuation = handleContinuation(cleanForContinuation.result_id, cleanForContinuation.output_offset, cleanForContinuation.max_output_chars);
+    return buildOuter({
+      content: continuation.content,
+      isError: continuation.isError,
+      superMcp: {
+        packageId: cleanForContinuation.package_id,
+        toolId: cleanForContinuation.tool_id,
+        durationMs: 0,
+        resultId: continuation.resultId,
+        continuation: true,
+      },
+    });
   }
 
   // Strip rebel-internal flags so they never leak to downstream tool handlers
@@ -883,7 +941,7 @@ export async function handleUseTool(
 
     let dryRunJson = JSON.stringify(result, null, 2);
 
-    return {
+    return buildOuter({
       content: [
         {
           type: "text",
@@ -891,7 +949,13 @@ export async function handleUseTool(
         },
       ],
       isError: false,
-    };
+      superMcp: {
+        packageId: package_id,
+        toolId: tool_id,
+        durationMs: 0,
+        dryRun: true,
+      },
+    });
   }
 
   const startTime = Date.now();
@@ -952,14 +1016,12 @@ export async function handleUseTool(
             ...(typeof matResultPayload.file_path === "string" ? { filePath: matResultPayload.file_path } : {}),
             ...(Array.isArray(matResultPayload.image_files) ? { imageFiles: matResultPayload.image_files as string[] } : {}),
           };
-          const outer: { content: Array<unknown>; isError: boolean; _meta?: Record<string, unknown>; structuredContent?: unknown } = {
+          return buildOuter({
             content: [
               { type: "text", text: envelopeJson },
               ...imageBlocks,
             ],
             isError: downstreamIsError,
-          };
-          applyOuterMeta(outer, {
             passthrough: innerPassthrough,
             superMcp: {
               packageId: package_id,
@@ -968,9 +1030,7 @@ export async function handleUseTool(
               outputChars: envelopeJson.length,
             },
             materialization: materializationMeta,
-            isError: downstreamIsError,
           });
-          return outer;
         }
       } catch (err: any) {
         logger.warn("Materialization failed, falling back to continuation", {
@@ -1136,7 +1196,7 @@ export async function handleUseTool(
 
     resetValidationAttempt(downstreamValidationAttemptKey);
 
-    const outer: { content: Array<unknown>; isError: boolean; _meta?: Record<string, unknown>; structuredContent?: unknown } = {
+    return buildOuter({
       content: [
         {
           type: "text",
@@ -1145,8 +1205,6 @@ export async function handleUseTool(
         ...passthroughImages,
       ],
       isError: downstreamIsError,
-    };
-    applyOuterMeta(outer, {
       passthrough: innerPassthrough,
       superMcp: {
         packageId: package_id,
@@ -1164,9 +1222,7 @@ export async function handleUseTool(
             } satisfies MaterializationMeta,
           }
         : {}),
-      isError: downstreamIsError,
     });
-    return outer;
   } catch (error) {
     registry.notifyActivity(package_id);
     const duration = Date.now() - startTime;

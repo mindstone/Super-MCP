@@ -347,4 +347,129 @@ describe("useTool passthrough contract", () => {
     expect(legacyResult.structuredContent).toEqual(innerStructured);
     expect((legacyResult._meta as Record<string, unknown>).ui).toEqual(innerUi);
   });
+
+  it("Case 12 — _rebel_staged bypass: emits super-mcp staged metadata only", async () => {
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks({ content: [{ type: "text", text: "unused" }] });
+
+    const response = await handleUseTool(
+      {
+        ...SUCCESS_INPUT,
+        _rebel_staged: true,
+        _rebel_staged_message: "Waiting for approval.",
+      },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    expect(response.isError).toBe(false);
+    expect(response.content).toEqual([{ type: "text", text: "Waiting for approval." }]);
+    expect(response.structuredContent).toBeUndefined();
+    expect(response._meta.ui).toBeUndefined();
+    expect(response._meta.materialization).toBeUndefined();
+    expect(response._meta.superMcp).toMatchObject({
+      packageId: "google_workspace_demo",
+      toolId: "compose_workspace_email",
+      durationMs: 0,
+      staged: true,
+    });
+    expect(response._meta.superMcp.dryRun).toBeUndefined();
+    expect(response._meta.superMcp.continuation).toBeUndefined();
+  });
+
+  it("Case 13 — dry_run bypass: emits super-mcp dryRun metadata and preserves args_used", async () => {
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createUseToolMocks({ content: [{ type: "text", text: "unused" }] });
+
+    const response = await handleUseTool(
+      {
+        package_id: "google_workspace_demo",
+        tool_id: "compose_workspace_email",
+        args: { to: ["recipient@example.com"], subject: "Dry run" },
+        dry_run: true,
+      },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+    expect(response.isError).toBe(false);
+    expect(response.structuredContent).toBeUndefined();
+    expect(response._meta.ui).toBeUndefined();
+    expect(response._meta.materialization).toBeUndefined();
+    expect(response._meta.superMcp).toMatchObject({
+      packageId: "google_workspace_demo",
+      toolId: "compose_workspace_email",
+      durationMs: 0,
+      dryRun: true,
+    });
+    expect(response._meta.superMcp.continuation).toBeUndefined();
+    expect(response._meta.superMcp.staged).toBeUndefined();
+
+    const envelope = parseEnvelope(response);
+    expect(envelope.args_used).toEqual({ to: ["recipient@example.com"], subject: "Dry run" });
+    expect(envelope.result).toEqual({ dry_run: true });
+  });
+
+  it("Case 14 — result_id continuation bypass: emits super-mcp continuation metadata only", async () => {
+    // Materialisation would short-circuit before truncation in this suite's
+    // default workspace setup; disable it so the first call seeds the
+    // continuation cache through the truncation branch.
+    delete process.env.REBEL_WORKSPACE_PATH;
+
+    const innerStructured = { draftId: "abc", body: "This should not be hoisted on continuation." };
+    const innerUi = {
+      resourceUri: "ui://google-workspace/compose-email.html",
+      sourcePackageId: "google_workspace_demo",
+    };
+    const inner = {
+      content: [{ type: "text", text: "X".repeat(200) }],
+      structuredContent: innerStructured,
+      _meta: { ui: innerUi },
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const firstResponse = await handleUseTool(
+      {
+        package_id: "google_workspace_demo",
+        tool_id: "compose_workspace_email",
+        args: {},
+        max_output_chars: 20,
+      },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    expect(firstResponse._meta.superMcp.truncated).toBe(true);
+    const resultId = firstResponse._meta.superMcp.resultId;
+    expect(typeof resultId).toBe("string");
+
+    const continuationResponse = await handleUseTool(
+      {
+        package_id: "google_workspace_demo",
+        tool_id: "compose_workspace_email",
+        args: {},
+        result_id: resultId,
+        output_offset: 0,
+      },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    expect(continuationResponse.isError).toBe(false);
+    expect(continuationResponse.structuredContent).toBeUndefined();
+    expect(continuationResponse._meta.ui).toBeUndefined();
+    expect(continuationResponse._meta.materialization).toBeUndefined();
+    expect(continuationResponse._meta.superMcp).toMatchObject({
+      packageId: "google_workspace_demo",
+      toolId: "compose_workspace_email",
+      durationMs: 0,
+      resultId,
+      continuation: true,
+    });
+    expect(continuationResponse._meta.superMcp.dryRun).toBeUndefined();
+    expect(continuationResponse._meta.superMcp.staged).toBeUndefined();
+  });
 });
