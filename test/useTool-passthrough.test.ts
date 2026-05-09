@@ -1,0 +1,350 @@
+// Conformance test suite for the super-mcp passthrough contract.
+// See docs/project/SUPER_MCP_PASSTHROUGH_CONTRACT.md.
+//
+// This suite locks the contract that super-mcp's use_tool outer block carries:
+//   - structuredContent (hoisted from inner.structuredContent)
+//   - _meta.ui (hoisted from inner._meta.ui when shaped like a usable record)
+//   - _meta.superMcp (super-mcp's own telemetry namespace)
+//   - _meta.materialization (super-mcp's materialisation namespace, when fired)
+//   - isError (preserved from the inner tool result)
+//
+// The model-facing JSON envelope inside content[0].text MUST remain unchanged
+// (backward-compat invariant).
+
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { handleUseTool } from "../src/handlers/useTool.js";
+import { PackageRegistry } from "../src/registry.js";
+import { Catalog } from "../src/catalog.js";
+import { ValidationResult } from "../src/validator.js";
+
+function createUseToolMocks(toolResult: unknown) {
+  const mockClient = {
+    callTool: vi.fn().mockResolvedValue(toolResult),
+  };
+
+  const mockRegistry = {
+    getPackage: vi.fn().mockReturnValue({ id: "google_workspace_demo" }),
+    getClient: vi.fn().mockResolvedValue(mockClient),
+    notifyActivity: vi.fn(),
+  } as unknown as PackageRegistry;
+
+  const mockCatalog = {
+    ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
+    getPackageStatus: vi.fn().mockReturnValue("ready"),
+    getToolSchema: vi.fn().mockResolvedValue({ type: "object" }),
+  } as unknown as Catalog;
+
+  const mockValidator = {
+    validate: vi.fn().mockReturnValue({ valid: true, errors: [], strippedArgs: [] } as unknown as ValidationResult),
+  };
+
+  return { mockRegistry, mockCatalog, mockValidator, mockClient };
+}
+
+function parseEnvelope(response: { content: Array<{ type: string; text?: string }> }): Record<string, unknown> {
+  expect(response.content[0].type).toBe("text");
+  expect(typeof response.content[0].text).toBe("string");
+  // Trim trailing continuation hint / large-output footer if present (separated by "\n\n[").
+  const text = response.content[0].text as string;
+  const footerStart = text.indexOf("\n\n[");
+  const sliceEnd = footerStart >= 0 ? footerStart : text.length;
+  return JSON.parse(text.slice(0, sliceEnd)) as Record<string, unknown>;
+}
+
+const SUCCESS_INPUT = {
+  package_id: "google_workspace_demo",
+  tool_id: "compose_workspace_email",
+  args: {},
+  max_output_chars: null,
+} as const;
+
+describe("useTool passthrough contract", () => {
+  let tempWorkspace: string;
+  let originalWorkspacePath: string | undefined;
+
+  beforeEach(async () => {
+    tempWorkspace = await fs.mkdtemp(path.join(os.tmpdir(), "super-mcp-passthrough-"));
+    originalWorkspacePath = process.env.REBEL_WORKSPACE_PATH;
+    process.env.REBEL_WORKSPACE_PATH = tempWorkspace;
+  });
+
+  afterEach(async () => {
+    process.env.REBEL_WORKSPACE_PATH = originalWorkspacePath;
+    await fs.rm(tempWorkspace, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it("Case 1 — plain text result: outer block carries _meta.superMcp; no _meta.ui or structuredContent", async () => {
+    const inner = {
+      content: [{ type: "text", text: "ok" }],
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator);
+
+    expect(response.isError).toBe(false);
+    expect(response.structuredContent).toBeUndefined();
+    expect(response._meta).toBeDefined();
+    expect(response._meta.ui).toBeUndefined();
+    expect(response._meta.materialization).toBeUndefined();
+    expect(response._meta.superMcp).toMatchObject({
+      packageId: "google_workspace_demo",
+      toolId: "compose_workspace_email",
+    });
+    expect(typeof response._meta.superMcp.durationMs).toBe("number");
+    expect(typeof response._meta.superMcp.outputChars).toBe("number");
+  });
+
+  it("Case 2 — structuredContent only: hoisted onto outer block; _meta.ui still absent", async () => {
+    const inner = {
+      content: [{ type: "text", text: "draft staged" }],
+      structuredContent: { draftId: "abc123", subject: "Hello" },
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator);
+
+    expect(response.isError).toBe(false);
+    expect(response.structuredContent).toEqual({ draftId: "abc123", subject: "Hello" });
+    expect(response._meta.ui).toBeUndefined();
+    expect(response._meta.superMcp.packageId).toBe("google_workspace_demo");
+  });
+
+  it("Case 3 — _meta.ui only: hoisted onto outer block; structuredContent absent", async () => {
+    const inner = {
+      content: [{ type: "text", text: "view ready" }],
+      _meta: {
+        ui: {
+          resourceUri: "ui://google-workspace/compose-email.html",
+          sourcePackageId: "google_workspace_demo",
+          protocolUrl: "rebel-mcp-app://google-workspace/compose-email.html",
+        },
+      },
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator);
+
+    expect(response.isError).toBe(false);
+    expect(response.structuredContent).toBeUndefined();
+    expect(response._meta.ui).toEqual({
+      resourceUri: "ui://google-workspace/compose-email.html",
+      sourcePackageId: "google_workspace_demo",
+      protocolUrl: "rebel-mcp-app://google-workspace/compose-email.html",
+    });
+  });
+
+  it("Case 4 — both _meta.ui AND structuredContent: both hoisted onto outer block (load-bearing email-compose case)", async () => {
+    const innerStructured = {
+      to: ["alice@example.com"],
+      subject: "Hello from Rebel",
+      body: "Thanks for the meeting today.",
+    };
+    const innerUi = {
+      resourceUri: "ui://google-workspace/compose-email.html",
+      sourcePackageId: "google_workspace_demo",
+      protocolUrl: "rebel-mcp-app://google-workspace/compose-email.html",
+      visibility: "user-and-llm",
+    };
+    const inner = {
+      content: [{ type: "text", text: "Email draft prepared" }],
+      structuredContent: innerStructured,
+      _meta: { ui: innerUi },
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator);
+
+    expect(response.isError).toBe(false);
+    expect(response.structuredContent).toEqual(innerStructured);
+    expect(response._meta.ui).toEqual(innerUi);
+
+    // Backward-compat invariant: model-facing JSON envelope unchanged. The
+    // text block must still parse as a UseToolOutput envelope.
+    const envelope = parseEnvelope(response);
+    expect(envelope.package_id).toBe("google_workspace_demo");
+    expect(envelope.tool_id).toBe("compose_workspace_email");
+    expect(envelope.telemetry).toMatchObject({ status: "ok" });
+  });
+
+  it("Case 5 — materialised path WITHOUT _meta.ui: _meta.superMcp + _meta.materialization populated", async () => {
+    const inner = {
+      content: [{ type: "text", text: "X".repeat(30_000) }],
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(
+      {
+        package_id: "google_workspace_demo",
+        tool_id: "compose_workspace_email",
+        args: {},
+      },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    expect(response.isError).toBe(false);
+    expect(response._meta.materialization).toBeDefined();
+    expect(response._meta.materialization.status).toBe("materialized");
+    expect(response._meta.ui).toBeUndefined();
+    expect(response.structuredContent).toBeUndefined();
+  });
+
+  it("Case 6 — materialised path WITH _meta.ui + structuredContent: passthrough preserved through materialisation", async () => {
+    const innerStructured = { draftId: "abc", body: "X".repeat(30_000) };
+    const innerUi = {
+      resourceUri: "ui://google-workspace/compose-email.html",
+      sourcePackageId: "google_workspace_demo",
+    };
+    const inner = {
+      content: [{ type: "text", text: "X".repeat(30_000) }],
+      structuredContent: innerStructured,
+      _meta: { ui: innerUi },
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(
+      {
+        package_id: "google_workspace_demo",
+        tool_id: "compose_workspace_email",
+        args: {},
+      },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    expect(response.isError).toBe(false);
+    expect(response._meta.materialization.status).toBe("materialized");
+    expect(response._meta.ui).toEqual(innerUi);
+    expect(response.structuredContent).toEqual(innerStructured);
+  });
+
+  it("Case 7 — error result: NOT hoisted (inner envelope is malformed; outer is a clean error envelope)", async () => {
+    const inner = {
+      content: [{ type: "text", text: "downstream failed" }],
+      structuredContent: { error: "permission_denied" },
+      _meta: {
+        ui: {
+          resourceUri: "ui://should-not-be-hoisted/error.html",
+          sourcePackageId: "google_workspace_demo",
+        },
+      },
+      isError: true,
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator);
+
+    expect(response.isError).toBe(true);
+    expect(response.structuredContent).toBeUndefined();
+    expect(response._meta.ui).toBeUndefined();
+    // superMcp namespace still present even on errors.
+    expect(response._meta.superMcp.packageId).toBe("google_workspace_demo");
+  });
+
+  it("Case 8 — malformed _meta.ui (missing resourceUri) is dropped", async () => {
+    const inner = {
+      content: [{ type: "text", text: "ok" }],
+      _meta: {
+        ui: {
+          // No resourceUri — must NOT be hoisted.
+          sourcePackageId: "google_workspace_demo",
+        },
+      },
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator);
+
+    expect(response.isError).toBe(false);
+    expect(response._meta.ui).toBeUndefined();
+  });
+
+  it("Case 9 — array _meta.ui is dropped (must be a non-array record)", async () => {
+    const inner = {
+      content: [{ type: "text", text: "ok" }],
+      _meta: { ui: ["bad-shape"] as unknown as Record<string, unknown> },
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator);
+
+    expect(response.isError).toBe(false);
+    expect(response._meta.ui).toBeUndefined();
+  });
+
+  it("Case 10 — backward-compat: model-facing JSON envelope still parseable with passthrough fields present", async () => {
+    const inner = {
+      content: [{ type: "text", text: "view ready" }],
+      structuredContent: { foo: "bar" },
+      _meta: { ui: { resourceUri: "ui://x/y.html", sourcePackageId: "x" } },
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator);
+
+    // Existing consumers parse content[0].text as JSON — this MUST still work.
+    const envelope = parseEnvelope(response);
+    expect(envelope).toMatchObject({
+      package_id: "google_workspace_demo",
+      tool_id: "compose_workspace_email",
+      telemetry: { status: "ok" },
+    });
+    // The inner result is wrapped as `result` inside the JSON envelope (legacy path).
+    expect(envelope.result).toBeDefined();
+  });
+
+  it("Case 11 — load-bearing acceptance: replay of compose-email envelope renders both structuredContent and _meta.ui", async () => {
+    // This mirrors the user-reported repro envelope captured in
+    // docs/investigations/260507_email_compose_prefill_bug.md. If this test
+    // regresses, the compose-email iframe loses pre-fill — the bug is back.
+    const innerStructured = {
+      to: ["recipient@example.com"],
+      cc: [],
+      bcc: [],
+      subject: "Project update — week 18",
+      body_markdown: "Hi team,\n\nQuick update on…",
+      attachment_paths: [],
+    };
+    const innerUi = {
+      resourceUri: "ui://google-workspace/compose-email.html",
+      sourcePackageId: "google_workspace_demo",
+      protocolUrl: "rebel-mcp-app://google-workspace/compose-email.html",
+      visibility: "user-and-llm",
+    };
+    const inner = {
+      content: [{ type: "text", text: "Draft prepared. Open the inline view to send." }],
+      structuredContent: innerStructured,
+      _meta: { ui: innerUi },
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(
+      {
+        package_id: "google_workspace_demo",
+        tool_id: "compose_workspace_email",
+        args: { to: ["recipient@example.com"], subject: "Project update — week 18", body_markdown: "Hi team,\n\nQuick update on…" },
+        max_output_chars: null,
+      },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    // Structural consumers: outer-block visibility per the contract.
+    expect(response.structuredContent).toEqual(innerStructured);
+    expect(response._meta.ui).toEqual(innerUi);
+
+    // Legacy consumers: the JSON envelope still carries the same fields nested
+    // under `result` (parseUseToolEnvelopeJson fallback path keeps working).
+    const envelope = parseEnvelope(response);
+    const legacyResult = envelope.result as Record<string, unknown>;
+    expect(legacyResult.structuredContent).toEqual(innerStructured);
+    expect((legacyResult._meta as Record<string, unknown>).ui).toEqual(innerUi);
+  });
+});

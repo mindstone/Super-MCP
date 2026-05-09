@@ -131,6 +131,117 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Spec-conformant passthrough fields hoisted onto super-mcp's outer use_tool
+ * response block. The MCP spec carries `_meta` and `structuredContent` on the
+ * outer tool_result envelope; super-mcp wraps results into a single text block
+ * for the model, but downstream consumers (agentMessageHandler, MCP App view,
+ * mobile/cloud DTOs) read these fields off the OUTER block per spec.
+ *
+ * See docs/project/SUPER_MCP_PASSTHROUGH_CONTRACT.md and the
+ * `super-mcp-passthrough` boundary registry entry.
+ */
+interface OuterPassthroughMeta {
+  /** Hoisted from inner._meta.ui when shaped like a usable McpAppUiMeta record. */
+  ui?: Record<string, unknown>;
+  /** Hoisted from inner.structuredContent (type-opaque). */
+  structuredContent?: unknown;
+}
+
+interface SuperMcpTelemetryMeta {
+  packageId: string;
+  toolId: string;
+  durationMs: number;
+  outputChars?: number;
+  truncated?: boolean;
+  resultId?: string;
+}
+
+interface MaterializationMeta {
+  status: "materialized" | "oversized_output";
+  originalChars?: number;
+  filePath?: string;
+  imageFiles?: string[];
+}
+
+/**
+ * Extract `_meta.ui` and `structuredContent` from the inner downstream tool
+ * result. Only hoists `_meta.ui` when shaped like a usable record (non-array
+ * object with non-empty string `resourceUri`); malformed shapes are dropped.
+ * Returns the snapshot to be applied by `applyOuterMeta` to the use_tool
+ * outer return block on every code path.
+ *
+ * IMPORTANT: capture this BEFORE truncation/safety-net rewrites — the
+ * passthrough fields belong to the original inner envelope.
+ */
+function extractInnerPassthroughMeta(toolResult: unknown): OuterPassthroughMeta {
+  if (!isRecord(toolResult)) return {};
+  const meta: OuterPassthroughMeta = {};
+
+  if (toolResult.structuredContent !== undefined) {
+    meta.structuredContent = toolResult.structuredContent;
+  }
+
+  const innerMeta = toolResult._meta;
+  if (isRecord(innerMeta) && isRecord(innerMeta.ui)) {
+    const ui = innerMeta.ui;
+    const resourceUri = ui.resourceUri;
+    if (typeof resourceUri === "string" && resourceUri.length > 0) {
+      meta.ui = ui;
+    }
+  }
+
+  return meta;
+}
+
+/**
+ * Apply the hoisted passthrough fields plus super-mcp's own telemetry/materialisation
+ * namespaces onto the outer use_tool response block. See
+ * docs/project/SUPER_MCP_PASSTHROUGH_CONTRACT.md for the full schema.
+ *
+ * - Always emits `_meta.superMcp`.
+ * - Conditionally emits `_meta.ui` (only when present and the result is not an error).
+ * - Conditionally emits `_meta.materialization` (only when materialisation fired).
+ * - Hoists `structuredContent` to the outer block when present and not an error.
+ */
+function applyOuterMeta(
+  outer: { content: Array<unknown>; isError?: boolean; _meta?: Record<string, unknown>; structuredContent?: unknown },
+  options: {
+    passthrough: OuterPassthroughMeta;
+    superMcp: SuperMcpTelemetryMeta;
+    materialization?: MaterializationMeta;
+    isError: boolean;
+  },
+): void {
+  const meta: Record<string, unknown> = {
+    superMcp: {
+      packageId: options.superMcp.packageId,
+      toolId: options.superMcp.toolId,
+      durationMs: options.superMcp.durationMs,
+      ...(options.superMcp.outputChars !== undefined ? { outputChars: options.superMcp.outputChars } : {}),
+      ...(options.superMcp.truncated !== undefined ? { truncated: options.superMcp.truncated } : {}),
+      ...(options.superMcp.resultId !== undefined ? { resultId: options.superMcp.resultId } : {}),
+    },
+  };
+
+  // Spec passthrough only applied to non-error results: an inner error envelope
+  // is malformed by definition; surfacing its _meta.ui / structuredContent on
+  // the outer block would mis-route consumers.
+  if (!options.isError && options.passthrough.ui) {
+    meta.ui = options.passthrough.ui;
+  }
+
+  if (options.materialization) {
+    meta.materialization = options.materialization;
+  }
+
+  outer._meta = meta;
+
+  if (!options.isError && options.passthrough.structuredContent !== undefined) {
+    outer.structuredContent = options.passthrough.structuredContent;
+  }
+}
+
 interface TextContentBlock {
   type: "text";
   text: string;
@@ -788,6 +899,10 @@ export async function handleUseTool(
     const client = await registry.getClient(package_id);
     let toolResult = await client.callTool(tool_id, args);
     const downstreamIsError = isRecord(toolResult) && toolResult.isError === true;
+    // Capture spec-passthrough fields off the inner tool_result BEFORE any
+    // truncation/safety-net/materialisation rewrites. See
+    // docs/project/SUPER_MCP_PASSTHROUGH_CONTRACT.md.
+    const innerPassthrough = extractInnerPassthroughMeta(toolResult);
     registry.notifyActivity(package_id);
     const duration = Date.now() - startTime;
 
@@ -829,13 +944,33 @@ export async function handleUseTool(
           }
 
           const envelopeJson = JSON.stringify(matResult, null, 2);
-          return {
+          const matResultPayload = isRecord(matResult.result) ? matResult.result as Record<string, unknown> : {};
+          const matStatus = matResultPayload.status === "oversized_output" ? "oversized_output" : "materialized";
+          const materializationMeta: MaterializationMeta = {
+            status: matStatus,
+            ...(typeof matResultPayload.size_chars === "number" ? { originalChars: matResultPayload.size_chars } : {}),
+            ...(typeof matResultPayload.file_path === "string" ? { filePath: matResultPayload.file_path } : {}),
+            ...(Array.isArray(matResultPayload.image_files) ? { imageFiles: matResultPayload.image_files as string[] } : {}),
+          };
+          const outer: { content: Array<unknown>; isError: boolean; _meta?: Record<string, unknown>; structuredContent?: unknown } = {
             content: [
               { type: "text", text: envelopeJson },
               ...imageBlocks,
             ],
             isError: downstreamIsError,
           };
+          applyOuterMeta(outer, {
+            passthrough: innerPassthrough,
+            superMcp: {
+              packageId: package_id,
+              toolId: tool_id,
+              durationMs: duration,
+              outputChars: envelopeJson.length,
+            },
+            materialization: materializationMeta,
+            isError: downstreamIsError,
+          });
+          return outer;
         }
       } catch (err: any) {
         logger.warn("Materialization failed, falling back to continuation", {
@@ -957,6 +1092,8 @@ export async function handleUseTool(
     // replace result with compact placeholder and trigger continuation. The JSON envelope
     // must remain valid (parseable) — downstream consumers parse the leading JSON.
     const safetyNetThreshold = Math.max(effectiveLimit !== undefined ? effectiveLimit + effectiveLimit : 0, SERIALIZED_OUTPUT_SAFETY_NET_FLOOR);
+    let safetyNetFired = false;
+    let safetyNetOriginalChars: number | undefined;
     if (effectiveLimit !== undefined && outputJson.length > safetyNetThreshold) {
       const originalOutputLength = outputJson.length;
 
@@ -984,6 +1121,9 @@ export async function handleUseTool(
       outputJson = JSON.stringify(result, null, 2);
       outputJson += `\n\n[Output too large for context (${originalOutputLength.toLocaleString()} chars). To retrieve the full result: use_tool({ package_id: "${package_id}", tool_id: "${tool_id}", args: {}, result_id: "${continuationResultId}", output_offset: 0 })]`;
 
+      safetyNetFired = true;
+      safetyNetOriginalChars = originalOutputLength;
+
       logger.warn("Serialized output exceeded context budget — replaced with placeholder", {
         event: "serialized_output_safety_net",
         package_id,
@@ -996,7 +1136,7 @@ export async function handleUseTool(
 
     resetValidationAttempt(downstreamValidationAttemptKey);
 
-    return {
+    const outer: { content: Array<unknown>; isError: boolean; _meta?: Record<string, unknown>; structuredContent?: unknown } = {
       content: [
         {
           type: "text",
@@ -1006,6 +1146,27 @@ export async function handleUseTool(
       ],
       isError: downstreamIsError,
     };
+    applyOuterMeta(outer, {
+      passthrough: innerPassthrough,
+      superMcp: {
+        packageId: package_id,
+        toolId: tool_id,
+        durationMs: duration,
+        outputChars: outputJson.length,
+        ...(typeof result.telemetry.output_truncated === "boolean" ? { truncated: result.telemetry.output_truncated } : {}),
+        ...(typeof result.telemetry.result_id === "string" ? { resultId: result.telemetry.result_id } : {}),
+      },
+      ...(safetyNetFired
+        ? {
+            materialization: {
+              status: "oversized_output" as const,
+              ...(safetyNetOriginalChars !== undefined ? { originalChars: safetyNetOriginalChars } : {}),
+            } satisfies MaterializationMeta,
+          }
+        : {}),
+      isError: downstreamIsError,
+    });
+    return outer;
   } catch (error) {
     registry.notifyActivity(package_id);
     const duration = Date.now() - startTime;
