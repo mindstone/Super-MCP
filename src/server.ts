@@ -553,7 +553,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           },
           {
             name: "authenticate",
-            description: "Start OAuth authentication for packages that require it (e.g., Notion, Slack). Opens browser for authorization. Use health_check_all first to see which packages need authentication. If a package reports 'already_authenticated' but tools still fail with auth errors, use force: true to bypass the check and re-authenticate.",
+            description: "Start authentication for packages that require it. For OAuth packages (e.g., Notion, HubSpot), opens the browser for authorization. For stdio packages with their own authentication tool (e.g., Slack's authenticate_slack_workspace), delegates to that tool. Use health_check_all first to see which packages need authentication. If a package reports 'already_authenticated' but tools still fail with auth errors, use force: true to bypass the check and re-authenticate.",
             inputSchema: {
               type: "object",
               properties: {

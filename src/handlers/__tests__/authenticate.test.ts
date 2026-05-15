@@ -43,8 +43,7 @@ function expectLegacyResponse(result: any): void {
   expect(parsed).toEqual({
     package_id: PACKAGE_ID,
     status: "success",
-    message:
-      "Auto-authentication delegation skipped or unavailable for this package. The package may need a different authentication flow.",
+    message: "Package does not expose an authentication tool — no action needed.",
   });
 }
 
@@ -114,7 +113,7 @@ describe("handleAuthenticate stdio delegation", () => {
     expectLegacyResponse(result);
   });
 
-  it("logs warn and falls back when delegated auth tool call fails", async () => {
+  it("returns error response when delegated auth tool call fails", async () => {
     const client = {
       listTools: vi.fn().mockResolvedValue([{ name: "authenticate_slack_workspace" }]),
       callTool: vi.fn().mockRejectedValue(new Error("callTool boom")),
@@ -125,13 +124,21 @@ describe("handleAuthenticate stdio delegation", () => {
 
     expect(client.callTool).toHaveBeenCalledWith("authenticate_slack_workspace", {});
     expect(mockLogger.warn).toHaveBeenCalledWith(
-      "Failed to delegate to stdio auth tool, falling back to legacy response",
+      "Failed to delegate to stdio auth tool",
       expect.objectContaining({
         package_id: PACKAGE_ID,
+        tool: "authenticate_slack_workspace",
         error: "callTool boom",
       })
     );
-    expectLegacyResponse(result);
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed).toEqual({
+      package_id: PACKAGE_ID,
+      status: "error",
+      error: "Authentication delegation failed: callTool boom",
+      delegated_tool: "authenticate_slack_workspace",
+    });
   });
 
   it("delegates when stdio package exposes exact authenticate tool name", async () => {
@@ -177,7 +184,7 @@ describe("handleAuthenticate stdio delegation", () => {
     expectLegacyResponse(result);
   });
 
-  it("logs warn and falls back when delegated auth tool call times out", async () => {
+  it("returns error response when delegated auth tool call times out", async () => {
     vi.useFakeTimers();
 
     const client = {
@@ -192,12 +199,19 @@ describe("handleAuthenticate stdio delegation", () => {
 
     expect(client.callTool).toHaveBeenCalledWith("authenticate_slack_workspace", {});
     expect(mockLogger.warn).toHaveBeenCalledWith(
-      "Delegated stdio auth tool timed out, falling back to legacy response",
+      "Delegated stdio auth tool timed out",
       expect.objectContaining({
         package_id: PACKAGE_ID,
         tool: "authenticate_slack_workspace",
       }),
     );
-    expectLegacyResponse(result);
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed).toEqual({
+      package_id: PACKAGE_ID,
+      status: "error",
+      error: "Authentication delegation failed: Delegated stdio auth tool timed out after 60000ms",
+      delegated_tool: "authenticate_slack_workspace",
+    });
   });
 });

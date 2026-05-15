@@ -102,14 +102,29 @@ export async function handleAuthenticate(
 
           logger.warn(
             timedOut
-              ? "Delegated stdio auth tool timed out, falling back to legacy response"
-              : "Failed to delegate to stdio auth tool, falling back to legacy response",
+              ? "Delegated stdio auth tool timed out"
+              : "Failed to delegate to stdio auth tool",
             {
               package_id,
               tool: authTool.name,
               error,
             },
           );
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  package_id,
+                  status: "error",
+                  error: `Authentication delegation failed: ${error}`,
+                  delegated_tool: authTool.name,
+                }, null, 2),
+              },
+            ],
+            isError: true,
+          };
         } finally {
           if (timeoutHandle) {
             clearTimeout(timeoutHandle);
@@ -130,8 +145,7 @@ export async function handleAuthenticate(
           text: JSON.stringify({
             package_id,
             status: "success",
-            message:
-              "Auto-authentication delegation skipped or unavailable for this package. The package may need a different authentication flow.",
+            message: "Package does not expose an authentication tool — no action needed.",
           }, null, 2),
         },
       ],
