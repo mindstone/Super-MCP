@@ -48,6 +48,29 @@ export async function handleAuthenticate(
   }
   
   if (pkg.transport === "stdio") {
+    try {
+      const client = await registry.getClient(package_id);
+      const tools = await client.listTools();
+      const authTool = tools.find(
+        (t: any) =>
+          typeof t?.name === "string" &&
+          (t.name === "authenticate" || t.name.startsWith("authenticate_"))
+      );
+
+      if (authTool) {
+        logger.info("Delegating to stdio package's auth tool", {
+          package_id,
+          tool: authTool.name,
+        });
+        return await client.callTool(authTool.name, {});
+      }
+    } catch (err) {
+      logger.warn("Failed to delegate to stdio auth tool, falling back to legacy response", {
+        package_id,
+        error: formatError(err),
+      });
+    }
+
     return {
       content: [
         {
