@@ -43,13 +43,15 @@ function expectLegacyResponse(result: any): void {
   expect(parsed).toEqual({
     package_id: PACKAGE_ID,
     status: "success",
-    message: "stdio packages don't require authentication",
+    message:
+      "Auto-authentication delegation skipped or unavailable for this package. The package may need a different authentication flow.",
   });
 }
 
 describe("handleAuthenticate stdio delegation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.useRealTimers();
   });
 
   it("delegates to authenticate_* tool for stdio packages", async () => {
@@ -151,5 +153,51 @@ describe("handleAuthenticate stdio delegation", () => {
       tool: "authenticate",
     });
     expect(result).toBe(delegatedResult);
+  });
+
+  it("skips delegation when authenticate_* tool requires input args", async () => {
+    const client = {
+      listTools: vi.fn().mockResolvedValue([
+        {
+          name: "authenticate_workspace_account",
+          inputSchema: {
+            type: "object",
+            required: ["email"],
+          },
+        },
+      ]),
+      callTool: vi.fn(),
+    };
+    const registry = createRegistry(client);
+
+    const result = await handleAuthenticate({ package_id: PACKAGE_ID }, registry, createCatalog());
+
+    expect(client.listTools).toHaveBeenCalledTimes(1);
+    expect(client.callTool).not.toHaveBeenCalled();
+    expectLegacyResponse(result);
+  });
+
+  it("logs warn and falls back when delegated auth tool call times out", async () => {
+    vi.useFakeTimers();
+
+    const client = {
+      listTools: vi.fn().mockResolvedValue([{ name: "authenticate_slack_workspace" }]),
+      callTool: vi.fn().mockReturnValue(new Promise(() => {})),
+    };
+    const registry = createRegistry(client);
+
+    const resultPromise = handleAuthenticate({ package_id: PACKAGE_ID }, registry, createCatalog());
+    await vi.advanceTimersByTimeAsync(60_000);
+    const result = await resultPromise;
+
+    expect(client.callTool).toHaveBeenCalledWith("authenticate_slack_workspace", {});
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      "Delegated stdio auth tool timed out, falling back to legacy response",
+      expect.objectContaining({
+        package_id: PACKAGE_ID,
+        tool: "authenticate_slack_workspace",
+      }),
+    );
+    expectLegacyResponse(result);
   });
 });

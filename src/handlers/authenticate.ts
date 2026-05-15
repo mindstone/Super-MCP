@@ -7,6 +7,7 @@ import { formatError } from "../utils/formatError.js";
 import { coerceStringifiedBoolean } from "../utils/normalizeInput.js";
 
 const logger = getLogger();
+const STDIO_AUTH_DELEGATION_TIMEOUT_MS = 60_000;
 
 export async function handleAuthenticate(
   input: { package_id: string; wait_for_completion?: boolean; force?: boolean },
@@ -52,9 +53,22 @@ export async function handleAuthenticate(
       const client = await registry.getClient(package_id);
       const tools = await client.listTools();
       const authTool = tools.find(
-        (t: any) =>
-          typeof t?.name === "string" &&
-          (t.name === "authenticate" || t.name.startsWith("authenticate_"))
+        (t: any) => {
+          if (typeof t?.name !== "string") {
+            return false;
+          }
+
+          if (t.name !== "authenticate" && !t.name.startsWith("authenticate_")) {
+            return false;
+          }
+
+          const required = t?.inputSchema?.required;
+          if (required === undefined) {
+            return true;
+          }
+
+          return Array.isArray(required) && required.length === 0;
+        }
       );
 
       if (authTool) {
@@ -62,7 +76,45 @@ export async function handleAuthenticate(
           package_id,
           tool: authTool.name,
         });
-        return await client.callTool(authTool.name, {});
+        let timeoutHandle: NodeJS.Timeout | null = null;
+        const timeoutPromise = new Promise<never>((_, reject) => {
+          timeoutHandle = setTimeout(() => {
+            reject(
+              new Error(
+                `Delegated stdio auth tool timed out after ${STDIO_AUTH_DELEGATION_TIMEOUT_MS}ms`,
+              ),
+            );
+          }, STDIO_AUTH_DELEGATION_TIMEOUT_MS);
+        });
+
+        try {
+          return await Promise.race([
+            client.callTool(authTool.name, {}),
+            timeoutPromise,
+          ]);
+        } catch (err) {
+          const error = formatError(err);
+          const timedOut =
+            typeof error === "string" &&
+            error.includes(
+              `timed out after ${STDIO_AUTH_DELEGATION_TIMEOUT_MS}ms`,
+            );
+
+          logger.warn(
+            timedOut
+              ? "Delegated stdio auth tool timed out, falling back to legacy response"
+              : "Failed to delegate to stdio auth tool, falling back to legacy response",
+            {
+              package_id,
+              tool: authTool.name,
+              error,
+            },
+          );
+        } finally {
+          if (timeoutHandle) {
+            clearTimeout(timeoutHandle);
+          }
+        }
       }
     } catch (err) {
       logger.warn("Failed to delegate to stdio auth tool, falling back to legacy response", {
@@ -78,7 +130,8 @@ export async function handleAuthenticate(
           text: JSON.stringify({
             package_id,
             status: "success",
-            message: "stdio packages don't require authentication",
+            message:
+              "Auto-authentication delegation skipped or unavailable for this package. The package may need a different authentication flow.",
           }, null, 2),
         },
       ],
