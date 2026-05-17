@@ -742,6 +742,32 @@ export class PackageRegistry {
     return this.packages.find(pkg => pkg.id === packageId);
   }
 
+  /**
+   * Resolve a bare package alias (e.g. "GoogleWorkspace", "Slack", "HubSpot",
+   * "Microsoft365Mail") to its concrete multi-instance package ids.
+   *
+   * Multi-instance packages always have ids of the form `${BaseName}-${slug}`.
+   * If a single-instance package with the exact id exists, that match wins and
+   * is returned alone. Otherwise we collect every package whose id starts with
+   * `${alias}-`.
+   *
+   * Used by useTool's R2 alias resolver. The caller picks the unique match
+   * (and emits a telemetry breadcrumb) or surfaces an ambiguity error listing
+   * every candidate. The lookup is case-insensitive.
+   */
+  findPackagesByAlias(alias: string): PackageConfig[] {
+    if (!alias) return [];
+
+    const aliasLower = alias.toLowerCase();
+    const exactMatch = this.packages.find(pkg => pkg.id.toLowerCase() === aliasLower);
+    if (exactMatch) {
+      return [exactMatch];
+    }
+
+    const prefix = `${aliasLower}-`;
+    return this.packages.filter(pkg => pkg.id.toLowerCase().startsWith(prefix));
+  }
+
   getSkippedPackages(): SkippedPackage[] {
     return [...this.skippedPackages];
   }

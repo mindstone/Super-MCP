@@ -201,6 +201,32 @@ export class Catalog {
     return tool?.tool.inputSchema;
   }
 
+  /**
+   * Search every cached package for a tool registered under the bare name `toolId`.
+   *
+   * Used by useTool's R5 bare-tool-name resolver: when the agent omits both
+   * `package_id` and the `Package__` prefix, super-mcp tries to recover by
+   * searching all loaded catalogs. The caller picks the unique match (and
+   * emits a telemetry breadcrumb) or surfaces an `AMBIGUOUS_TOOL` error
+   * listing every candidate.
+   *
+   * Only iterates the in-memory cache — does not force-load other packages.
+   * Match is exact (case-sensitive) on `tool.name`.
+   */
+  findToolByName(toolId: string): Array<{ packageId: string; toolId: string }> {
+    if (!toolId) return [];
+    const matches: Array<{ packageId: string; toolId: string }> = [];
+    for (const cached of this.cache.values()) {
+      if (cached.status !== "ready") continue;
+      for (const t of cached.tools) {
+        if (t.tool.name === toolId) {
+          matches.push({ packageId: cached.packageId, toolId: t.tool.name });
+        }
+      }
+    }
+    return matches;
+  }
+
   paginate(
     packageId: string,
     pageSize: number = 20,

@@ -154,6 +154,11 @@ interface OuterPassthroughMeta {
   structuredContent?: unknown;
 }
 
+interface SuperMcpResolution {
+  from: string;
+  to: string;
+}
+
 interface SuperMcpTelemetryMeta {
   packageId: string;
   toolId: string;
@@ -164,6 +169,12 @@ interface SuperMcpTelemetryMeta {
   dryRun?: boolean;
   continuation?: boolean;
   staged?: boolean;
+  /** Argument-shape normalisations applied (e.g. "coerce_undefined_args"). */
+  normalisations?: string[];
+  /** Package alias resolution (e.g. bare "GoogleWorkspace" -> instance id). */
+  packageResolution?: SuperMcpResolution;
+  /** Bare-tool-name resolution across packages. */
+  toolResolution?: SuperMcpResolution & { packageId: string };
 }
 
 interface MaterializationMeta {
@@ -234,6 +245,11 @@ function applyOuterMeta(
       ...(options.superMcp.dryRun ? { dryRun: true } : {}),
       ...(options.superMcp.continuation ? { continuation: true } : {}),
       ...(options.superMcp.staged ? { staged: true } : {}),
+      ...(options.superMcp.normalisations && options.superMcp.normalisations.length > 0
+        ? { normalisations: options.superMcp.normalisations }
+        : {}),
+      ...(options.superMcp.packageResolution ? { packageResolution: options.superMcp.packageResolution } : {}),
+      ...(options.superMcp.toolResolution ? { toolResolution: options.superMcp.toolResolution } : {}),
     },
   };
 
@@ -772,11 +788,29 @@ export async function handleUseTool(
 
   let { package_id, tool_id, args, dry_run = false, max_output_chars, schema_hash } = cleanInput;
 
+  const normalisations: string[] = [];
+
   // Normalize inputs that the model may have stringified (upstream Claude model bug).
   // See: anthropics/claude-code#25865, docs/investigations/260330_slow_turn_brute_force_search.md
   // Safety: coercion returns the properly-typed value on success, or the original value
   // unchanged on failure — in which case downstream validation catches the type mismatch.
   args = coerceStringifiedJson(args, "object", { handler: "use_tool", field: "args", package_id, tool_id }) as typeof args;
+
+  // R1: coerce undefined/null args to {} so no-arg tools (list_*, status, ready, etc.)
+  // pass Zod schemas that require an object. Logged once per call as a telemetry breadcrumb.
+  // Evidence: 100+ replayed errors per fortnight on `list_workspace_accounts`,
+  // `list_slack_workspaces`, `authenticate_*`, etc. — agent omits args entirely and the
+  // upstream connector rejects `undefined`. Validator then loops through repair tickets.
+  if (args === undefined || args === null) {
+    args = {} as typeof args;
+    normalisations.push("coerce_undefined_args");
+    logger.debug("Coerced undefined/null args to {}", {
+      handler: "use_tool",
+      package_id,
+      tool_id,
+    });
+  }
+
   dry_run = coerceStringifiedBoolean(dry_run, { handler: "use_tool", field: "dry_run" }) as typeof dry_run;
   max_output_chars = coerceStringifiedNumber(max_output_chars, {
     handler: "use_tool",
@@ -809,6 +843,70 @@ export async function handleUseTool(
       stripped_tool_id: tool_id,
       package_id,
     });
+  }
+
+  // R5 — bare tool-name resolver. When the agent omits both package_id and the
+  // `Package__` prefix, search every loaded package for a tool registered under
+  // this bare name. Unique match wins (breadcrumb); ambiguous match surfaces a
+  // structured AMBIGUOUS_TOOL error listing every candidate.
+  //
+  // Evidence: 58 calls in the 2-week corpus (2026-05-03 -> 2026-05-16) had a
+  // bare tool name (search_workspace_emails, get_workspace_email_thread, etc.)
+  // without package prefix and hit `client.callTool` against an empty package.
+  let toolResolution: { from: string; to: string; packageId: string } | undefined;
+  if (!package_id && !tool_id.includes("__")) {
+    const matches = catalog.findToolByName(tool_id);
+    if (matches.length === 1) {
+      const match = matches[0];
+      toolResolution = { from: tool_id, to: match.toolId, packageId: match.packageId };
+      package_id = match.packageId;
+      logger.debug("Resolved bare tool name to single package", {
+        tool_id,
+        resolved_package_id: match.packageId,
+      });
+    } else if (matches.length > 1) {
+      throw {
+        code: ERROR_CODES.TOOL_NOT_FOUND,
+        message: `Bare tool name '${tool_id}' matches ${matches.length} loaded packages. Provide an explicit \`package_id\` to disambiguate, or use the \`Package__${tool_id}\` form.`,
+        data: {
+          tool_id,
+          ambiguous: true,
+          candidates: matches.map(m => ({ package_id: m.packageId, tool_id: m.toolId })),
+        },
+      };
+    }
+  }
+
+  // R2 — bare package-alias resolver. When the agent passes the base server
+  // name (e.g. "GoogleWorkspace") instead of a multi-instance package id
+  // (e.g. "GoogleWorkspace-greg-work-com"), recover by querying the registry
+  // for every package whose id starts with `${alias}-`. Unique match wins
+  // (breadcrumb); ambiguous match surfaces ACCOUNT_SELECTION_REQUIRED with
+  // the candidate list so the agent can ask the user which account to use.
+  //
+  // Evidence: 66 `Package not found: GoogleWorkspace` errors in the corpus.
+  let packageResolution: { from: string; to: string } | undefined;
+  if (package_id && !registry.getPackage(package_id)) {
+    const matches = registry.findPackagesByAlias(package_id);
+    if (matches.length === 1) {
+      const resolved = matches[0];
+      packageResolution = { from: package_id, to: resolved.id };
+      logger.debug("Resolved bare package alias to single instance", {
+        original_package_id: package_id,
+        resolved_package_id: resolved.id,
+      });
+      package_id = resolved.id;
+    } else if (matches.length > 1) {
+      throw {
+        code: ERROR_CODES.PACKAGE_NOT_FOUND,
+        message: `Package alias '${package_id}' matches ${matches.length} active accounts. Specify the full package_id (e.g. ${matches.map(m => `'${m.id}'`).join(", ")}).`,
+        data: {
+          package_id,
+          ambiguous: true,
+          candidates: matches.map(m => ({ package_id: m.id, name: m.name })),
+        },
+      };
+    }
   }
 
   // Check if tool is blocked by security policy
@@ -954,6 +1052,9 @@ export async function handleUseTool(
         toolId: tool_id,
         durationMs: 0,
         dryRun: true,
+        ...(normalisations.length > 0 ? { normalisations: [...normalisations] } : {}),
+        ...(packageResolution ? { packageResolution } : {}),
+        ...(toolResolution ? { toolResolution } : {}),
       },
     });
   }
@@ -1028,6 +1129,9 @@ export async function handleUseTool(
               toolId: tool_id,
               durationMs: duration,
               outputChars: envelopeJson.length,
+              ...(normalisations.length > 0 ? { normalisations: [...normalisations] } : {}),
+              ...(packageResolution ? { packageResolution } : {}),
+              ...(toolResolution ? { toolResolution } : {}),
             },
             materialization: materializationMeta,
           });
@@ -1215,6 +1319,9 @@ export async function handleUseTool(
           : outputJson.length,
         ...(typeof result.telemetry.output_truncated === "boolean" ? { truncated: result.telemetry.output_truncated } : {}),
         ...(typeof result.telemetry.result_id === "string" ? { resultId: result.telemetry.result_id } : {}),
+        ...(normalisations.length > 0 ? { normalisations: [...normalisations] } : {}),
+        ...(packageResolution ? { packageResolution } : {}),
+        ...(toolResolution ? { toolResolution } : {}),
       },
       ...(safetyNetFired
         ? {
