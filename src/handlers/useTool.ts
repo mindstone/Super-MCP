@@ -7,7 +7,7 @@ import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/t
 import { getLogger } from "../logging.js";
 import { getSecurityPolicy } from "../security.js";
 import { findBestMatch } from "../utils/fuzzyMatch.js";
-import { coerceStringifiedJson, coerceStringifiedBoolean, coerceStringifiedNumber } from "../utils/normalizeInput.js";
+import { coerceStringifiedJson, coerceStringifiedBoolean, coerceStringifiedNumber, normalizeArgKeys, formatKeyAliasBreadcrumb } from "../utils/normalizeInput.js";
 import { materializeOutput, extractImageContentBlocks, SUPPORTED_IMAGE_MIME_TYPES } from "./materializeOutput.js";
 
 const logger = getLogger();
@@ -996,6 +996,25 @@ export async function handleUseTool(
         "schema_hash mismatch — tool schema may have changed since get_tool_details was called",
         { tool_id, expected: cachedTool.schemaHash, got: schema_hash },
       );
+    }
+  }
+
+  // R3 — per-tool top-level key-alias normalisation. Rewrites the agent's
+  // mistaken key into the canonical key the schema accepts (e.g. limit→count
+  // for Slack message tools, snake_case→camelCase for Microsoft Graph,
+  // body→properties.hs_note_body for HubSpot create_hubspot_note). Runs after
+  // R1/R2/R5 so we know the final package/tool id. Target-wins on collision.
+  // See super-mcp/src/config/paramAliasMap.ts for the map and direction
+  // rationale.
+  {
+    const { args: rewritten, breadcrumbs } = normalizeArgKeys(args, {
+      handler: "use_tool",
+      package_id,
+      tool_id,
+    });
+    args = rewritten as typeof args;
+    for (const entry of breadcrumbs) {
+      normalisations.push(formatKeyAliasBreadcrumb(entry));
     }
   }
 
