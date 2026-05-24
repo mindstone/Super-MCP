@@ -226,4 +226,77 @@ describe("search_tools BM25 cache and build coordination", () => {
     expect(buildToolInfos).toHaveBeenCalledTimes(1);
     expect(bm25Factory).toHaveBeenCalledTimes(1);
   });
+
+  it("clears failed in-flight BM25 builds so the next call retries and caches", async () => {
+    const { handleSearchTools } = await import("../searchTools.js");
+    const registry = createRegistry(["pkg-a"]);
+
+    const ensurePackageLoaded = vi.fn(async () => {});
+    const buildToolInfos = vi.fn(async (packageId: string) => [createTool(`${packageId}__tool`)]);
+
+    const catalog = {
+      etag: vi.fn(() => "etag-retry"),
+      ensurePackageLoaded,
+      buildToolInfos,
+    } as unknown as Catalog;
+
+    bm25Factory.mockImplementationOnce(() => {
+      throw new Error("intentional bm25 build failure");
+    });
+
+    await expect(handleSearchTools({ query: "tool", limit: 2 }, registry, catalog)).rejects.toThrow(
+      "intentional bm25 build failure"
+    );
+
+    const retry = parseSearchResult(await handleSearchTools({ query: "tool", limit: 2 }, registry, catalog));
+    const cached = parseSearchResult(await handleSearchTools({ query: "tool", limit: 2 }, registry, catalog));
+
+    expect(retry.total_tools_searched).toBe(1);
+    expect(cached.total_tools_searched).toBe(1);
+    expect(ensurePackageLoaded).toHaveBeenCalledTimes(1);
+    expect(buildToolInfos).toHaveBeenCalledTimes(1);
+    expect(bm25Factory).toHaveBeenCalledTimes(2);
+  });
+
+  it("blocks cache install when invalidated mid-build even if post-build etag changes", async () => {
+    const { handleSearchTools, invalidateSearchCache } = await import("../searchTools.js");
+    const registry = createRegistry(["pkg-a"]);
+
+    const buildEntered = createDeferred();
+    const releaseBuild = createDeferred();
+    let shouldPauseFirstBuild = true;
+    let currentEtag = "etag-A";
+    let toolVersion = 1;
+
+    const ensurePackageLoaded = vi.fn(async () => {
+      if (!shouldPauseFirstBuild) {
+        return;
+      }
+      shouldPauseFirstBuild = false;
+      buildEntered.resolve();
+      await releaseBuild.promise;
+    });
+    const buildToolInfos = vi.fn(async (packageId: string) => [createTool(`${packageId}__tool-v${toolVersion++}`)]);
+
+    const catalog = {
+      etag: vi.fn(() => currentEtag),
+      ensurePackageLoaded,
+      buildToolInfos,
+    } as unknown as Catalog;
+
+    const firstBuild = handleSearchTools({ query: "tool", limit: 2 }, registry, catalog);
+    await buildEntered.promise;
+    invalidateSearchCache();
+    currentEtag = "etag-B";
+    releaseBuild.resolve();
+
+    const first = parseSearchResult(await firstBuild);
+    const second = parseSearchResult(await handleSearchTools({ query: "tool", limit: 2 }, registry, catalog));
+
+    expect(first.results[0]?.tool_id).toBe("pkg-a__tool-v1");
+    expect(second.results[0]?.tool_id).toBe("pkg-a__tool-v2");
+    expect(ensurePackageLoaded).toHaveBeenCalledTimes(2);
+    expect(buildToolInfos).toHaveBeenCalledTimes(2);
+    expect(bm25Factory).toHaveBeenCalledTimes(2);
+  });
 });
