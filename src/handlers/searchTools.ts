@@ -33,8 +33,11 @@ export interface SearchToolsOutput {
 
 // Cache for BM25 engine - rebuilt when catalog changes
 let cachedBM25Engine: BM25Engine | null = null;
-let cachedEtag: string = "";
-let cachedToolMap: Map<string, ToolInfo> = new Map();
+let cachedEtag: string | null = null;
+let cachedToolMap: Map<string, ToolInfo> | null = null;
+let buildBM25Promise: Promise<{ engine: BM25Engine; toolMap: Map<string, ToolInfo>; etag: string }> | null = null;
+let cacheGeneration = 0;
+let buildBM25DedupWaiters = 0;
 
 function tokenize(text: string): string[] {
   return text
@@ -51,64 +54,99 @@ async function buildBM25Index(
   const currentEtag = catalog.etag();
 
   // Return cached if etag matches
-  if (cachedBM25Engine && cachedEtag === currentEtag) {
+  if (cachedBM25Engine && cachedToolMap && cachedEtag === currentEtag) {
+    logger.debug("BM25 search index cache hit", {
+      etag: currentEtag,
+      "bm25.cache_hit": true,
+    });
     return { engine: cachedBM25Engine, toolMap: cachedToolMap };
+  }
+
+  if (buildBM25Promise) {
+    buildBM25DedupWaiters += 1;
+    const result = await buildBM25Promise;
+    return { engine: result.engine, toolMap: result.toolMap };
   }
 
   logger.debug("Building BM25 search index", { etag: currentEtag });
   const startTime = Date.now();
+  const myGeneration = cacheGeneration;
+  buildBM25DedupWaiters = 0;
 
-  const engine = (bm25Constructor as () => BM25Engine)();
-  engine.defineConfig({ fldWeights: { name: 3, summary: 2, params: 1 } });
-  engine.definePrepTasks([tokenize]);
+  buildBM25Promise = (async () => {
+    const engine = (bm25Constructor as () => BM25Engine)();
+    engine.defineConfig({ fldWeights: { name: 3, summary: 2, params: 1 } });
+    engine.definePrepTasks([tokenize]);
 
-  const toolMap = new Map<string, ToolInfo>();
+    const toolMap = new Map<string, ToolInfo>();
 
-  for (const pkg of registry.getPackages()) {
-    try {
-      await catalog.ensurePackageLoaded(pkg.id);
-      const tools = await catalog.buildToolInfos(pkg.id, {
-        summarize: true,
-        include_schemas: true,
-      });
+    for (const pkg of registry.getPackages()) {
+      try {
+        await catalog.ensurePackageLoaded(pkg.id);
+        const tools = await catalog.buildToolInfos(pkg.id, {
+          summarize: true,
+          include_schemas: true,
+        });
 
-      for (const tool of tools) {
-        const paramNames = Object.keys(tool.schema?.properties || {}).join(" ");
+        for (const tool of tools) {
+          const paramNames = Object.keys(tool.schema?.properties || {}).join(" ");
 
-        engine.addDoc(
-          {
-            name: tool.name,
-            summary: tool.summary || "",
-            params: paramNames,
-          },
-          tool.tool_id
-        );
-        toolMap.set(tool.tool_id, {
-          ...tool,
+          engine.addDoc(
+            {
+              name: tool.name,
+              summary: tool.summary || "",
+              params: paramNames,
+            },
+            tool.tool_id
+          );
+          toolMap.set(tool.tool_id, {
+            ...tool,
+            package_id: pkg.id,
+          });
+        }
+      } catch (error) {
+        logger.debug("Skipping package for search index", {
           package_id: pkg.id,
+          error: error instanceof Error ? error.message : String(error),
         });
       }
-    } catch (error) {
-      logger.debug("Skipping package for search index", {
-        package_id: pkg.id,
-        error: error instanceof Error ? error.message : String(error),
-      });
     }
+
+    engine.consolidate();
+
+    return {
+      engine,
+      toolMap,
+      etag: catalog.etag(),
+    };
+  })();
+
+  try {
+    const result = await buildBM25Promise;
+    const shouldInstallCache = cacheGeneration === myGeneration;
+
+    if (shouldInstallCache) {
+      cachedBM25Engine = result.engine;
+      cachedToolMap = result.toolMap;
+      cachedEtag = result.etag;
+    }
+
+    logger.debug("BM25 search index built", {
+      tool_count: result.toolMap.size,
+      elapsed_ms: Date.now() - startTime,
+      cold_path: true,
+      dedup_count: buildBM25DedupWaiters,
+      concurrency: 1,
+      cache_generation: myGeneration,
+      cache_installed: shouldInstallCache,
+      "bm25.cache_hit": false,
+    });
+
+    return { engine: result.engine, toolMap: result.toolMap };
+  } finally {
+    buildBM25Promise = null;
+    buildBM25DedupWaiters = 0;
   }
-
-  engine.consolidate();
-
-  // Update cache
-  cachedBM25Engine = engine;
-  cachedEtag = currentEtag;
-  cachedToolMap = toolMap;
-
-  logger.debug("BM25 search index built", {
-    tool_count: toolMap.size,
-    elapsed_ms: Date.now() - startTime,
-  });
-
-  return { engine, toolMap };
 }
 
 export async function handleSearchTools(
@@ -187,8 +225,11 @@ export async function handleSearchTools(
 
 // Export function to invalidate cache (called when config changes)
 export function invalidateSearchCache(): void {
+  cacheGeneration += 1;
   cachedBM25Engine = null;
-  cachedEtag = "";
-  cachedToolMap.clear();
-  logger.debug("Search cache invalidated");
+  cachedEtag = null;
+  cachedToolMap = null;
+  logger.debug("Search cache invalidated", {
+    cache_generation: cacheGeneration,
+  });
 }
