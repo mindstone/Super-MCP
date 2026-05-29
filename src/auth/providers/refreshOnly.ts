@@ -56,6 +56,13 @@ export class RefreshOnlyOAuthProvider implements OAuthClientProvider {
   }
   
   async invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier') {
+    if (scope === 'tokens') {
+      logger.warn("Ignoring token invalidation request in refresh-only mode", {
+        message: "Background connection attempts must not delete persisted OAuth tokens. Use authenticate() to replace expired credentials.",
+      });
+      return;
+    }
+
     return this.delegate.invalidateCredentials(scope);
   }
 }

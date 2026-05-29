@@ -7,6 +7,11 @@ import { homedir } from "os";
 import { randomBytes } from "crypto";
 
 const logger = getLogger();
+const OAUTH_TOKEN_DIR_ENV = "SUPER_MCP_OAUTH_TOKEN_DIR";
+
+function getOAuthTokenStoragePath(): string {
+  return process.env[OAUTH_TOKEN_DIR_ENV] || path.join(homedir(), ".super-mcp", "oauth-tokens");
+}
 
 /**
  * Simple OAuth provider that opens browser for authorization
@@ -30,7 +35,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   constructor(packageId: string, oauthPort: number = 5173, staticCredentials?: StaticOAuthCredentials) {
     this.packageId = packageId;
     this.oauthPort = oauthPort;
-    this.tokenStoragePath = path.join(homedir(), ".super-mcp", "oauth-tokens");
+    this.tokenStoragePath = getOAuthTokenStoragePath();
     this.staticCredentials = staticCredentials;
     
     // Pre-populate client info from static credentials (skips DCR)
@@ -53,7 +58,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
    */
   static async getSavedClientPort(packageId: string): Promise<number | undefined> {
     try {
-      const tokenStoragePath = path.join(homedir(), ".super-mcp", "oauth-tokens");
+      const tokenStoragePath = getOAuthTokenStoragePath();
       const clientPath = path.join(tokenStoragePath, `${packageId}_client.json`);
       const clientData = await fs.readFile(clientPath, "utf8");
       const clientInfo = JSON.parse(clientData);
@@ -171,15 +176,28 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   }
   
   async saveTokens(tokens: any) {
-    this.savedTokens = tokens;
+    const mergedTokens = {
+      ...(this.savedTokens || {}),
+      ...tokens,
+    };
+
+    // OAuth refresh responses often omit refresh_token when it has not rotated.
+    // Preserve the existing refresh token so a routine access-token refresh does
+    // not make the next app launch require full browser authentication.
+    if (!tokens?.refresh_token && this.savedTokens?.refresh_token) {
+      mergedTokens.refresh_token = this.savedTokens.refresh_token;
+    }
+
+    this.savedTokens = mergedTokens;
     
     try {
       await fs.mkdir(this.tokenStoragePath, { recursive: true, mode: 0o700 });
       const tokenPath = path.join(this.tokenStoragePath, `${this.packageId}_tokens.json`);
-      await fs.writeFile(tokenPath, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+      await fs.writeFile(tokenPath, JSON.stringify(mergedTokens, null, 2), { mode: 0o600 });
       logger.info("OAuth tokens saved to disk", { 
         package_id: this.packageId,
-        path: tokenPath 
+        path: tokenPath,
+        has_refresh_token: !!mergedTokens.refresh_token,
       });
     } catch (error) {
       logger.error("Failed to persist OAuth tokens", {
