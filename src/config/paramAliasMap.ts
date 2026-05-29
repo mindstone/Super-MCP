@@ -17,6 +17,9 @@
  *     braces. When the connector telemetry confirms R3 is firing reliably,
  *     the connector mirror in resources/mcp/hubspot/src/tools/crm-handlers.ts
  *     can go.
+ *   • Google Workspace Gmail tools accept snake_case after the MCP naming
+ *     standardisation; agents still regularly emit the old camelCase names
+ *     from stale prompt memory and earlier connector examples.
  *
  * Semantics:
  *   • Source matches by exact key on the top level of `args` only.
@@ -44,11 +47,14 @@ export type AliasEntry = {
 
 export type ToolAliasMap = ReadonlyArray<AliasEntry>;
 
-/** Per-tool entries, keyed by exact tool id (no package qualifier). */
-const TOOL_ALIASES: Readonly<Record<string, ToolAliasMap>> = {
+/** Per-tool entries, keyed by exact tool id, scoped by package family. */
+const SLACK_TOOL_ALIASES: Readonly<Record<string, ToolAliasMap>> = {
   // Slack message tools accept `count`, agents pass `limit`.
   search_slack_messages: [{ from: "limit", to: "count" }],
   get_slack_channel_history: [{ from: "limit", to: "count" }],
+};
+
+const MICROSOFT_TOOL_ALIASES: Readonly<Record<string, ToolAliasMap>> = {
   // Microsoft Graph wants camelCase; snake_case bleeds in from Google/Slack.
   search_workspace_calendar_events: [
     { from: "start_datetime", to: "startDateTime" },
@@ -70,6 +76,9 @@ const TOOL_ALIASES: Readonly<Record<string, ToolAliasMap>> = {
     { from: "end_datetime", to: "endDateTime" },
     { from: "device_timezone", to: "deviceTimezone" },
   ],
+};
+
+const HUBSPOT_TOOL_ALIASES: Readonly<Record<string, ToolAliasMap>> = {
   // HubSpot create_hubspot_note nested-target case.
   create_hubspot_note: [
     { from: "body", to: "properties.hs_note_body" },
@@ -77,19 +86,104 @@ const TOOL_ALIASES: Readonly<Record<string, ToolAliasMap>> = {
   ],
 };
 
+const GOOGLE_WORKSPACE_TOOL_ALIASES: Readonly<Record<string, ToolAliasMap>> = {
+  // Google Workspace Gmail/draft tools accept snake_case; agents still pass
+  // the pre-standardisation camelCase parameter names.
+  search_workspace_emails: [
+    { from: "hasAttachment", to: "has_attachment" },
+    { from: "isUnread", to: "is_unread" },
+    { from: "pageToken", to: "page_token" },
+    { from: "includeBody", to: "include_body" },
+    { from: "returnJson", to: "return_json" },
+    { from: "maxResults", to: "max_results" },
+  ],
+  get_workspace_email_thread: [
+    { from: "threadId", to: "thread_id" },
+    { from: "maxMessages", to: "max_messages" },
+    { from: "includeBody", to: "include_body" },
+    { from: "returnJson", to: "return_json" },
+  ],
+  send_workspace_email: [
+    { from: "isHtml", to: "is_html" },
+    { from: "replyToMessageId", to: "reply_to_message_id" },
+  ],
+  get_workspace_draft: [{ from: "draftId", to: "draft_id" }],
+  create_workspace_draft: [
+    { from: "isHtml", to: "is_html" },
+    { from: "replyToMessageId", to: "reply_to_message_id" },
+    { from: "threadId", to: "thread_id" },
+    { from: "inReplyTo", to: "in_reply_to" },
+  ],
+  update_workspace_draft: [
+    { from: "draftId", to: "draft_id" },
+    { from: "isHtml", to: "is_html" },
+    { from: "replyToMessageId", to: "reply_to_message_id" },
+    { from: "threadId", to: "thread_id" },
+    { from: "inReplyTo", to: "in_reply_to" },
+  ],
+  delete_workspace_draft: [{ from: "draftId", to: "draft_id" }],
+  send_workspace_draft: [{ from: "draftId", to: "draft_id" }],
+  archive_workspace_email: [
+    { from: "messageId", to: "message_id" },
+    { from: "messageIds", to: "message_ids" },
+  ],
+  trash_workspace_email: [
+    { from: "messageId", to: "message_id" },
+    { from: "messageIds", to: "message_ids" },
+  ],
+  untrash_workspace_email: [
+    { from: "messageId", to: "message_id" },
+    { from: "messageIds", to: "message_ids" },
+  ],
+  mark_workspace_email_read: [
+    { from: "messageId", to: "message_id" },
+    { from: "messageIds", to: "message_ids" },
+  ],
+  mark_workspace_email_unread: [
+    { from: "messageId", to: "message_id" },
+    { from: "messageIds", to: "message_ids" },
+  ],
+  manage_workspace_draft: [{ from: "draftId", to: "draft_id" }],
+  manage_workspace_attachment: [{ from: "messageId", to: "message_id" }],
+  download_workspace_attachment: [{ from: "messageId", to: "message_id" }],
+  upload_workspace_attachment: [
+    { from: "messageId", to: "message_id" },
+    { from: "mimeType", to: "mime_type" },
+  ],
+  delete_workspace_attachment: [{ from: "messageId", to: "message_id" }],
+};
+
+function isPackageFamily(packageId: string, family: string): boolean {
+  const normalizedPackageId = packageId.trim().toLowerCase();
+  const normalizedFamily = family.toLowerCase();
+  return (
+    normalizedPackageId === normalizedFamily ||
+    normalizedPackageId.startsWith(`${normalizedFamily}-`)
+  );
+}
+
+function isMicrosoftPackage(packageId: string): boolean {
+  return packageId.trim().toLowerCase().startsWith("microsoft");
+}
+
 /**
  * Returns the alias entries for a tool. Empty array when nothing is registered.
  *
- * The package id is accepted (and ignored today) so callers can pass the
- * full identifier without inspecting it; future entries that need to scope
- * by package (e.g. only `microsoft-calendar` flavour of the calendar tools)
- * can do so without rewriting call sites.
+ * Aliases are scoped by package family because generic tool ids like
+ * `list_workspace_calendar_events` can exist across providers with opposite
+ * canonical casing.
  */
 export function getAliasesForTool(
-  _packageId: string,
+  packageId: string,
   toolId: string,
 ): ToolAliasMap {
-  return TOOL_ALIASES[toolId] ?? [];
+  if (isPackageFamily(packageId, "Slack")) return SLACK_TOOL_ALIASES[toolId] ?? [];
+  if (isPackageFamily(packageId, "HubSpot")) return HUBSPOT_TOOL_ALIASES[toolId] ?? [];
+  if (isPackageFamily(packageId, "GoogleWorkspace")) {
+    return GOOGLE_WORKSPACE_TOOL_ALIASES[toolId] ?? [];
+  }
+  if (isMicrosoftPackage(packageId)) return MICROSOFT_TOOL_ALIASES[toolId] ?? [];
+  return [];
 }
 
 /** Reserved top-level keys that the normaliser must never rewrite. */

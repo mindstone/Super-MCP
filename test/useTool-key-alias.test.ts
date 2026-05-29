@@ -210,4 +210,60 @@ describe("useTool R3 — per-tool key-alias normalisation", () => {
       "key_alias:device_timezone→deviceTimezone",
     ]);
   });
+
+  it("Google Workspace draft: rewrites stale camelCase → snake_case before validation", async () => {
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createMocks();
+    (mockRegistry.getPackage as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: "GoogleWorkspace-alexs-mindstone-com",
+    });
+
+    const response = await handleUseTool(
+      {
+        package_id: "GoogleWorkspace-alexs-mindstone-com",
+        tool_id: "create_workspace_draft",
+        args: {
+          to: ["debug-recipient@example.com"],
+          subject: "REBEL-609 draft routing test",
+          body: "This is a draft routing test.",
+          isHtml: false,
+          threadId: "thread-123",
+          replyToMessageId: "message-123",
+        },
+        max_output_chars: null,
+      },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    expect(response.isError).toBe(false);
+    expect(mockValidator.validate).toHaveBeenCalledWith(
+      expect.anything(),
+      {
+        to: ["debug-recipient@example.com"],
+        subject: "REBEL-609 draft routing test",
+        body: "This is a draft routing test.",
+        is_html: false,
+        thread_id: "thread-123",
+        reply_to_message_id: "message-123",
+      },
+      expect.objectContaining({ tool_id: "create_workspace_draft" }),
+    );
+    expect(mockClient.callTool).toHaveBeenCalledWith("create_workspace_draft", {
+      to: ["debug-recipient@example.com"],
+      subject: "REBEL-609 draft routing test",
+      body: "This is a draft routing test.",
+      is_html: false,
+      thread_id: "thread-123",
+      reply_to_message_id: "message-123",
+    });
+
+    const meta = (response as { _meta?: Record<string, unknown> })._meta;
+    const superMcp = meta?.superMcp as Record<string, unknown> | undefined;
+    expect(superMcp?.normalisations).toEqual([
+      "key_alias:isHtml→is_html",
+      "key_alias:replyToMessageId→reply_to_message_id",
+      "key_alias:threadId→thread_id",
+    ]);
+  });
 });

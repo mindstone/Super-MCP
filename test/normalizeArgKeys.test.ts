@@ -44,8 +44,31 @@ describe("normalizeArgKeys — alias map directions", () => {
     ]);
   });
 
+  it("Google Workspace create_workspace_draft: stale camelCase → snake_case", () => {
+    const aliases = getAliasesForTool(
+      "GoogleWorkspace-alexs-mindstone-com",
+      "create_workspace_draft"
+    );
+    expect(aliases).toEqual([
+      { from: "isHtml", to: "is_html" },
+      { from: "replyToMessageId", to: "reply_to_message_id" },
+      { from: "threadId", to: "thread_id" },
+      { from: "inReplyTo", to: "in_reply_to" },
+    ]);
+  });
+
   it("returns [] for a tool with no aliases", () => {
     expect(getAliasesForTool("anything", "list_slack_channels")).toEqual([]);
+  });
+
+  it("returns [] when a shared tool name belongs to a different package family", () => {
+    expect(
+      getAliasesForTool(
+        "GoogleWorkspace-alexs-mindstone-com",
+        "list_workspace_calendar_events"
+      )
+    ).toEqual([]);
+    expect(getAliasesForTool("Slack-test", "create_workspace_draft")).toEqual([]);
   });
 });
 
@@ -54,7 +77,7 @@ describe("normalizeArgKeys — top-level replacement semantics", () => {
     const args = { limit: 25, channel: "C1" };
     const { args: out, breadcrumbs } = normalizeArgKeys(
       args,
-      ctx("search_slack_messages")
+      ctx("search_slack_messages", "Slack-test")
     );
     expect(out).toEqual({ count: 25, channel: "C1" });
     expect(breadcrumbs).toEqual([{ kind: "applied", from: "limit", to: "count" }]);
@@ -69,7 +92,7 @@ describe("normalizeArgKeys — top-level replacement semantics", () => {
     };
     const { args: out, breadcrumbs } = normalizeArgKeys(
       args,
-      ctx("list_workspace_calendar_events")
+      ctx("list_workspace_calendar_events", "Microsoft365Calendar-work")
     );
     expect(out).toEqual({
       startDateTime: "2026-05-17T00:00:00Z",
@@ -80,11 +103,39 @@ describe("normalizeArgKeys — top-level replacement semantics", () => {
     expect(breadcrumbs.every((b) => b.kind === "applied")).toBe(true);
   });
 
+  it("rewrites Google Workspace draft camelCase keys before validation", () => {
+    const args = {
+      to: ["debug-recipient@example.com"],
+      subject: "REBEL-609 draft routing test",
+      body: "This is a draft routing test.",
+      isHtml: false,
+      threadId: "thread-123",
+      inReplyTo: "message-123",
+    };
+    const { args: out, breadcrumbs } = normalizeArgKeys(
+      args,
+      ctx("create_workspace_draft", "GoogleWorkspace-alexs-mindstone-com")
+    );
+    expect(out).toEqual({
+      to: ["debug-recipient@example.com"],
+      subject: "REBEL-609 draft routing test",
+      body: "This is a draft routing test.",
+      is_html: false,
+      thread_id: "thread-123",
+      in_reply_to: "message-123",
+    });
+    expect(breadcrumbs).toEqual([
+      { kind: "applied", from: "isHtml", to: "is_html" },
+      { kind: "applied", from: "threadId", to: "thread_id" },
+      { kind: "applied", from: "inReplyTo", to: "in_reply_to" },
+    ]);
+  });
+
   it("is a no-op when the agent already used the canonical key", () => {
     const args = { count: 25, channel: "C1" };
     const { args: out, breadcrumbs } = normalizeArgKeys(
       args,
-      ctx("search_slack_messages")
+      ctx("search_slack_messages", "Slack-test")
     );
     expect(out).toEqual({ count: 25, channel: "C1" });
     expect(breadcrumbs).toEqual([]);
@@ -100,7 +151,7 @@ describe("normalizeArgKeys — top-level replacement semantics", () => {
   it("passes through non-object args unchanged", () => {
     const { args: out, breadcrumbs } = normalizeArgKeys(
       "not-an-object",
-      ctx("search_slack_messages")
+      ctx("search_slack_messages", "Slack-test")
     );
     expect(out).toBe("not-an-object");
     expect(breadcrumbs).toEqual([]);
@@ -109,7 +160,7 @@ describe("normalizeArgKeys — top-level replacement semantics", () => {
   it("passes through undefined args unchanged", () => {
     const { args: out, breadcrumbs } = normalizeArgKeys(
       undefined,
-      ctx("search_slack_messages")
+      ctx("search_slack_messages", "Slack-test")
     );
     expect(out).toBeUndefined();
     expect(breadcrumbs).toEqual([]);
@@ -121,7 +172,7 @@ describe("normalizeArgKeys — target-wins collision", () => {
     const args = { limit: 25, count: 50, channel: "C1" };
     const { args: out, breadcrumbs } = normalizeArgKeys(
       args,
-      ctx("search_slack_messages")
+      ctx("search_slack_messages", "Slack-test")
     );
     expect(out).toEqual({ count: 50, channel: "C1" });
     expect(breadcrumbs).toEqual([
@@ -136,7 +187,7 @@ describe("normalizeArgKeys — target-wins collision", () => {
     const args = { limit: 25, count: "", channel: "C1" };
     const { args: out, breadcrumbs } = normalizeArgKeys(
       args,
-      ctx("search_slack_messages")
+      ctx("search_slack_messages", "Slack-test")
     );
     expect(out).toEqual({ count: 25, channel: "C1" });
     expect(breadcrumbs).toEqual([{ kind: "applied", from: "limit", to: "count" }]);
@@ -146,7 +197,7 @@ describe("normalizeArgKeys — target-wins collision", () => {
     const args = { limit: 25, count: null, channel: "C1" };
     const { args: out, breadcrumbs } = normalizeArgKeys(
       args,
-      ctx("search_slack_messages")
+      ctx("search_slack_messages", "Slack-test")
     );
     expect(out).toEqual({ count: 25, channel: "C1" });
     expect(breadcrumbs).toEqual([{ kind: "applied", from: "limit", to: "count" }]);
@@ -218,7 +269,7 @@ describe("normalizeArgKeys — reserved-key exclusion", () => {
     const args = { _meta: { trace_id: "abc" }, limit: 25 };
     const { args: out, breadcrumbs } = normalizeArgKeys(
       args,
-      ctx("search_slack_messages")
+      ctx("search_slack_messages", "Slack-test")
     );
     expect(out).toEqual({ _meta: { trace_id: "abc" }, count: 25 });
     expect(breadcrumbs).toEqual([{ kind: "applied", from: "limit", to: "count" }]);
@@ -229,7 +280,7 @@ describe("normalizeArgKeys — reserved-key exclusion", () => {
       structuredContent: { items: [{ id: 1 }] },
       limit: 25,
     };
-    const { args: out } = normalizeArgKeys(args, ctx("search_slack_messages"));
+    const { args: out } = normalizeArgKeys(args, ctx("search_slack_messages", "Slack-test"));
     expect(out).toEqual({
       structuredContent: { items: [{ id: 1 }] },
       count: 25,
