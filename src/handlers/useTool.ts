@@ -12,6 +12,26 @@ import { materializeOutput, extractImageContentBlocks, SUPPORTED_IMAGE_MIME_TYPE
 
 const logger = getLogger();
 
+function isDownstreamOutputValidationError(error: McpError): boolean {
+  let dataText = "";
+  if (error.data !== undefined) {
+    try {
+      dataText = JSON.stringify(error.data);
+    } catch {
+      dataText = String(error.data);
+    }
+  }
+
+  const combined = `${error.message}\n${dataText}`;
+
+  return /\boutput\s+validation\b/i.test(combined)
+    || /\btool\s+result\s+validation\b/i.test(combined)
+    || /\bstructured\s*content\s+validation\b/i.test(combined)
+    || /\bstructured\s*content\b[\s\S]{0,160}\boutput\s+schema\b/i.test(combined)
+    || /\boutput\s+schema\b[\s\S]{0,160}\bstructured\s*content\b/i.test(combined)
+    || /\bfailed\s+to\s+validate\s+structured\s*content\b/i.test(combined);
+}
+
 // --- Continuation cache for truncated results ---
 interface CachedResult {
   serializedOutput: string;
@@ -1355,6 +1375,29 @@ export async function handleUseTool(
     registry.notifyActivity(package_id);
     const duration = Date.now() - startTime;
     const errorMessage = error instanceof Error ? error.message : String(error);
+
+    if (
+      error instanceof McpError
+      && error.code === SdkErrorCode.InvalidParams
+      && isDownstreamOutputValidationError(error)
+    ) {
+      resetValidationAttempt(downstreamValidationAttemptKey);
+      const providedArgs = isRecord(args) ? Object.keys(args) : [];
+
+      throw {
+        code: ERROR_CODES.DOWNSTREAM_ERROR,
+        message: `Downstream output validation failed for tool '${tool_id}': ${error.message}`,
+        data: {
+          package_id,
+          tool_id,
+          duration_ms: duration,
+          args_provided: providedArgs,
+          mcp_error_code: error.code,
+          mcp_error_data: error.data,
+          validation_direction: "output",
+        },
+      };
+    }
 
     if (error instanceof McpError && error.code === SdkErrorCode.InvalidParams) {
       const attempt = incrementValidationAttempt(downstreamValidationAttemptKey);

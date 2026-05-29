@@ -597,6 +597,122 @@ describe("use_tool repair tickets", () => {
     expect(repairTicket.downstream_error).toContain("query must include tenant context");
   });
 
+  it("classifies downstream output validation without an argument repair ticket", async () => {
+    const error = await runDownstreamInvalidParams({
+      schema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+        },
+      },
+      args: { query: "events" },
+      message: "Output validation failed: startDate must be string, received Date",
+      data: { path: ["events", 0, "startDate"], expected: "string", received: "Date" },
+    });
+
+    expect(error.code).toBe(ERROR_CODES.DOWNSTREAM_ERROR);
+    expect(error.message).toContain("Downstream output validation failed");
+    expect(error.data.validation_direction).toBe("output");
+    expect(error.data.repair_ticket).toBeUndefined();
+  });
+
+  it("classifies SDK structured content output-schema failures as downstream output validation", async () => {
+    const error = await runDownstreamInvalidParams({
+      schema: {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+        },
+      },
+      args: { query: "events" },
+      message: "Structured content does not match the tool's output schema: startDate must be string",
+    });
+
+    expect(error.code).toBe(ERROR_CODES.DOWNSTREAM_ERROR);
+    expect(error.message).toContain("Downstream output validation failed");
+    expect(error.data.validation_direction).toBe("output");
+    expect(error.data.repair_ticket).toBeUndefined();
+  });
+
+  it("does not classify input validation for an output argument as output validation", async () => {
+    const schema = {
+      type: "object",
+      properties: {
+        output: { type: "string" },
+      },
+      required: ["output"],
+    };
+
+    const error = await runDownstreamInvalidParams({
+      schema,
+      args: { output: "not-a-url" },
+      message: "Input validation error: output must be a URL",
+    });
+
+    const repairTicket = expectRepairTicket(error);
+    expect(repairTicket.attempt).toBe(1);
+    expect(repairTicket.downstream_error).toContain("output must be a URL");
+  });
+
+  it("does not classify input validation for a result argument as output validation", async () => {
+    const schema = {
+      type: "object",
+      properties: {
+        result: { type: "string" },
+      },
+      required: ["result"],
+    };
+
+    const error = await runDownstreamInvalidParams({
+      schema,
+      args: { result: "draft" },
+      message: "Input validation error: result validation failed",
+    });
+
+    const repairTicket = expectRepairTicket(error);
+    expect(repairTicket.attempt).toBe(1);
+    expect(repairTicket.downstream_error).toContain("result validation failed");
+  });
+
+  it("resets downstream validation attempts after output validation failures", async () => {
+    const packageId = nextId("pkg");
+    const toolId = nextId("tool");
+    const schema = {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+      },
+      required: ["query"],
+    };
+
+    const first = await runDownstreamInvalidParams({
+      schema,
+      args: { query: "events" },
+      packageId,
+      toolId,
+      message: "query must include tenant context",
+    });
+    expect(expectRepairTicket(first).attempt).toBe(1);
+
+    const outputFailure = await runDownstreamInvalidParams({
+      schema,
+      args: { query: "events" },
+      packageId,
+      toolId,
+      message: "Structured content does not match the tool's output schema: startDate must be string",
+    });
+    expect(outputFailure.code).toBe(ERROR_CODES.DOWNSTREAM_ERROR);
+
+    const nextInputFailure = await runDownstreamInvalidParams({
+      schema,
+      args: { query: "events" },
+      packageId,
+      toolId,
+      message: "query must include tenant context",
+    });
+    expect(expectRepairTicket(nextInputFailure).attempt).toBe(1);
+  });
+
   it("escalates downstream InvalidParams to full schema on attempt 2", async () => {
     const packageId = nextId("pkg");
     const toolId = nextId("tool");
