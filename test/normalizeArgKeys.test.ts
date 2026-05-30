@@ -62,13 +62,71 @@ describe("normalizeArgKeys — alias map directions", () => {
   });
 
   it("returns [] when a shared tool name belongs to a different package family", () => {
-    expect(
-      getAliasesForTool(
-        "GoogleWorkspace-alexs-mindstone-com",
-        "list_workspace_calendar_events"
-      )
-    ).toEqual([]);
     expect(getAliasesForTool("Slack-test", "create_workspace_draft")).toEqual([]);
+  });
+
+  it("Google Workspace list_workspace_calendar_events: stale camelCase → snake_case (REBEL-13Y)", () => {
+    const aliases = getAliasesForTool(
+      "GoogleWorkspace-alexs-mindstone-com",
+      "list_workspace_calendar_events"
+    );
+    expect(aliases).toEqual([
+      { from: "calendarId", to: "calendar_id" },
+      { from: "maxResults", to: "max_results" },
+      { from: "timeMin", to: "time_min" },
+      { from: "timeMax", to: "time_max" },
+      { from: "returnJson", to: "return_json" },
+      { from: "deviceTimezone", to: "device_timezone" },
+    ]);
+  });
+
+  it("Microsoft list_workspace_calendar_events keeps the opposite direction (snake_case → camelCase)", () => {
+    // Same tool id, opposite canonical casing — the package-family scoping in
+    // getAliasesForTool is what keeps these two from clobbering each other.
+    const aliases = getAliasesForTool(
+      "Microsoft-foo",
+      "list_workspace_calendar_events"
+    );
+    expect(aliases).toEqual([
+      { from: "start_datetime", to: "startDateTime" },
+      { from: "end_datetime", to: "endDateTime" },
+      { from: "device_timezone", to: "deviceTimezone" },
+    ]);
+  });
+
+  it("Google Workspace manage_workspace_calendar_event: camelCase → snake_case (REBEL-13Y review F3)", () => {
+    const aliases = getAliasesForTool(
+      "GoogleWorkspace-alexs-mindstone-com",
+      "manage_workspace_calendar_event"
+    );
+    expect(aliases).toEqual([
+      { from: "eventId", to: "event_id" },
+      { from: "newTimes", to: "new_times" },
+      { from: "colorId", to: "color_id" },
+    ]);
+  });
+
+  it("Google Workspace delete_workspace_calendar_event: camelCase → snake_case (REBEL-13Y review F3)", () => {
+    const aliases = getAliasesForTool(
+      "GoogleWorkspace-alexs-mindstone-com",
+      "delete_workspace_calendar_event"
+    );
+    expect(aliases).toEqual([
+      { from: "eventId", to: "event_id" },
+      { from: "sendUpdates", to: "send_updates" },
+      { from: "deletionScope", to: "deletion_scope" },
+    ]);
+  });
+
+  it("Google Workspace respond_to_workspace_calendar_event: includes eventId → event_id (REBEL-13Y review F3)", () => {
+    const aliases = getAliasesForTool(
+      "GoogleWorkspace-alexs-mindstone-com",
+      "respond_to_workspace_calendar_event"
+    );
+    expect(aliases).toEqual([
+      { from: "eventId", to: "event_id" },
+      { from: "calendarId", to: "calendar_id" },
+    ]);
   });
 });
 
@@ -128,6 +186,119 @@ describe("normalizeArgKeys — top-level replacement semantics", () => {
       { kind: "applied", from: "isHtml", to: "is_html" },
       { kind: "applied", from: "threadId", to: "thread_id" },
       { kind: "applied", from: "inReplyTo", to: "in_reply_to" },
+    ]);
+  });
+
+  it("rewrites Google Workspace calendar camelCase → snake_case (REBEL-13Y)", () => {
+    const args = {
+      email: "user@example.com",
+      timeMin: "2026-05-17T00:00:00Z",
+      timeMax: "2026-05-17T23:59:59Z",
+      maxResults: 25,
+      returnJson: true,
+      deviceTimezone: "Europe/London",
+      calendarId: "primary",
+    };
+    const { args: out, breadcrumbs } = normalizeArgKeys(
+      args,
+      ctx("list_workspace_calendar_events", "GoogleWorkspace-alexs-mindstone-com")
+    );
+    expect(out).toEqual({
+      email: "user@example.com",
+      calendar_id: "primary",
+      max_results: 25,
+      time_min: "2026-05-17T00:00:00Z",
+      time_max: "2026-05-17T23:59:59Z",
+      return_json: true,
+      device_timezone: "Europe/London",
+    });
+    // Order matches the alias-map declaration order.
+    expect(breadcrumbs).toEqual([
+      { kind: "applied", from: "calendarId", to: "calendar_id" },
+      { kind: "applied", from: "maxResults", to: "max_results" },
+      { kind: "applied", from: "timeMin", to: "time_min" },
+      { kind: "applied", from: "timeMax", to: "time_max" },
+      { kind: "applied", from: "returnJson", to: "return_json" },
+      { kind: "applied", from: "deviceTimezone", to: "device_timezone" },
+    ]);
+  });
+
+  it("does NOT rewrite Google Workspace calendar deviceTimezone for the Microsoft package family", () => {
+    // Package scoping means the same tool id (list_workspace_calendar_events)
+    // applies the *Microsoft* alias direction (snake → camel), so a stray
+    // camelCase deviceTimezone passes through unchanged for Microsoft.
+    const args = { deviceTimezone: "Europe/London" };
+    const { args: out, breadcrumbs } = normalizeArgKeys(
+      args,
+      ctx("list_workspace_calendar_events", "Microsoft365Calendar-work")
+    );
+    expect(out).toEqual({ deviceTimezone: "Europe/London" });
+    expect(breadcrumbs).toEqual([]);
+  });
+
+  it("rewrites Google Workspace manage_workspace_calendar_event camelCase → snake_case (REBEL-13Y review F3)", () => {
+    const args = {
+      email: "user@example.com",
+      eventId: "abc123",
+      action: "update_time",
+      newTimes: [{ start: { dateTime: "2026-06-01T09:00:00Z" }, end: { dateTime: "2026-06-01T10:00:00Z" } }],
+      colorId: "7",
+    };
+    const { args: out, breadcrumbs } = normalizeArgKeys(
+      args,
+      ctx("manage_workspace_calendar_event", "GoogleWorkspace-alexs-mindstone-com")
+    );
+    expect(out).toEqual({
+      email: "user@example.com",
+      event_id: "abc123",
+      action: "update_time",
+      new_times: [{ start: { dateTime: "2026-06-01T09:00:00Z" }, end: { dateTime: "2026-06-01T10:00:00Z" } }],
+      color_id: "7",
+    });
+    expect(breadcrumbs).toEqual([
+      { kind: "applied", from: "eventId", to: "event_id" },
+      { kind: "applied", from: "newTimes", to: "new_times" },
+      { kind: "applied", from: "colorId", to: "color_id" },
+    ]);
+  });
+
+  it("rewrites Google Workspace delete_workspace_calendar_event camelCase → snake_case (REBEL-13Y review F3)", () => {
+    const args = {
+      email: "user@example.com",
+      eventId: "abc123",
+      sendUpdates: "all",
+      deletionScope: "this_and_following",
+    };
+    const { args: out, breadcrumbs } = normalizeArgKeys(
+      args,
+      ctx("delete_workspace_calendar_event", "GoogleWorkspace-alexs-mindstone-com")
+    );
+    expect(out).toEqual({
+      email: "user@example.com",
+      event_id: "abc123",
+      send_updates: "all",
+      deletion_scope: "this_and_following",
+    });
+    expect(breadcrumbs).toEqual([
+      { kind: "applied", from: "eventId", to: "event_id" },
+      { kind: "applied", from: "sendUpdates", to: "send_updates" },
+      { kind: "applied", from: "deletionScope", to: "deletion_scope" },
+    ]);
+  });
+
+  it("rewrites Google Workspace respond_to_workspace_calendar_event eventId → event_id (REBEL-13Y review F3)", () => {
+    const args = { email: "user@example.com", eventId: "abc123", action: "accept" };
+    const { args: out, breadcrumbs } = normalizeArgKeys(
+      args,
+      ctx("respond_to_workspace_calendar_event", "GoogleWorkspace-alexs-mindstone-com")
+    );
+    expect(out).toEqual({
+      email: "user@example.com",
+      event_id: "abc123",
+      action: "accept",
+    });
+    expect(breadcrumbs).toEqual([
+      { kind: "applied", from: "eventId", to: "event_id" },
     ]);
   });
 

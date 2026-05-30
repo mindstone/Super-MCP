@@ -266,4 +266,162 @@ describe("useTool R3 — per-tool key-alias normalisation", () => {
       "key_alias:threadId→thread_id",
     ]);
   });
+
+  it("Google Workspace calendar: rewrites camelCase → snake_case before validation (REBEL-13Y)", async () => {
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createMocks();
+    (mockRegistry.getPackage as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: "GoogleWorkspace-alexs-mindstone-com",
+    });
+
+    const response = await handleUseTool(
+      {
+        package_id: "GoogleWorkspace-alexs-mindstone-com",
+        tool_id: "list_workspace_calendar_events",
+        args: {
+          email: "user@example.com",
+          deviceTimezone: "Europe/London",
+          returnJson: true,
+          maxResults: 25,
+        },
+        max_output_chars: null,
+      },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    expect(response.isError).toBe(false);
+    expect(mockValidator.validate).toHaveBeenCalledWith(
+      expect.anything(),
+      {
+        email: "user@example.com",
+        max_results: 25,
+        return_json: true,
+        device_timezone: "Europe/London",
+      },
+      expect.objectContaining({ tool_id: "list_workspace_calendar_events" }),
+    );
+    expect(mockClient.callTool).toHaveBeenCalledWith("list_workspace_calendar_events", {
+      email: "user@example.com",
+      max_results: 25,
+      return_json: true,
+      device_timezone: "Europe/London",
+    });
+
+    const meta = (response as { _meta?: Record<string, unknown> })._meta;
+    const superMcp = meta?.superMcp as Record<string, unknown> | undefined;
+    expect(superMcp?.normalisations).toEqual([
+      "key_alias:maxResults→max_results",
+      "key_alias:returnJson→return_json",
+      "key_alias:deviceTimezone→device_timezone",
+    ]);
+  });
+
+  it("Google Workspace calendar: rewrites manage_workspace_calendar_event camelCase before validation (REBEL-13Y review F3)", async () => {
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createMocks();
+    (mockRegistry.getPackage as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: "GoogleWorkspace-alexs-mindstone-com",
+    });
+
+    const response = await handleUseTool(
+      {
+        package_id: "GoogleWorkspace-alexs-mindstone-com",
+        tool_id: "manage_workspace_calendar_event",
+        args: {
+          email: "user@example.com",
+          eventId: "abc123",
+          action: "update_time",
+          newTimes: [
+            {
+              start: { dateTime: "2026-06-01T09:00:00Z" },
+              end: { dateTime: "2026-06-01T10:00:00Z" },
+            },
+          ],
+          colorId: "7",
+        },
+        max_output_chars: null,
+      },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    expect(response.isError).toBe(false);
+    expect(mockValidator.validate).toHaveBeenCalledWith(
+      expect.anything(),
+      {
+        email: "user@example.com",
+        event_id: "abc123",
+        action: "update_time",
+        new_times: [
+          {
+            start: { dateTime: "2026-06-01T09:00:00Z" },
+            end: { dateTime: "2026-06-01T10:00:00Z" },
+          },
+        ],
+        color_id: "7",
+      },
+      expect.objectContaining({ tool_id: "manage_workspace_calendar_event" }),
+    );
+    expect(mockClient.callTool).toHaveBeenCalledWith("manage_workspace_calendar_event", {
+      email: "user@example.com",
+      event_id: "abc123",
+      action: "update_time",
+      new_times: [
+        {
+          start: { dateTime: "2026-06-01T09:00:00Z" },
+          end: { dateTime: "2026-06-01T10:00:00Z" },
+        },
+      ],
+      color_id: "7",
+    });
+
+    const meta = (response as { _meta?: Record<string, unknown> })._meta;
+    const superMcp = meta?.superMcp as Record<string, unknown> | undefined;
+    expect(superMcp?.normalisations).toEqual([
+      "key_alias:eventId→event_id",
+      "key_alias:newTimes→new_times",
+      "key_alias:colorId→color_id",
+    ]);
+  });
+
+  it("Google Workspace calendar: rewrites delete_workspace_calendar_event camelCase before validation (REBEL-13Y review F3)", async () => {
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createMocks();
+    (mockRegistry.getPackage as ReturnType<typeof vi.fn>).mockReturnValue({
+      id: "GoogleWorkspace-alexs-mindstone-com",
+    });
+
+    const response = await handleUseTool(
+      {
+        package_id: "GoogleWorkspace-alexs-mindstone-com",
+        tool_id: "delete_workspace_calendar_event",
+        args: {
+          email: "user@example.com",
+          eventId: "abc123",
+          sendUpdates: "all",
+          deletionScope: "this_and_following",
+        },
+        max_output_chars: null,
+      },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    expect(response.isError).toBe(false);
+    expect(mockClient.callTool).toHaveBeenCalledWith("delete_workspace_calendar_event", {
+      email: "user@example.com",
+      event_id: "abc123",
+      send_updates: "all",
+      deletion_scope: "this_and_following",
+    });
+
+    const meta = (response as { _meta?: Record<string, unknown> })._meta;
+    const superMcp = meta?.superMcp as Record<string, unknown> | undefined;
+    expect(superMcp?.normalisations).toEqual([
+      "key_alias:eventId→event_id",
+      "key_alias:sendUpdates→send_updates",
+      "key_alias:deletionScope→deletion_scope",
+    ]);
+  });
 });

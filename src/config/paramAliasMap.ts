@@ -20,6 +20,10 @@
  *   • Google Workspace Gmail tools accept snake_case after the MCP naming
  *     standardisation; agents still regularly emit the old camelCase names
  *     from stale prompt memory and earlier connector examples.
+ *   • Google Workspace Calendar tools also accept snake_case; models bleed
+ *     camelCase across from Microsoft Graph naming habits (REBEL-13Y),
+ *     producing MCP -33003 validation failures. Targets are verified against
+ *     mcp-servers/connectors/google-workspace/src/tools/definitions/calendar.ts.
  *
  * Semantics:
  *   • Source matches by exact key on the top level of `args` only.
@@ -151,6 +155,48 @@ const GOOGLE_WORKSPACE_TOOL_ALIASES: Readonly<Record<string, ToolAliasMap>> = {
     { from: "mimeType", to: "mime_type" },
   ],
   delete_workspace_attachment: [{ from: "messageId", to: "message_id" }],
+  // Google Workspace Calendar tools accept snake_case (canonical schema), but
+  // models routinely emit camelCase — typically bleeding across from Microsoft
+  // Graph naming habits — and previously also from a calendar-sync prompt that
+  // explicitly instructed `returnJson`/`deviceTimezone` for Google. The result
+  // was MCP -33003 validation failures (umbrella Sentry issue REBEL-13Y).
+  // Every alias target is verified against the connector schema in
+  // mcp-servers/connectors/google-workspace/src/tools/definitions/calendar.ts.
+  list_workspace_calendar_events: [
+    { from: "calendarId", to: "calendar_id" },
+    { from: "maxResults", to: "max_results" },
+    { from: "timeMin", to: "time_min" },
+    { from: "timeMax", to: "time_max" },
+    { from: "returnJson", to: "return_json" },
+    { from: "deviceTimezone", to: "device_timezone" },
+  ],
+  find_free_slots: [
+    { from: "timeMin", to: "time_min" },
+    { from: "timeMax", to: "time_max" },
+    { from: "minSlotDurationMinutes", to: "min_slot_duration_minutes" },
+  ],
+  get_workspace_calendar_event: [
+    { from: "eventId", to: "event_id" },
+    { from: "calendarId", to: "calendar_id" },
+  ],
+  create_workspace_calendar_event: [
+    { from: "calendarId", to: "calendar_id" },
+    { from: "colorId", to: "color_id" },
+  ],
+  manage_workspace_calendar_event: [
+    { from: "eventId", to: "event_id" },
+    { from: "newTimes", to: "new_times" },
+    { from: "colorId", to: "color_id" },
+  ],
+  respond_to_workspace_calendar_event: [
+    { from: "eventId", to: "event_id" },
+    { from: "calendarId", to: "calendar_id" },
+  ],
+  delete_workspace_calendar_event: [
+    { from: "eventId", to: "event_id" },
+    { from: "sendUpdates", to: "send_updates" },
+    { from: "deletionScope", to: "deletion_scope" },
+  ],
 };
 
 function isPackageFamily(packageId: string, family: string): boolean {
