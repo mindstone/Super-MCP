@@ -564,7 +564,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
                 },
                 wait_for_completion: {
                   type: "boolean",
-                  description: "Whether to wait for OAuth completion before returning",
+                  description: "Whether to wait for OAuth completion before returning. For OAuth packages this is always treated as true (the browser sign-in must complete before tokens can be saved); passing false has no effect.",
                   default: true,
                 },
                 force: {

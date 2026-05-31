@@ -47,6 +47,13 @@ export async function handleAuthenticate(
       isError: false,
     };
   }
+
+  if (pkg.transport === "http" && pkg.oauth === true && wait_for_completion === false) {
+    wait_for_completion = true;
+    logger.warn("OAuth package received wait_for_completion:false — coerced to true; saveless callback path is unsafe for OAuth", {
+      package_id,
+    });
+  }
   
   if (pkg.transport === "stdio") {
     try {
