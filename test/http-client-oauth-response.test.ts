@@ -1,5 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import * as fs from 'fs/promises';
+import * as os from 'os';
+import * as path from 'path';
 import { HttpMcpClient } from '../src/clients/httpClient.js';
+import { SimpleOAuthProvider } from '../src/auth/providers/simple.js';
+import { RefreshOnlyOAuthProvider } from '../src/auth/providers/refreshOnly.js';
 import type { PackageConfig } from '../src/types.js';
 
 // vi.hoisted ensures the variable exists before vi.mock runs (vi.mock is hoisted)
@@ -169,17 +174,28 @@ function createNativeFetch() {
 
 describe('HttpMcpClient cross-realm Response handling', () => {
   let originalFetch: typeof globalThis.fetch;
+  let tempDir: string;
+  let previousTokenDir: string | undefined;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     originalFetch = globalThis.fetch;
+    previousTokenDir = process.env.SUPER_MCP_OAUTH_TOKEN_DIR;
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'super-mcp-http-oauth-test-'));
+    process.env.SUPER_MCP_OAUTH_TOKEN_DIR = tempDir;
     mockLogger.info.mockClear();
     mockLogger.warn.mockClear();
     mockLogger.error.mockClear();
     mockLogger.debug.mockClear();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     globalThis.fetch = originalFetch;
+    if (previousTokenDir === undefined) {
+      delete process.env.SUPER_MCP_OAUTH_TOKEN_DIR;
+    } else {
+      process.env.SUPER_MCP_OAUTH_TOKEN_DIR = previousTokenDir;
+    }
+    await fs.rm(tempDir, { recursive: true, force: true });
   });
 
   it('ForeignRealmResponse fails instanceof Response (precondition)', () => {
@@ -247,5 +263,123 @@ describe('HttpMcpClient cross-realm Response handling', () => {
 
     const errors = collectErrorMessages();
     expect(errors).not.toContain('[object Response]');
+  });
+
+  it('captures only error and error_description from non-OK OAuth JSON responses without consuming the SDK response body', async () => {
+    const provider = new SimpleOAuthProvider('test-oauth-error-capture', 5201);
+    await provider.initialize();
+
+    const config = oauthHttpPackage('test-oauth-error-capture');
+    const client = new HttpMcpClient('test-oauth-error-capture', config, {
+      oauthPort: 5201,
+      oauthProvider: provider,
+    });
+
+    globalThis.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          error: 'invalid_grant',
+          error_description: 'Refresh token expired',
+          access_token: 'should-not-be-logged',
+          refresh_token: 'should-not-be-logged',
+          secret_note: 'should-not-be-logged',
+        }),
+        {
+          status: 400,
+          headers: { 'Content-Type': 'application/json' },
+        },
+      );
+    }) as unknown as typeof fetch;
+
+    await (client as any).initializeOAuthIfNeeded(true);
+    const options = (client as any).getTransportOptions() as { fetch: typeof fetch };
+
+    const response = await options.fetch('https://oauth.example/token', { method: 'POST' });
+    const parsed = await response.json();
+    expect(parsed).toMatchObject({
+      error: 'invalid_grant',
+      error_description: 'Refresh token expired',
+      access_token: 'should-not-be-logged',
+      refresh_token: 'should-not-be-logged',
+    });
+
+    expect(provider.consumeLastOAuthError()).toEqual({
+      error: 'invalid_grant',
+      error_description: 'Refresh token expired',
+    });
+    expect(provider.consumeLastOAuthError()).toBeUndefined();
+  });
+
+  it('does NOT capture an error from a non-token-endpoint response (scoping guard)', async () => {
+    const provider = new SimpleOAuthProvider('test-oauth-error-scope', 5202);
+    await provider.initialize();
+
+    const config = oauthHttpPackage('test-oauth-error-scope');
+    const client = new HttpMcpClient('test-oauth-error-scope', config, {
+      oauthPort: 5202,
+      oauthProvider: provider,
+    });
+
+    // A normal MCP/API endpoint returning a non-OK body that happens to carry a
+    // string `error` field — must NOT be mis-captured as an OAuth error.
+    globalThis.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({ error: 'rate_limited', error_description: 'Slow down' }),
+        { status: 429, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as unknown as typeof fetch;
+
+    await (client as any).initializeOAuthIfNeeded(true);
+    const options = (client as any).getTransportOptions() as { fetch: typeof fetch };
+
+    // Non-token paths: the MCP JSON-RPC endpoint and the DCR /register endpoint.
+    await options.fetch('https://mcp.example.com/mcp', { method: 'POST' });
+    await options.fetch('https://oauth.example/register', { method: 'POST' });
+
+    expect(provider.consumeLastOAuthError()).toBeUndefined();
+  });
+
+  it('surfaces the captured token-endpoint error through the shared provider on refresh-only token invalidation (end-to-end wiring)', async () => {
+    const provider = new SimpleOAuthProvider('test-oauth-error-wiring', 5203);
+    await provider.initialize();
+
+    const config = oauthHttpPackage('test-oauth-error-wiring');
+    const client = new HttpMcpClient('test-oauth-error-wiring', config, {
+      oauthPort: 5203,
+      oauthProvider: provider,
+    });
+
+    globalThis.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({ error: 'invalid_grant', error_description: 'Refresh token expired' }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      );
+    }) as unknown as typeof fetch;
+
+    await (client as any).initializeOAuthIfNeeded(true);
+    const options = (client as any).getTransportOptions() as { fetch: typeof fetch };
+
+    // Simulate the SDK's refresh request to the token endpoint hitting a 400.
+    await options.fetch('https://oauth.example/token', { method: 'POST' });
+
+    // The refresh-only wrapper used on background connects shares the SAME provider
+    // instance the fetch wrapper wrote to — so its "ignoring token invalidation" warn
+    // must carry the captured error, prove the seam end-to-end, and still NOT delete tokens.
+    const refreshOnly = new RefreshOnlyOAuthProvider(provider);
+    mockLogger.warn.mockClear();
+    await refreshOnly.invalidateCredentials('tokens');
+
+    const warnWithError = mockLogger.warn.mock.calls.find(
+      (call: unknown[]) =>
+        String(call[0] ?? '').includes('Ignoring token invalidation request in refresh-only mode'),
+    );
+    expect(warnWithError).toBeDefined();
+    expect(warnWithError?.[1]).toMatchObject({
+      error: 'invalid_grant',
+      error_description: 'Refresh token expired',
+    });
+
+    // Consumed and cleared — no stale carryover into a later invalidation.
+    expect(provider.consumeLastOAuthError()).toBeUndefined();
   });
 });

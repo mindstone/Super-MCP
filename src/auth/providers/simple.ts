@@ -21,6 +21,11 @@ export interface StaticOAuthCredentials {
   clientSecret?: string;
 }
 
+export interface OAuthErrorSummary {
+  error: string;
+  error_description?: string;
+}
+
 export class SimpleOAuthProvider implements OAuthClientProvider {
   private packageId: string;
   private savedTokens?: any;
@@ -31,6 +36,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   private stateValue?: string;
   private staticCredentials?: StaticOAuthCredentials;
   private redirectStarted: boolean = false;
+  private lastOAuthError?: OAuthErrorSummary;
   
   constructor(packageId: string, oauthPort: number = 5173, staticCredentials?: StaticOAuthCredentials) {
     this.packageId = packageId;
@@ -292,11 +298,26 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   getStoredState(): string | undefined {
     return this.stateValue;
   }
+
+  setLastOAuthError(error: OAuthErrorSummary): void {
+    this.lastOAuthError = {
+      error: error.error,
+      ...(error.error_description ? { error_description: error.error_description } : {}),
+    };
+  }
+
+  consumeLastOAuthError(): OAuthErrorSummary | undefined {
+    const error = this.lastOAuthError;
+    this.lastOAuthError = undefined;
+    return error;
+  }
   
   async invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery' = 'all') {
+    const oauthError = this.consumeLastOAuthError();
     logger.info("Invalidating OAuth credentials", { 
       package_id: this.packageId,
-      scope 
+      scope,
+      ...(oauthError ? oauthError : {}),
     });
     
     if (scope === 'all' || scope === 'tokens') {

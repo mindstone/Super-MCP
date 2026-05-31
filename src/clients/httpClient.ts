@@ -6,7 +6,7 @@ import PQueue from "p-queue";
 import { McpClient, PackageConfig, ReadResourceResult } from "../types.js";
 import { getLogger } from "../logging.js";
 import { SimpleOAuthProvider, RefreshOnlyOAuthProvider } from "../auth/providers/index.js";
-import type { StaticOAuthCredentials } from "../auth/providers/simple.js";
+import type { OAuthErrorSummary, StaticOAuthCredentials } from "../auth/providers/simple.js";
 
 const logger = getLogger();
 
@@ -22,9 +22,64 @@ const logger = getLogger();
  * This wrapper detects the mismatch and re-creates the Response using
  * `globalThis.Response` so the SDK's instanceof check succeeds.
  */
-function createResponseNormalizingFetch(baseFetch: typeof fetch): typeof fetch {
+function createResponseNormalizingFetch(
+  baseFetch: typeof fetch,
+  onOAuthError?: (error: OAuthErrorSummary) => void,
+): typeof fetch {
+  // OAuth refresh / code-exchange failures (invalid_grant, invalid_client, …) hit the
+  // authorization server's token endpoint. Scope error capture to that endpoint so a
+  // normal non-OK MCP/JSON-RPC API response that happens to carry a string `error`
+  // field cannot be mis-attributed as an OAuth error in a later invalidation log.
+  const isOAuthTokenEndpoint = (input: RequestInfo | URL): boolean => {
+    try {
+      const raw =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : (input as Request)?.url ?? "";
+      if (!raw) {
+        return false;
+      }
+      let pathname = raw;
+      try {
+        pathname = new URL(raw).pathname;
+      } catch {
+        // raw is not an absolute URL; fall back to matching the whole string
+      }
+      return /token/i.test(pathname);
+    } catch {
+      return false;
+    }
+  };
+
+  const captureOAuthErrorIfPresent = async (response: Response): Promise<void> => {
+    if (response.ok) {
+      return;
+    }
+
+    try {
+      const body = await response.clone().json();
+      if (body && typeof body === "object") {
+        const oauthBody = body as { error?: unknown; error_description?: unknown };
+        if (typeof oauthBody.error !== "string") {
+          return;
+        }
+        onOAuthError?.({
+          error: oauthBody.error,
+          ...(typeof oauthBody.error_description === "string"
+            ? { error_description: oauthBody.error_description }
+            : {}),
+        });
+      }
+    } catch {
+      // Ignore non-JSON or unreadable responses
+    }
+  };
+
   return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const response: unknown = await baseFetch(input, init);
+    let normalizedResponse: Response;
     if (
       response !== null &&
       typeof response === 'object' &&
@@ -34,13 +89,19 @@ function createResponseNormalizingFetch(baseFetch: typeof fetch): typeof fetch {
     ) {
       // Cross-realm Response detected — re-wrap with globalThis.Response
       const r = response as { body?: ReadableStream | null; status: number; statusText?: string; headers: HeadersInit };
-      return new Response(r.body ?? null, {
+      normalizedResponse = new Response(r.body ?? null, {
         status: r.status,
         statusText: r.statusText ?? '',
         headers: new Headers(r.headers),
       });
+    } else {
+      normalizedResponse = response as Response;
     }
-    return response as Response;
+
+    if (isOAuthTokenEndpoint(input)) {
+      await captureOAuthErrorIfPresent(normalizedResponse);
+    }
+    return normalizedResponse;
   }) as typeof fetch;
 }
 
@@ -379,7 +440,9 @@ export class HttpMcpClient implements McpClient {
     //   "[object Response]" is not valid JSON
     // This wrapper re-creates the Response using globalThis.Response when a mismatch
     // is detected, ensuring the SDK can properly read the response body.
-    options.fetch = createResponseNormalizingFetch(fetch);
+    options.fetch = createResponseNormalizingFetch(fetch, (error) => {
+      this.simpleOAuthProvider?.setLastOAuthError(error);
+    });
 
     return options;
   }

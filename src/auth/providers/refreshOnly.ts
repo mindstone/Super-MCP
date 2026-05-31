@@ -1,6 +1,7 @@
 import { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import { getLogger } from "../../logging.js";
 import { SimpleOAuthProvider } from "./simple.js";
+import type { OAuthErrorSummary } from "./simple.js";
 
 const logger = getLogger();
 
@@ -47,6 +48,10 @@ export class RefreshOnlyOAuthProvider implements OAuthClientProvider {
   async codeVerifier() {
     return this.delegate.codeVerifier();
   }
+
+  consumeLastOAuthError(): OAuthErrorSummary | undefined {
+    return this.delegate.consumeLastOAuthError();
+  }
   
   async redirectToAuthorization(_authUrl: URL): Promise<void> {
     logger.info("OAuth browser redirect blocked (refresh-only mode)", {
@@ -57,8 +62,10 @@ export class RefreshOnlyOAuthProvider implements OAuthClientProvider {
   
   async invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier') {
     if (scope === 'tokens') {
+      const oauthError = this.delegate.consumeLastOAuthError();
       logger.warn("Ignoring token invalidation request in refresh-only mode", {
         message: "Background connection attempts must not delete persisted OAuth tokens. Use authenticate() to replace expired credentials.",
+        ...(oauthError ? oauthError : {}),
       });
       return;
     }
