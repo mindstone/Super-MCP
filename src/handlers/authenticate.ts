@@ -5,9 +5,67 @@ import { findAvailablePort, checkPortAvailable } from "../utils/portFinder.js";
 import { SimpleOAuthProvider } from "../auth/providers/simple.js";
 import { formatError } from "../utils/formatError.js";
 import { coerceStringifiedBoolean } from "../utils/normalizeInput.js";
+import { getValidator } from "../validator.js";
 
 const logger = getLogger();
 const STDIO_AUTH_DELEGATION_TIMEOUT_MS = 60_000;
+
+type AuthDelegationToolCandidate = {
+  name?: unknown;
+  inputSchema?: unknown;
+  input_schema?: unknown;
+};
+
+type NamedAuthDelegationToolCandidate = AuthDelegationToolCandidate & { name: string };
+
+function getInputSchema(tool: AuthDelegationToolCandidate): unknown {
+  return tool.inputSchema ?? tool.input_schema;
+}
+
+function getRequiredArguments(inputSchema: unknown): unknown {
+  if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) {
+    return undefined;
+  }
+
+  return (inputSchema as { required?: unknown }).required;
+}
+
+export function isEligibleForZeroArgAuthDelegation(
+  tool: AuthDelegationToolCandidate,
+): tool is NamedAuthDelegationToolCandidate {
+  if (typeof tool.name !== "string") {
+    return false;
+  }
+
+  if (tool.name !== "authenticate" && !tool.name.startsWith("authenticate_")) {
+    return false;
+  }
+
+  // Eligible only if the tool can actually be invoked with `{}`. Answer that by
+  // validating an empty arg object against the tool's own input schema using the
+  // same Ajv validator Super-MCP enforces at call time — so this catches not just
+  // top-level `required`, but `$ref` / `anyOf` / `oneOf` / `allOf` / `minProperties`
+  // shapes where `{}` is invalid WITHOUT a top-level `required`. No schema → no
+  // constraints → eligible. A malformed/uncompilable schema → ineligible (fail closed).
+  const schema = getInputSchema(tool);
+  if (schema === undefined || schema === null) {
+    return true;
+  }
+  try {
+    return getValidator().validate(schema, {}).valid;
+  } catch {
+    return false;
+  }
+}
+
+function requiredArgsForMessage(tool: AuthDelegationToolCandidate): string[] {
+  const required = getRequiredArguments(getInputSchema(tool));
+  if (!Array.isArray(required)) {
+    return [];
+  }
+
+  return required.filter((arg): arg is string => typeof arg === "string");
+}
 
 export async function handleAuthenticate(
   input: { package_id: string; wait_for_completion?: boolean; force?: boolean },
@@ -59,24 +117,39 @@ export async function handleAuthenticate(
     try {
       const client = await registry.getClient(package_id);
       const tools = await client.listTools();
-      const authTool = tools.find(
-        (t: any) => {
-          if (typeof t?.name !== "string") {
-            return false;
-          }
-
-          if (t.name !== "authenticate" && !t.name.startsWith("authenticate_")) {
-            return false;
-          }
-
-          const required = t?.inputSchema?.required;
-          if (required === undefined) {
-            return true;
-          }
-
-          return Array.isArray(required) && required.length === 0;
-        }
+      const authTools = tools.filter(
+        (t: AuthDelegationToolCandidate): t is NamedAuthDelegationToolCandidate =>
+          typeof t?.name === "string" &&
+          (t.name === "authenticate" || t.name.startsWith("authenticate_")),
       );
+      const authTool = authTools.find(isEligibleForZeroArgAuthDelegation);
+
+      if (!authTool && authTools.length > 0) {
+        const ineligibleTools = authTools.map((tool) => ({
+          tool: tool.name,
+          required: requiredArgsForMessage(tool),
+        }));
+        logger.warn("Stdio auth tools require arguments; refusing zero-arg generic delegation", {
+          package_id,
+          tools: ineligibleTools,
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                package_id,
+                status: "error",
+                error:
+                  "This connector's authentication tool needs additional information, so Rebel cannot start it automatically. Please reconnect this connector from Settings.",
+                ineligible_auth_tools: ineligibleTools,
+              }, null, 2),
+            },
+          ],
+          isError: true,
+        };
+      }
 
       if (authTool) {
         logger.info("Delegating to stdio package's auth tool", {

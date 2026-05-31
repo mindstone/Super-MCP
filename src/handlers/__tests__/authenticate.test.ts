@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { handleAuthenticate } from "../authenticate.js";
+import {
+  handleAuthenticate,
+  isEligibleForZeroArgAuthDelegation,
+} from "../authenticate.js";
 import type { Catalog } from "../../catalog.js";
 import type { PackageRegistry } from "../../registry.js";
 
@@ -51,6 +54,88 @@ describe("handleAuthenticate stdio delegation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useRealTimers();
+  });
+
+  describe("isEligibleForZeroArgAuthDelegation", () => {
+    it("rejects authenticate tools with required arguments", () => {
+      expect(isEligibleForZeroArgAuthDelegation({
+        name: "authenticate_workspace_account",
+        inputSchema: {
+          type: "object",
+          required: ["workspace_id"],
+        },
+      })).toBe(false);
+    });
+
+    it("accepts authenticate tools with no required arguments", () => {
+      expect(isEligibleForZeroArgAuthDelegation({
+        name: "authenticate_slack_workspace",
+        inputSchema: {
+          type: "object",
+          properties: {
+            force: { type: "boolean" },
+          },
+        },
+      })).toBe(true);
+
+      expect(isEligibleForZeroArgAuthDelegation({
+        name: "authenticate",
+        input_schema: {
+          type: "object",
+          required: [],
+        },
+      })).toBe(true);
+    });
+
+    it("rejects non-authentication tools", () => {
+      expect(isEligibleForZeroArgAuthDelegation({
+        name: "list_slack_channels",
+        inputSchema: {
+          type: "object",
+          required: [],
+        },
+      })).toBe(false);
+    });
+
+    // C40 review F1: `{}` can be invalid WITHOUT a top-level `required` — these
+    // schema shapes must also be ineligible (eligibility = "does `{}` validate?").
+    it("rejects schemas where {} is invalid without a top-level required", () => {
+      // minProperties: 1
+      expect(isEligibleForZeroArgAuthDelegation({
+        name: "authenticate_a",
+        inputSchema: { type: "object", minProperties: 1 },
+      })).toBe(false);
+      // anyOf branch requires an arg
+      expect(isEligibleForZeroArgAuthDelegation({
+        name: "authenticate_b",
+        inputSchema: { type: "object", anyOf: [{ required: ["workspace_id"] }] },
+      })).toBe(false);
+      // allOf branch requires an arg
+      expect(isEligibleForZeroArgAuthDelegation({
+        name: "authenticate_c",
+        inputSchema: { type: "object", allOf: [{ required: ["account"] }] },
+      })).toBe(false);
+      // $ref to a definition with a required arg
+      expect(isEligibleForZeroArgAuthDelegation({
+        name: "authenticate_d",
+        inputSchema: {
+          $ref: "#/$defs/in",
+          $defs: { in: { type: "object", required: ["token"] } },
+        },
+      })).toBe(false);
+      // snake_case input_schema with a required arg
+      expect(isEligibleForZeroArgAuthDelegation({
+        name: "authenticate_e",
+        input_schema: { type: "object", required: ["org_id"] },
+      })).toBe(false);
+    });
+
+    it("treats a malformed/uncompilable schema as ineligible (fail closed)", () => {
+      expect(isEligibleForZeroArgAuthDelegation({
+        name: "authenticate_f",
+        inputSchema: { type: "object", required: "not-an-array" },
+      })).toBe(false);
+    });
   });
 
   it("delegates to authenticate_* tool for stdio packages", async () => {
@@ -162,7 +247,7 @@ describe("handleAuthenticate stdio delegation", () => {
     expect(result).toBe(delegatedResult);
   });
 
-  it("skips delegation when authenticate_* tool requires input args", async () => {
+  it("refuses zero-arg generic delegation when authenticate_* tool requires input args", async () => {
     const client = {
       listTools: vi.fn().mockResolvedValue([
         {
@@ -181,7 +266,63 @@ describe("handleAuthenticate stdio delegation", () => {
 
     expect(client.listTools).toHaveBeenCalledTimes(1);
     expect(client.callTool).not.toHaveBeenCalled();
-    expectLegacyResponse(result);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      "Stdio auth tools require arguments; refusing zero-arg generic delegation",
+      expect.objectContaining({
+        package_id: PACKAGE_ID,
+        tools: [{
+          tool: "authenticate_workspace_account",
+          required: ["email"],
+        }],
+      }),
+    );
+    expect(result.isError).toBe(true);
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed).toEqual({
+      package_id: PACKAGE_ID,
+      status: "error",
+      error:
+        "This connector's authentication tool needs additional information, so Rebel cannot start it automatically. Please reconnect this connector from Settings.",
+      ineligible_auth_tools: [{
+        tool: "authenticate_workspace_account",
+        required: ["email"],
+      }],
+    });
+  });
+
+  it("selects an eligible zero-arg authenticate_* tool over an ineligible required-arg candidate", async () => {
+    const delegatedResult = {
+      content: [{ type: "text", text: '{"status":"success"}' }],
+      isError: false,
+    };
+    const client = {
+      listTools: vi.fn().mockResolvedValue([
+        {
+          name: "authenticate_workspace_account",
+          inputSchema: {
+            type: "object",
+            required: ["workspace_id"],
+          },
+        },
+        {
+          name: "authenticate_slack_workspace",
+          inputSchema: {
+            type: "object",
+            properties: {
+              force: { type: "boolean" },
+            },
+          },
+        },
+      ]),
+      callTool: vi.fn().mockResolvedValue(delegatedResult),
+    };
+    const registry = createRegistry(client);
+
+    const result = await handleAuthenticate({ package_id: PACKAGE_ID }, registry, createCatalog());
+
+    expect(client.callTool).toHaveBeenCalledTimes(1);
+    expect(client.callTool).toHaveBeenCalledWith("authenticate_slack_workspace", {});
+    expect(result).toBe(delegatedResult);
   });
 
   it("returns error response when delegated auth tool call times out", async () => {
