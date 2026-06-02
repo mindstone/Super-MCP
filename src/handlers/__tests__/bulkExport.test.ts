@@ -473,6 +473,122 @@ describe("handleBulkExport", () => {
     expect(written).toBe('{"id":1}\n{"id":2}\n{"id":3}\n{"id":4}\n');
   });
 
+  it("stops early when the external AbortSignal is cancelled mid-export", async () => {
+    const controller = new AbortController();
+    // Paginated source that would otherwise yield three pages. Page 1 resolves
+    // cleanly and is written to disk. The external signal is aborted as a side
+    // effect of the SECOND executeTool call, so the in-flight signal race
+    // rejects it: the loop records the cancellation and breaks before fetching
+    // pages 3+. Fully deterministic: no timers, no sleeps.
+    const callTool = vi.fn()
+      .mockResolvedValueOnce(textResult({ items: [{ id: 1 }, { id: 2 }], next: "tok-2" }))
+      .mockImplementationOnce(async () => {
+        controller.abort();
+        return textResult({ items: [{ id: 3 }], next: "tok-3" });
+      })
+      .mockResolvedValueOnce(textResult({ items: [{ id: 4 }] }));
+
+    const result = await handleBulkExport(
+      {
+        package_id: PACKAGE_ID,
+        tool_id: "search_records",
+        args: { q: "x" },
+        output_file: "cancelled.ndjson",
+        items_path: "items",
+        pagination: { token_field: "next", input_param: "pageToken" },
+      },
+      createRegistry(callTool),
+      createCatalog({ readOnlyHint: true }),
+      controller.signal,
+    );
+
+    const summary = parseSuccess(result);
+    expect(result.isError).toBe(false);
+    // The export stopped early: it fetched page 1 plus the aborted page 2, but
+    // never reached the third page that the mock would otherwise have returned.
+    expect(callTool).toHaveBeenCalledTimes(2);
+    expect(summary.pages).toBe(1);
+    expect(summary.lines).toBe(2);
+    // Lines were written before the abort, so status is "partial" (not "failed").
+    expect(summary.status).toBe("partial");
+    // The cancellation is surfaced as an error in the summary.
+    expect(summary.errors).toBeDefined();
+    expect(summary.errors?.some((e) => /cancel|abort/i.test(e))).toBe(true);
+
+    // The partial NDJSON file contains exactly the lines written before the abort.
+    const outputPath = path.join(workspace, ".rebel", "exports", "cancelled.ndjson");
+    const written = await fs.readFile(outputPath, "utf8");
+    expect(written).toBe('{"id":1}\n{"id":2}\n');
+  });
+
+  it("reports failed when the external AbortSignal cancels before any line is written", async () => {
+    const controller = new AbortController();
+    // Abort before the first executeTool returns usable data: the signal-race
+    // in executeTool rejects the call, so it is reported as an error result and
+    // no lines are written -> status "failed".
+    const callTool = vi.fn().mockImplementation(async () => {
+      controller.abort();
+      // This page would otherwise write a line, but the abort wins the race.
+      return textResult({ items: [{ id: 1 }] });
+    });
+
+    const result = await handleBulkExport(
+      {
+        package_id: PACKAGE_ID,
+        tool_id: "search_records",
+        args: {},
+        output_file: "cancelled-empty.ndjson",
+        items_path: "items",
+      },
+      createRegistry(callTool),
+      createCatalog({ readOnlyHint: true }),
+      controller.signal,
+    );
+
+    const summary = parseSuccess(result);
+    expect(result.isError).toBe(false);
+    expect(summary.status).toBe("failed");
+    expect(summary.lines).toBe(0);
+    expect(summary.pages).toBe(0);
+    expect(callTool).toHaveBeenCalledTimes(1);
+    expect(summary.errors?.some((e) => /cancel|abort/i.test(e))).toBe(true);
+    // Nothing was written before the abort, so no final output file is left.
+    await expect(fs.readFile(
+      path.join(workspace, ".rebel", "exports", "cancelled-empty.ndjson"),
+      "utf8",
+    )).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("does not clobber a file created after the if_exists error precheck", async () => {
+    const outputPath = path.join(workspace, ".rebel", "exports", "race.ndjson");
+    const callTool = vi.fn().mockImplementation(async () => {
+      await fs.writeFile(outputPath, "racer\n", "utf8");
+      return textResult({ items: [{ id: 1 }] });
+    });
+
+    const result = await handleBulkExport(
+      {
+        package_id: PACKAGE_ID,
+        tool_id: "search_records",
+        args: {},
+        output_file: "race.ndjson",
+        items_path: "items",
+      },
+      createRegistry(callTool),
+      createCatalog({ readOnlyHint: true }),
+    );
+
+    expect(result.isError).toBe(false);
+    const summary = parseSuccess(result);
+    expect(summary.status).toBe("failed");
+    expect(summary.lines).toBe(0);
+    expect(summary.errors?.[0]).toContain("Output file already exists");
+    expect(await fs.readFile(outputPath, "utf8")).toBe("racer\n");
+
+    const exportDirEntries = await fs.readdir(path.join(workspace, ".rebel", "exports"));
+    expect(exportDirEntries.filter((entry) => entry.includes(".tmp"))).toHaveLength(0);
+  });
+
   it("checks the raw page byte ceiling before parsing", async () => {
     const callTool = vi.fn().mockResolvedValue(textResult("x".repeat(BULK_EXPORT_MAX_PAGE_BYTES + 1)));
     const result = parseSuccess(await handleBulkExport(

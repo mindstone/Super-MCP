@@ -575,7 +575,7 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
 
   const stream = createWriteStream(params.absoluteTempFile, { flags: "wx" });
   let streamError: Error | undefined;
-  let outputRenamed = false;
+  let outputPersisted = false;
 
   stream.on("error", (error) => {
     streamError = error;
@@ -717,22 +717,48 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
 
   if (streamError) {
     pushError(errors, `Stream error: ${streamError.message}`);
-  } else {
-    try {
-      await fs.rename(params.absoluteTempFile, params.absoluteOutputFile);
-      outputRenamed = true;
-    } catch (error) {
-      await fs.rm(params.absoluteTempFile, { force: true });
-      throw error;
-    }
-  }
-
-  if (!outputRenamed) {
-    await fs.rm(params.absoluteTempFile, { force: true });
   }
 
   const status: BulkExportOutput["status"] =
     errors.length === 0 && completedNaturally ? "complete" : lines > 0 ? "partial" : "failed";
+
+  if (!streamError && !(status === "failed" && lines === 0)) {
+    try {
+      if (params.ifExists === "error") {
+        try {
+          await fs.link(params.absoluteTempFile, params.absoluteOutputFile);
+          outputPersisted = true;
+          await fs.rm(params.absoluteTempFile, { force: true });
+        } catch (error) {
+          const code = isRecord(error) ? error.code : undefined;
+          await fs.rm(params.absoluteTempFile, { force: true });
+          if (code === "EEXIST") {
+            return {
+              status: "failed",
+              pages: 0,
+              lines: 0,
+              bytes: 0,
+              output_file: params.relativeOutputFile,
+              errors: [truncateErrorDiagnostic(`Output file already exists: ${params.relativeOutputFile}`)],
+            };
+          }
+          throw error;
+        }
+      } else {
+        await fs.rename(params.absoluteTempFile, params.absoluteOutputFile);
+        outputPersisted = true;
+      }
+    } catch (error) {
+      if (!outputPersisted) {
+        await fs.rm(params.absoluteTempFile, { force: true });
+      }
+      throw error;
+    }
+  }
+
+  if (!outputPersisted) {
+    await fs.rm(params.absoluteTempFile, { force: true });
+  }
 
   return {
     status,
