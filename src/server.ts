@@ -702,7 +702,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       };
     });
 
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const { name, arguments: args } = request.params;
 
       try {
@@ -720,10 +720,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
             return await handleUseTool(args as any, registry, catalog, validator);
 
           case "bulk_export":
-            // TODO(agent-data-export): MCP SDK request handlers do not currently
-            // expose a request AbortSignal here. handleBulkExport accepts one
-            // when the server dispatch contract grows cancellation plumbing.
-            return await handleBulkExport(args as any, registry, catalog);
+            return await handleBulkExport(args as any, registry, catalog, extra?.signal);
 
           case "health_check_all":
             return await handleHealthCheckAll(args as any, registry, catalog);

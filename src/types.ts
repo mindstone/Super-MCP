@@ -230,7 +230,6 @@ export interface BulkExportInput {
 export interface BulkExportOutput {
   status: "complete" | "partial" | "failed";
   pages: number;
-  pages_completed: number;
   lines: number;
   bytes: number;
   output_file: string;

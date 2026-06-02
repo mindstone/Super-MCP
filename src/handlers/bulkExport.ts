@@ -18,6 +18,8 @@ const BULK_EXPORT_TIMEOUT_MS = 10 * 60 * 1_000;
 const BULK_EXPORT_TIMEOUT_MESSAGE = "Bulk export timed out after 10 minutes.";
 const BULK_EXPORT_ABORTED_MESSAGE = "Bulk export was cancelled.";
 export const BULK_EXPORT_MAX_PAGE_BYTES = 10 * 1024 * 1024;
+const BULK_EXPORT_ERROR_DIAGNOSTIC_CHARS = 500;
+const BULK_EXPORT_ERROR_TRUNCATED_SUFFIX = "…[truncated]";
 
 const TRUSTABLE_READ_ONLY_VERBS = [
   "list",
@@ -67,6 +69,16 @@ const SIDE_EFFECT_VERBS = [
   "unassign",
   "replace",
   "manage",
+  "mark",
+  "set",
+  "enable",
+  "disable",
+  "clear",
+  "flush",
+  "import",
+  "sync",
+  "revoke",
+  "grant",
 ] as const;
 
 const SELF_RECURSION_TOOL_IDS = new Set([
@@ -117,6 +129,7 @@ interface RunBulkExportParams {
   toolName: string;
   args: Record<string, unknown>;
   absoluteOutputFile: string;
+  absoluteTempFile: string;
   relativeOutputFile: string;
   ifExists: "error" | "overwrite";
   itemsPath?: string;
@@ -131,6 +144,18 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 const toErrorMessage = (error: unknown): string =>
   error instanceof Error ? error.message : String(error);
+
+function truncateErrorDiagnostic(message: string): string {
+  if (message.length <= BULK_EXPORT_ERROR_DIAGNOSTIC_CHARS) {
+    return message;
+  }
+
+  return `${message.slice(0, BULK_EXPORT_ERROR_DIAGNOSTIC_CHARS)}${BULK_EXPORT_ERROR_TRUNCATED_SUFFIX}`;
+}
+
+function pushError(errors: string[], message: string): void {
+  errors.push(truncateErrorDiagnostic(message));
+}
 
 function errorResponse(message: string): { content: Array<{ type: "text"; text: string }>; isError: true } {
   return {
@@ -337,7 +362,43 @@ function isPathWithinRealRoot(candidatePath: string, rootPath: string): boolean 
   return relative === "" || relative === "." || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-async function resolveOutputPath(outputFile: string): Promise<{ absolutePath: string; relativePath: string }> {
+async function ensureDirectoryWithinRealRoot(
+  targetDir: string,
+  exportRoot: string,
+  realExportRoot: string,
+): Promise<string> {
+  const relativeFromExportRoot = path.relative(exportRoot, targetDir);
+  if (relativeFromExportRoot === "" || relativeFromExportRoot === ".") {
+    return realExportRoot;
+  }
+
+  let current = exportRoot;
+  let realCurrent = realExportRoot;
+  for (const part of relativeFromExportRoot.split(path.sep).filter(Boolean)) {
+    current = path.join(current, part);
+    try {
+      const stats = await fs.lstat(current);
+      if (!stats.isDirectory() && !stats.isSymbolicLink()) {
+        throw new Error("output_file parent path must contain only directories.");
+      }
+    } catch (error) {
+      const code = isRecord(error) ? error.code : undefined;
+      if (code !== "ENOENT") {
+        throw error;
+      }
+      await fs.mkdir(current);
+    }
+
+    realCurrent = await fs.realpath(current);
+    if (!isPathWithinRealRoot(realCurrent, realExportRoot)) {
+      throw new Error("output_file parent directory must stay within .rebel/exports.");
+    }
+  }
+
+  return realCurrent;
+}
+
+async function resolveOutputPath(outputFile: string): Promise<{ absolutePath: string; absoluteTempFile: string; relativePath: string }> {
   const workspacePath = process.env.REBEL_WORKSPACE_PATH?.trim();
   if (!workspacePath) {
     throw new Error("REBEL_WORKSPACE_PATH is not set.");
@@ -354,13 +415,18 @@ async function resolveOutputPath(outputFile: string): Promise<{ absolutePath: st
     throw new Error(`REBEL_WORKSPACE_PATH is not a directory: ${workspacePath}`);
   }
 
-  if (path.isAbsolute(outputFile)) {
+  const realWorkspacePath = await fs.realpath(workspacePath);
+
+  if (path.isAbsolute(outputFile) || path.win32.isAbsolute(outputFile)) {
     throw new Error("output_file must be a relative path under .rebel/exports.");
+  }
+  if (outputFile.split(/[\\/]+/).includes("..")) {
+    throw new Error("output_file must stay within .rebel/exports.");
   }
 
   const exportRoot = path.resolve(workspacePath, ".rebel", "exports");
-  const absolutePath = path.resolve(exportRoot, outputFile);
-  const relativeFromRoot = path.relative(exportRoot, absolutePath);
+  const lexicalAbsolutePath = path.resolve(exportRoot, outputFile);
+  const relativeFromRoot = path.relative(exportRoot, lexicalAbsolutePath);
 
   if (
     relativeFromRoot === "" ||
@@ -371,34 +437,25 @@ async function resolveOutputPath(outputFile: string): Promise<{ absolutePath: st
     throw new Error("output_file must stay within .rebel/exports.");
   }
 
-  await fs.mkdir(path.dirname(absolutePath), { recursive: true });
-
+  await fs.mkdir(exportRoot, { recursive: true });
   const realExportRoot = await fs.realpath(exportRoot);
-  const realParentDir = await fs.realpath(path.dirname(absolutePath));
-  // Lexical checks above block direct traversal. This realpath check catches
-  // symlinked subdirectories under .rebel/exports that point outside the export root.
-  if (!isPathWithinRealRoot(realParentDir, realExportRoot)) {
-    throw new Error("output_file parent directory must stay within .rebel/exports.");
+
+  if (!isPathWithinRealRoot(realExportRoot, realWorkspacePath)) {
+    throw new Error(".rebel/exports must stay within REBEL_WORKSPACE_PATH.");
   }
-  try {
-    const targetStats = await fs.lstat(absolutePath);
-    if (targetStats.isSymbolicLink()) {
-      throw new Error("output_file must not be a symlink.");
-    }
-  } catch (error) {
-    const code = isRecord(error) ? error.code : undefined;
-    if (code !== "ENOENT") {
-      throw error;
-    }
-  }
+
+  const realOutputDir = await ensureDirectoryWithinRealRoot(path.dirname(lexicalAbsolutePath), exportRoot, realExportRoot);
+  const absolutePath = path.join(realOutputDir, path.basename(lexicalAbsolutePath));
 
   const relativePath = path.posix.join(
     ".rebel",
     "exports",
     ...relativeFromRoot.split(path.sep).filter(Boolean),
   );
+  const tempSuffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  const absoluteTempFile = `${absolutePath}.${tempSuffix}.tmp`;
 
-  return { absolutePath, relativePath };
+  return { absolutePath, absoluteTempFile, relativePath };
 }
 
 function extractMcpTextResult(toolResult: unknown): ToolExecutionResult {
@@ -503,11 +560,10 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
       return {
         status: "failed",
         pages: 0,
-        pages_completed: 0,
         lines: 0,
         bytes: 0,
         output_file: params.relativeOutputFile,
-        errors: [`Output file already exists: ${params.relativeOutputFile}`],
+        errors: [truncateErrorDiagnostic(`Output file already exists: ${params.relativeOutputFile}`)],
       };
     } catch (error) {
       const code = isRecord(error) ? error.code : undefined;
@@ -517,8 +573,9 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
     }
   }
 
-  const stream = createWriteStream(params.absoluteOutputFile, { flags: params.ifExists === "error" ? "wx" : "w" });
+  const stream = createWriteStream(params.absoluteTempFile, { flags: "wx" });
   let streamError: Error | undefined;
+  let outputRenamed = false;
 
   stream.on("error", (error) => {
     streamError = error;
@@ -530,11 +587,12 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
   let currentArgs: Record<string, unknown> = { ...params.args };
   const errors: string[] = [];
   let completedNaturally = false;
+  let loopError: unknown;
 
   try {
     while (page < maxPages) {
       if (params.signal.aborted) {
-        errors.push(getAbortMessage(params.signal));
+        pushError(errors, getAbortMessage(params.signal));
         break;
       }
       if (streamError) {
@@ -557,14 +615,14 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
           const delay = BULK_EXPORT_RETRY_BASE_MS * Math.pow(2, attempt);
           await waitWithAbort(delay, params.signal);
         } else {
-          errors.push(`Page ${page + 1}: ${result.output}`);
+          pushError(errors, `Page ${page + 1}: ${result.output}`);
         }
       }
 
       if (params.signal.aborted) {
         const abortMessage = getAbortMessage(params.signal);
         if (!errors.includes(abortMessage)) {
-          errors.push(abortMessage);
+          pushError(errors, abortMessage);
         }
         break;
       }
@@ -575,7 +633,7 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
 
       const rawPageBytes = Buffer.byteLength(result.output);
       if (rawPageBytes > BULK_EXPORT_MAX_PAGE_BYTES) {
-        errors.push(`Page ${page + 1} raw output exceeded 10MB; lower the tool's page size.`);
+        pushError(errors, `Page ${page + 1} raw output exceeded 10MB; lower the tool's page size.`);
         break;
       }
 
@@ -583,7 +641,7 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
       try {
         parsed = JSON.parse(result.output);
       } catch {
-        errors.push("Tool output is not JSON. Try adding returnJson: true to args.");
+        pushError(errors, "Tool output is not JSON. Try adding returnJson: true to args.");
         break;
       }
 
@@ -592,7 +650,7 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
         const extracted = getByPath(parsed, params.itemsPath);
         if (page === 0 && extracted === undefined) {
           const keys = isRecord(parsed) ? Object.keys(parsed).join(", ") : "none";
-          errors.push(`No items at path '${params.itemsPath}'. Available keys: ${keys}`);
+          pushError(errors, `No items at path '${params.itemsPath}'. Available keys: ${keys}`);
           break;
         }
         items = Array.isArray(extracted) ? extracted : extracted != null ? [extracted] : [];
@@ -631,15 +689,18 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
         break;
       }
 
+      if (page >= maxPages) {
+        pushError(errors, `Reached max_pages (${maxPages}) before pagination completed; increase max_pages or narrow the query.`);
+        break;
+      }
+
       currentArgs = {
         ...currentArgs,
         [params.pagination.inputParam]: nextToken,
       };
     }
-
-    if (page >= maxPages && errors.length === 0) {
-      completedNaturally = true;
-    }
+  } catch (error) {
+    loopError = error;
   } finally {
     stream.end();
     try {
@@ -649,8 +710,25 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
     }
   }
 
+  if (loopError) {
+    await fs.rm(params.absoluteTempFile, { force: true });
+    throw loopError;
+  }
+
   if (streamError) {
-    errors.push(`Stream error: ${streamError.message}`);
+    pushError(errors, `Stream error: ${streamError.message}`);
+  } else {
+    try {
+      await fs.rename(params.absoluteTempFile, params.absoluteOutputFile);
+      outputRenamed = true;
+    } catch (error) {
+      await fs.rm(params.absoluteTempFile, { force: true });
+      throw error;
+    }
+  }
+
+  if (!outputRenamed) {
+    await fs.rm(params.absoluteTempFile, { force: true });
   }
 
   const status: BulkExportOutput["status"] =
@@ -659,7 +737,6 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
   return {
     status,
     pages: page,
-    pages_completed: page,
     lines,
     bytes,
     output_file: params.relativeOutputFile,
@@ -690,6 +767,20 @@ function validateSecurityPolicy(packageId: string, toolId: string, registry: Pac
   return null;
 }
 
+async function validatePackageAvailable(packageId: string, catalog: Catalog): Promise<string | null> {
+  await catalog.ensurePackageLoaded(packageId);
+  const packageStatus = catalog.getPackageStatus(packageId);
+  if (packageStatus === "auth_required") {
+    return `Package '${packageId}' requires authentication. Run 'authenticate(package_id: "${packageId}")'.`;
+  }
+  if (packageStatus === "error") {
+    const reason = catalog.getPackageError(packageId) || "See logs for details";
+    return `Package '${packageId}' is unavailable: ${reason}`;
+  }
+
+  return null;
+}
+
 export async function handleBulkExport(
   input: BulkExportInput,
   registry: PackageRegistry,
@@ -706,6 +797,15 @@ export async function handleBulkExport(
   const securityError = validateSecurityPolicy(parsedInput.packageId, parsedInput.toolId, registry);
   if (securityError) {
     return errorResponse(securityError);
+  }
+
+  try {
+    const packageError = await validatePackageAvailable(parsedInput.packageId, catalog);
+    if (packageError) {
+      return errorResponse(packageError);
+    }
+  } catch (error) {
+    return errorResponse(toErrorMessage(error));
   }
 
   try {
@@ -744,6 +844,7 @@ export async function handleBulkExport(
       toolName: parsedInput.toolId,
       args: parsedInput.args,
       absoluteOutputFile: resolvedOutput.absolutePath,
+      absoluteTempFile: resolvedOutput.absoluteTempFile,
       relativeOutputFile: resolvedOutput.relativePath,
       ifExists: parsedInput.ifExists,
       itemsPath: parsedInput.itemsPath,
