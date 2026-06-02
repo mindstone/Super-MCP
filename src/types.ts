@@ -213,6 +213,30 @@ export interface UseToolOutput {
   };
 }
 
+export interface BulkExportInput {
+  package_id?: string;
+  tool_id: string;
+  args: Record<string, unknown>;
+  output_file: string;
+  items_path?: string;
+  max_pages?: number;
+  if_exists?: "error" | "overwrite";
+  pagination?: {
+    token_field: string;
+    input_param: string;
+  };
+}
+
+export interface BulkExportOutput {
+  status: "complete" | "partial" | "failed";
+  pages: number;
+  pages_completed: number;
+  lines: number;
+  bytes: number;
+  output_file: string;
+  errors?: string[];
+}
+
 export interface BeginAuthInput {
   package_id: string;
 }

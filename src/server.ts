@@ -16,6 +16,7 @@ import {
   handleListToolPackages,
   handleListTools,
   handleGetToolDetails,
+  handleBulkExport,
   handleUseTool,
   handleHealthCheckAll,
   handleHealthCheckPackage,
@@ -492,6 +493,78 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
             },
           },
           {
+            name: "bulk_export",
+            description: "Run a read-only package tool across multiple pages and stream the results to an NDJSON file in the workspace. Use this for large exports that should bypass use_tool truncation and continuation handling.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                package_id: {
+                  type: "string",
+                  description: "Package ID containing the tool. Optional when tool_id is namespaced like 'Package__tool_name'.",
+                  examples: ["filesystem", "gmail", "hubspot"],
+                },
+                tool_id: {
+                  type: "string",
+                  description: "Read-only tool ID to execute. Can be a bare tool name or a namespaced ID like 'Package__tool_name'.",
+                  examples: ["search_emails", "GoogleWorkspace__search_workspace_emails"],
+                },
+                args: {
+                  type: "object",
+                  description: "Arguments to send to the target tool on the first page.",
+                },
+                output_file: {
+                  type: "string",
+                  description: "Relative file path to create under .rebel/exports/ (for example 'gmail/messages.ndjson').",
+                  examples: ["gmail/messages.ndjson", "reports/slack.ndjson"],
+                },
+                if_exists: {
+                  type: "string",
+                  enum: ["error", "overwrite"],
+                  description: "What to do if output_file already exists. Defaults to error.",
+                  default: "error",
+                },
+                items_path: {
+                  type: "string",
+                  description: "Optional dot-path to the array or object to emit as NDJSON lines from each JSON response.",
+                  examples: ["emails", "data.items"],
+                },
+                max_pages: {
+                  type: "number",
+                  description: "Maximum number of pages to fetch. Values are clamped to the range 1-500.",
+                  default: 100,
+                },
+                pagination: {
+                  type: "object",
+                  description: "Pagination config describing where to read the next-page token and which input param to update with it.",
+                  properties: {
+                    token_field: {
+                      type: "string",
+                      description: "Dot-path to the next-page token in the tool's JSON response.",
+                      examples: ["nextPageToken", "meta.next_cursor"],
+                    },
+                    input_param: {
+                      type: "string",
+                      description: "Argument name that should receive the next-page token on subsequent calls.",
+                      examples: ["pageToken", "cursor"],
+                    },
+                  },
+                  required: ["token_field", "input_param"],
+                },
+              },
+              required: ["tool_id", "args", "output_file"],
+              examples: [
+                {
+                  package_id: "GoogleWorkspace",
+                  tool_id: "search_workspace_emails",
+                  args: { query: "after:2026/01/01", returnJson: true },
+                  output_file: "gmail/messages.ndjson",
+                  items_path: "emails",
+                  pagination: { token_field: "nextPageToken", input_param: "pageToken" },
+                },
+              ],
+            },
+          },
+          {
             name: "get_help",
             description: "Get detailed guidance on using Super-MCP effectively. Provides step-by-step instructions, common workflows, troubleshooting tips, and best practices. Use this when you need clarification on how to accomplish tasks.",
             inputSchema: {
@@ -645,6 +718,12 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
 
           case "use_tool":
             return await handleUseTool(args as any, registry, catalog, validator);
+
+          case "bulk_export":
+            // TODO(agent-data-export): MCP SDK request handlers do not currently
+            // expose a request AbortSignal here. handleBulkExport accepts one
+            // when the server dispatch contract grows cancellation plumbing.
+            return await handleBulkExport(args as any, registry, catalog);
 
           case "health_check_all":
             return await handleHealthCheckAll(args as any, registry, catalog);

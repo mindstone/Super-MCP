@@ -1,6 +1,7 @@
 export { handleListToolPackages } from "./listToolPackages.js";
 export { handleListTools } from "./listTools.js";
 export { handleGetToolDetails } from "./getToolDetails.js";
+export { handleBulkExport } from "./bulkExport.js";
 export { handleUseTool } from "./useTool.js";
 export { handleHealthCheckAll } from "./healthCheck.js";
 export { handleHealthCheckPackage } from "./healthCheckPackage.js";
