@@ -43,6 +43,52 @@ describe("materializeOutput", () => {
     expect(result).toBeNull();
   });
 
+  it("T-symlink: aborts (returns null) when .rebel/tool-outputs symlinks outside the workspace", async () => {
+    // Defense-in-depth (restores super-mcp 02f703dc, lost in a submodule-pin
+    // rollback): a symlinked tool-outputs dir escaping the workspace must be
+    // rejected — the lexical path check does not follow symlinks; realpath does.
+    const escapeDir = await fs.mkdtemp(path.join(os.tmpdir(), "rebel-mcp-escape-"));
+    try {
+      await fs.mkdir(path.join(tempWorkspace, ".rebel"), { recursive: true });
+      await fs.symlink(escapeDir, path.join(tempWorkspace, ".rebel", "tool-outputs"), "dir");
+
+      const text = "A".repeat(150_000);
+      const result = await materializeOutput("pkg1", "tool1", {}, createToolResult(text), 100, tempWorkspace, 100_000);
+
+      expect(result).toBeNull(); // realpath symlink defense aborts materialization
+      const leaked = await fs.readdir(escapeDir);
+      expect(leaked).toEqual([]); // nothing written into the escape target
+    } finally {
+      await fs.rm(escapeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("T-symlink-image: image/archive flow aborts (returns null) when .rebel/tool-outputs symlinks outside the workspace", async () => {
+    // Defense-in-depth for the IMAGE/ARCHIVE write flow (mirrors T-symlink for
+    // the text/JSON flow): the realpath symlink guard must abort here too — the
+    // lexical path check does not follow symlinks, realpath does. A tool result
+    // carrying an image block exercises the imageBlocks branch of materializeOutput.
+    const TINY_PNG_BASE64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+    const escapeDir = await fs.mkdtemp(path.join(os.tmpdir(), "rebel-mcp-escape-img-"));
+    try {
+      await fs.mkdir(path.join(tempWorkspace, ".rebel"), { recursive: true });
+      await fs.symlink(escapeDir, path.join(tempWorkspace, ".rebel", "tool-outputs"), "dir");
+
+      const toolResult = {
+        content: [{ type: "image", data: TINY_PNG_BASE64, mimeType: "image/png" }],
+        isError: false,
+      };
+      const result = await materializeOutput("pkg1", "tool1", {}, toolResult, 100, tempWorkspace, 20_000);
+
+      expect(result).toBeNull(); // realpath symlink defense aborts the image/archive flow
+      const leaked = await fs.readdir(escapeDir);
+      expect(leaked).toEqual([]); // no archive JSON and no image binary written into the escape target
+    } finally {
+      await fs.rm(escapeDir, { recursive: true, force: true });
+    }
+  });
+
   it("T3: JSON output -> valid pretty-printed .json file (no frontmatter)", async () => {
     const jsonStr = JSON.stringify({ items: Array(1000).fill({ a: 1 }) });
     const result = await materializeOutput("pkg1", "tool1", {}, createToolResult(jsonStr), 100, tempWorkspace, 100);

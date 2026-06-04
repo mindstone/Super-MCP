@@ -52,6 +52,51 @@ function isPathWithinTarget(filePath: string, targetDir: string): boolean {
   return resolvedPath.startsWith(resolvedTarget + path.sep) || resolvedPath === resolvedTarget;
 }
 
+/**
+ * Defense-in-depth symlink-traversal guard. Call AFTER `fs.mkdir(targetDir)`:
+ * resolves symlinks (`fs.realpath`) on both the tool-outputs dir and the workspace,
+ * and verifies the real target is still inside the real workspace. The lexical
+ * `isPathWithinTarget` check does NOT follow symlinks, so a symlinked
+ * `.rebel/tool-outputs` (or `.rebel`) pointing outside the workspace would slip past
+ * it; this catches that and the caller writes through the returned real dir.
+ * Returns the realpath'd target dir, or null to abort materialization.
+ *
+ * Restores super-mcp 02f703dc ("realpath symlink defense"), which was lost when a
+ * submodule-pin rollback orphaned it (see Rebel postmortem
+ * 260603_supermcp_bulk_export_submodule_pin_orphan).
+ */
+async function resolveRealTargetWithinWorkspace(
+  targetDir: string,
+  workspacePath: string,
+  ctx: { package_id: string; tool_id: string },
+): Promise<string | null> {
+  let realTargetDir: string;
+  let realWorkspace: string;
+  try {
+    realTargetDir = await fs.realpath(targetDir);
+    realWorkspace = await fs.realpath(workspacePath);
+  } catch (err: any) {
+    logger.warn("realpath failed for tool-outputs dir; aborting materialization", {
+      targetDir,
+      workspacePath,
+      package_id: ctx.package_id,
+      tool_id: ctx.tool_id,
+      error: err?.message ?? String(err),
+    });
+    return null;
+  }
+  if (realTargetDir !== realWorkspace && !realTargetDir.startsWith(realWorkspace + path.sep)) {
+    logger.error("Path traversal via symlink detected, aborting materialization", {
+      realTargetDir,
+      realWorkspace,
+      package_id: ctx.package_id,
+      tool_id: ctx.tool_id,
+    });
+    return null;
+  }
+  return realTargetDir;
+}
+
 function buildFilenamePrefix(package_id: string, tool_id: string): string {
   const now = new Date();
   const yy = String(now.getFullYear()).slice(2);
@@ -307,13 +352,21 @@ export async function materializeOutput(
       return null;
     }
 
-    const archiveTmpPath = `${archivePath}.tmp`;
+    let archiveTmpPath = `${archivePath}.tmp`;
     let savedImages: SavedImageFile[] = [];
     try {
       await fs.mkdir(targetDir, { recursive: true });
-      savedImages = await saveImageFiles(imageBlocks, targetDir, filenamePrefix);
+      // Defense-in-depth: abort if the tool-outputs dir resolves (via symlink)
+      // outside the workspace, and write through the resolved real dir.
+      const realTargetDir = await resolveRealTargetWithinWorkspace(targetDir, workspacePath, { package_id, tool_id });
+      if (!realTargetDir) {
+        return null;
+      }
+      const realArchivePath = path.join(realTargetDir, archiveFilename);
+      archiveTmpPath = `${realArchivePath}.tmp`;
+      savedImages = await saveImageFiles(imageBlocks, realTargetDir, filenamePrefix);
       await fs.writeFile(archiveTmpPath, archiveContent, "utf8");
-      await fs.rename(archiveTmpPath, archivePath);
+      await fs.rename(archiveTmpPath, realArchivePath);
     } catch (err: any) {
       try {
         await fs.unlink(archiveTmpPath);
@@ -432,12 +485,20 @@ export async function materializeOutput(
     return null;
   }
 
-  const tmpFilePath = filePath + ".tmp";
+  let tmpFilePath = filePath + ".tmp";
 
   try {
     await fs.mkdir(targetDir, { recursive: true });
+    // Defense-in-depth: abort if the tool-outputs dir resolves (via symlink)
+    // outside the workspace, and write through the resolved real dir.
+    const realTargetDir = await resolveRealTargetWithinWorkspace(targetDir, workspacePath, { package_id, tool_id });
+    if (!realTargetDir) {
+      return null;
+    }
+    const realFilePath = path.join(realTargetDir, filename);
+    tmpFilePath = `${realFilePath}.tmp`;
     await fs.writeFile(tmpFilePath, fileContent, "utf8");
-    await fs.rename(tmpFilePath, filePath);
+    await fs.rename(tmpFilePath, realFilePath);
   } catch (err: any) {
     // Clean up tmp file if possible
     try { await fs.unlink(tmpFilePath); } catch (e) {}
