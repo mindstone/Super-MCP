@@ -808,6 +808,24 @@ export async function handleUseTool(
 
   let { package_id, tool_id, args, dry_run = false, max_output_chars, schema_hash } = cleanInput;
 
+  // REBEL-62D: the MCP SDK does not enforce a tool's `required` inputSchema, so
+  // a use_tool call can arrive with tool_id missing/empty (model slip, or an
+  // upstream stringified-args bug stripping it). Guard BEFORE the namespaced-id
+  // `tool_id.includes('__')` checks below — on `undefined` those throw a raw
+  // TypeError that surfaces as a generic -33xx/-32603 INTERNAL_ERROR the model
+  // can't recover from. Fail with a coded, actionable validation error instead.
+  if (typeof tool_id !== "string" || tool_id.trim().length === 0) {
+    throw {
+      code: ERROR_CODES.ARG_VALIDATION_FAILED,
+      message:
+        'use_tool requires a non-empty "tool_id". Use search_tools(query) to find a tool by intent, or list_tools(package_id) to list a package\'s tools.',
+      data: {
+        package_id: package_id ?? null,
+        provided_args: args && typeof args === "object" ? Object.keys(args) : [],
+      },
+    };
+  }
+
   const normalisations: string[] = [];
 
   // Normalize inputs that the model may have stringified (upstream Claude model bug).
