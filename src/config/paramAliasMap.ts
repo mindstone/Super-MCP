@@ -53,9 +53,17 @@ export type ToolAliasMap = ReadonlyArray<AliasEntry>;
 
 /** Per-tool entries, keyed by exact tool id, scoped by package family. */
 const SLACK_TOOL_ALIASES: Readonly<Record<string, ToolAliasMap>> = {
-  // Slack message tools accept `count`, agents pass `limit`.
+  // `search_slack_messages` is canonical on `count` (connectors/slack messages.ts),
+  // so an agent's `limit` must be aliased to `count`.
   search_slack_messages: [{ from: "limit", to: "count" }],
-  get_slack_channel_history: [{ from: "limit", to: "count" }],
+  // NOTE: `get_slack_channel_history` is canonical on `limit`
+  // (connectors/slack channels.ts) — it has NO `count` field. A `limit→count`
+  // alias here rewrote a correct `limit` into an invalid `count`, which the
+  // connector rejected (use_tool -33003 "unknown field: count"), driving weak
+  // models into a non-convergent retry loop (observed burning whole turns on
+  // local DeepSeek-V4-Flash). Removed 2026-06-08; see
+  // docs/plans/260608_minimax-ds4-mcp-toolcall-eval/PLAN.md (P1) and
+  // docs/plans/260608_ds4-local-call-improvements/FINDINGS.md.
 };
 
 const MICROSOFT_TOOL_ALIASES: Readonly<Record<string, ToolAliasMap>> = {
