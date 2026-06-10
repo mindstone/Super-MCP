@@ -754,14 +754,15 @@ export async function handleUseTool(
   catalog: Catalog,
   validator: { validate: (schema: any, data: any, context?: { package_id?: string; tool_id?: string }) => ValidationResult }
 ): Promise<any> {
-  input = parseUseToolInput(input);
-
   // Staged tool calls: the host process (toolSafetyService PreToolUse hook) intercepted
   // this call for deferred user approval. It sets _rebel_staged via updatedInput so the
   // SDK treats the call as "allowed" (preventing sibling-error cascade for parallel calls)
   // while we return immediately without executing the underlying tool.
   // See: src/main/services/toolSafetyService.ts — staging path.
-  if (input._rebel_staged) {
+  // This short-circuit MUST run before dispatch validation (parseUseToolInput): the host
+  // has already created and broadcast the approval entry by the time we run, so rejecting
+  // here would diverge model and user state — validation runs on the approval-replay leg.
+  if (typeof input === "object" && input !== null && input._rebel_staged) {
     return buildOuter({
       content: [{ type: "text", text: input._rebel_staged_message ?? "Tool call staged for approval." }],
       isError: false,
@@ -773,6 +774,8 @@ export async function handleUseTool(
       },
     });
   }
+
+  input = parseUseToolInput(input);
 
   // Continuation: retrieve cached truncated result (before any validation/security)
   const { _rebel_staged: _, _rebel_staged_message: __, ...cleanForContinuation } = input;

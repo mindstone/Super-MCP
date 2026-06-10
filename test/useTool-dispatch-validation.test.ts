@@ -203,6 +203,32 @@ describe("useTool dispatch-level validation", () => {
     expect(mockClient.callTool).toHaveBeenCalledWith("tool1", { query: "budget" });
   });
 
+  it("staged calls short-circuit BEFORE dispatch validation even with a malformed args container", async () => {
+    // Pin the ordering contract: by the time _rebel_staged reaches us, the host has
+    // already created and broadcast the approval entry. A -33003 here would diverge
+    // model and user state (duplicate approval prompts); validation belongs to the
+    // approval-replay leg. See useTool.ts staged short-circuit comment.
+    const { mockRegistry, mockCatalog, mockValidator } = createMocks();
+
+    const response = await handleUseTool(
+      {
+        package_id: "pkg1",
+        tool_id: "pkg1__tool",
+        args: 42, // malformed container that WOULD throw -33003 on a normal call
+        _rebel_staged: true,
+        _rebel_staged_message: "Staged for approval.",
+      } as unknown as Parameters<typeof handleUseTool>[0],
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    );
+
+    expect(response.isError).toBe(false);
+    expect(response._meta?.superMcp).toMatchObject({ staged: true });
+    expect(response.content[0]).toMatchObject({ type: "text", text: "Staged for approval." });
+    expect(mockValidator.validate).not.toHaveBeenCalled();
+  });
+
   it("treats result_id calls as continuation calls and ignores package/tool/args shape", async () => {
     const { mockRegistry, mockCatalog, mockValidator } = createMocks();
 
