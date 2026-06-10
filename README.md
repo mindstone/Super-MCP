@@ -1,6 +1,16 @@
 # Super MCP Router
 
-A local MCP router that aggregates multiple MCPs into a single interface for Claude. No installation required - just use npx!
+A local MCP router that aggregates all your MCP servers behind a single
+interface — and saves your context window by loading only the tools you
+actually need, when you need them. No installation required - just use npx!
+
+Connect ten MCP servers directly and every tool schema lands in your model's
+context before it has done any work. Super-MCP replaces that with a small set
+of meta-tools and on-demand discovery: search for the tool you need, fetch its
+schema, call it. Your context window stays for the actual task.
+
+Works with Claude Desktop, Claude Code, Cursor, [Rebel](https://mindstone.com),
+or any other MCP host.
 
 ## Overview
 
@@ -590,3 +600,20 @@ npm run dev -- --config ./super-mcp-config.json
 # Build for production
 npm run build
 ```
+
+## The Mindstone open-source family
+
+This repo is one of several open-source projects from Mindstone:
+
+- [Rebel](https://mindstone.com) — the AI workspace desktop app that uses
+  Super-MCP as its tool router (source release in progress).
+- [mcp-servers](https://github.com/mindstone/mcp-servers) — source-available
+  MCP connectors for popular SaaS tools; works with any MCP host.
+- [rebel-system](https://github.com/mindstone/rebel-system-oss) — the public
+  Rebel system: skills, prompts, operators, help docs, and templates.
+- [meeting-note-recorder](https://github.com/mindstone/meeting-note-recorder)
+  — meeting detection, recording, and live transcripts (the Rebel note-taker).
+
+## License
+
+Released under the [MIT License](LICENSE).
