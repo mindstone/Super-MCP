@@ -7,8 +7,9 @@ import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/t
 import { getLogger } from "../logging.js";
 import { getSecurityPolicy } from "../security.js";
 import { findBestMatch } from "../utils/fuzzyMatch.js";
-import { coerceStringifiedJson, coerceStringifiedBoolean, coerceStringifiedNumber, normalizeArgKeys, formatKeyAliasBreadcrumb } from "../utils/normalizeInput.js";
+import { coerceStringifiedBoolean, coerceStringifiedNumber, normalizeArgKeys, formatKeyAliasBreadcrumb } from "../utils/normalizeInput.js";
 import { materializeOutput, extractImageContentBlocks, SUPPORTED_IMAGE_MIME_TYPES } from "./materializeOutput.js";
+import { parseUseToolInput } from "./useToolInput.js";
 
 const logger = getLogger();
 
@@ -758,7 +759,10 @@ export async function handleUseTool(
   // SDK treats the call as "allowed" (preventing sibling-error cascade for parallel calls)
   // while we return immediately without executing the underlying tool.
   // See: src/main/services/toolSafetyService.ts — staging path.
-  if (input._rebel_staged) {
+  // This short-circuit MUST run before dispatch validation (parseUseToolInput): the host
+  // has already created and broadcast the approval entry by the time we run, so rejecting
+  // here would diverge model and user state — validation runs on the approval-replay leg.
+  if (typeof input === "object" && input !== null && input._rebel_staged) {
     return buildOuter({
       content: [{ type: "text", text: input._rebel_staged_message ?? "Tool call staged for approval." }],
       isError: false,
@@ -770,6 +774,8 @@ export async function handleUseTool(
       },
     });
   }
+
+  input = parseUseToolInput(input);
 
   // Continuation: retrieve cached truncated result (before any validation/security)
   const { _rebel_staged: _, _rebel_staged_message: __, ...cleanForContinuation } = input;
@@ -808,31 +814,7 @@ export async function handleUseTool(
 
   let { package_id, tool_id, args, dry_run = false, max_output_chars, schema_hash } = cleanInput;
 
-  // REBEL-62D: the MCP SDK does not enforce a tool's `required` inputSchema, so
-  // a use_tool call can arrive with tool_id missing/empty (model slip, or an
-  // upstream stringified-args bug stripping it). Guard BEFORE the namespaced-id
-  // `tool_id.includes('__')` checks below — on `undefined` those throw a raw
-  // TypeError that surfaces as a generic -33xx/-32603 INTERNAL_ERROR the model
-  // can't recover from. Fail with a coded, actionable validation error instead.
-  if (typeof tool_id !== "string" || tool_id.trim().length === 0) {
-    throw {
-      code: ERROR_CODES.ARG_VALIDATION_FAILED,
-      message:
-        'use_tool requires a non-empty "tool_id". Use search_tools(query) to find a tool by intent, or list_tools(package_id) to list a package\'s tools.',
-      data: {
-        package_id: package_id ?? null,
-        provided_args: args && typeof args === "object" ? Object.keys(args) : [],
-      },
-    };
-  }
-
   const normalisations: string[] = [];
-
-  // Normalize inputs that the model may have stringified (upstream Claude model bug).
-  // See: anthropics/claude-code#25865, docs/investigations/260330_slow_turn_brute_force_search.md
-  // Safety: coercion returns the properly-typed value on success, or the original value
-  // unchanged on failure — in which case downstream validation catches the type mismatch.
-  args = coerceStringifiedJson(args, "object", { handler: "use_tool", field: "args", package_id, tool_id }) as typeof args;
 
   // R1: coerce undefined/null args to {} so no-arg tools (list_*, status, ready, etc.)
   // pass Zod schemas that require an object. Logged once per call as a telemetry breadcrumb.
