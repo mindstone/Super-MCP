@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/glitch.svg" alt="Glitch, the Rebel character for safety checks and known limitations" width="112" />
+</p>
+
 # Super MCP Router
 
 A local MCP router that aggregates all your MCP servers behind a single
