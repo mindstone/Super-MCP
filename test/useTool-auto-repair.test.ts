@@ -176,4 +176,50 @@ describe("useTool — Stage 0 schema-driven auto-repair", () => {
       external_id: "12345678901234567890",
     });
   });
+
+  // Cross-family GPT review (Stage 0): a non-canonical integer string for an integer-only
+  // field must NOT be silently coerced — it stays -33003 (the model corrects explicitly).
+  it("does NOT coerce a non-canonical integer string (max_results:'1e3') — stays -33003", async () => {
+    const { mockRegistry, mockCatalog, validator, mockClient } = createMocks();
+
+    await expect(
+      handleUseTool(
+        {
+          package_id: "GoogleWorkspace-test",
+          tool_id: "list_workspace_calendar_events",
+          args: { email: "user@example.com", max_results: "1e3" },
+          max_output_chars: null,
+        },
+        mockRegistry,
+        mockCatalog,
+        validator,
+      ),
+    ).rejects.toMatchObject({ code: -33003 });
+
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+
+  // A repair that FIRES (a key gets canonical-normalized) but whose re-validation still
+  // FAILS must throw the original ticket and leak NO auto_repair breadcrumbs.
+  it("a fired-but-insufficient repair still -33003 and leaks no breadcrumbs", async () => {
+    const { mockRegistry, mockCatalog, validator, mockClient } = createMocks();
+
+    // maxResults→max_results normalizes (repair fires), but required `email` is missing,
+    // so re-validation still fails → original ticket, no dispatch, no breadcrumb leak.
+    await expect(
+      handleUseTool(
+        {
+          package_id: "GoogleWorkspace-test",
+          tool_id: "list_workspace_calendar_events",
+          args: { maxResults: "20" },
+          max_output_chars: null,
+        },
+        mockRegistry,
+        mockCatalog,
+        validator,
+      ),
+    ).rejects.toMatchObject({ code: -33003 });
+
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
 });

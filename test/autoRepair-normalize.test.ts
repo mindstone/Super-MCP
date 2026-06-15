@@ -179,11 +179,10 @@ describe("coerceArgsToSchema", () => {
     };
     const args: Record<string, unknown> = { a: "007", b: "0x10", c: " 5 " };
     const { breadcrumbs } = coerceArgsToSchema(args, schema);
-    // "007" leading-zero rejected; "0x10" hex rejected; " 5 " trims to "5" which IS canonical.
-    expect(args.a).toBe("007");
-    expect(args.b).toBe("0x10");
-    expect(args.c).toBe(5);
-    expect(breadcrumbs.map(formatAutoRepairBreadcrumb)).toEqual(["auto_repair_coerce:c"]);
+    // "007" leading-zero rejected; "0x10" hex rejected; " 5 " whitespace rejected — all
+    // fall through to the repair-ticket rather than being silently reshaped.
+    expect(args).toEqual({ a: "007", b: "0x10", c: " 5 " });
+    expect(breadcrumbs).toEqual([]);
   });
 
   it("does not coerce a fractional string for an integer-only property", () => {
@@ -191,5 +190,56 @@ describe("coerceArgsToSchema", () => {
     const args: Record<string, unknown> = { n: "1.5" };
     coerceArgsToSchema(args, schema);
     expect(args).toEqual({ n: "1.5" });
+  });
+
+  // Cross-family GPT review (Stage 0): integer-only fields must reject non-canonical
+  // spellings that Number() would otherwise silently accept as equivalent integers.
+  it("does NOT coerce non-canonical integer spellings for an integer-only field (-0, 1.0, 1e3, whitespace)", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        a: { type: "integer" },
+        b: { type: "integer" },
+        c: { type: "integer" },
+        d: { type: "integer" },
+      },
+    };
+    const args: Record<string, unknown> = { a: "-0", b: "1.0", c: "1e3", d: " 5 " };
+    const { breadcrumbs } = coerceArgsToSchema(args, schema);
+    expect(args).toEqual({ a: "-0", b: "1.0", c: "1e3", d: " 5 " }); // all left as strings
+    expect(breadcrumbs).toEqual([]);
+  });
+
+  it("DOES coerce canonical integers (0, positive, negative) for an integer-only field", () => {
+    const schema = {
+      type: "object",
+      properties: { a: { type: "integer" }, b: { type: "integer" }, c: { type: "integer" } },
+    };
+    const args: Record<string, unknown> = { a: "0", b: "40", c: "-7" };
+    const { breadcrumbs } = coerceArgsToSchema(args, schema);
+    expect(args).toEqual({ a: 0, b: 40, c: -7 });
+    expect(breadcrumbs.map(formatAutoRepairBreadcrumb)).toEqual([
+      "auto_repair_coerce:a",
+      "auto_repair_coerce:b",
+      "auto_repair_coerce:c",
+    ]);
+  });
+
+  it("still accepts fractional/exponent forms for a `number` (non-integer) field", () => {
+    const schema = { type: "object", properties: { x: { type: "number" } } };
+    const args: Record<string, unknown> = { x: "1.5" };
+    coerceArgsToSchema(args, schema);
+    expect(args).toEqual({ x: 1.5 });
+  });
+});
+
+describe("canonicalKeyNormalize — reserved keys", () => {
+  it("never rewrites reserved top-level keys (_meta / structuredContent)", () => {
+    const schema = { type: "object", properties: { meta: { type: "object" } } };
+    // `_meta` canonicalizes to `meta` which IS a schema prop, but it must be left alone.
+    const args: Record<string, unknown> = { _meta: { x: 1 } };
+    const { breadcrumbs } = canonicalKeyNormalize(args, schema);
+    expect(args).toEqual({ _meta: { x: 1 } });
+    expect(breadcrumbs).toEqual([]);
   });
 });

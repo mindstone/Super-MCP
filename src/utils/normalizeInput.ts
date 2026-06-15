@@ -299,6 +299,7 @@ export function canonicalKeyNormalize(
   // Snapshot the keys up front: we mutate `args` while iterating.
   for (const key of Object.keys(args)) {
     if (Object.prototype.hasOwnProperty.call(props, key)) continue; // already a valid key
+    if (RESERVED_TOP_LEVEL_KEYS.has(key)) continue; // never rewrite _meta / structuredContent
     const target = canonicalKey(key);
     const matches = propKeys.filter((p) => canonicalKey(p) === target);
     if (matches.length !== 1) continue; // unknown or ambiguous → leave for the validator
@@ -314,6 +315,11 @@ export function canonicalKeyNormalize(
 }
 
 const CANONICAL_NUMBER = /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$/;
+// Strict integer grammar for integer-only fields: no whitespace, no `-0`, no leading
+// zeros, no decimal/exponent forms. `"1.0"`, `"1e3"`, `" 5 "`, `"-0"` are intentionally
+// NOT auto-coerced — they fall through to the -33003 repair-ticket so the model corrects
+// explicitly rather than being silently reshaped (cross-family GPT review, Stage 0).
+const STRICT_INTEGER = /^(0|-?[1-9][0-9]*)$/;
 
 /**
  * Resolve the set of scalar primitive types a property schema declares,
@@ -380,24 +386,30 @@ function coerceScalarToSchema(
   // If a string / enum / const is legitimately accepted, never coerce.
   if (hasStringOrLiteral) return { value, changed: false };
 
-  const trimmed = value.trim();
-
-  if ((types.has("number") || types.has("integer")) && CANONICAL_NUMBER.test(trimmed)) {
-    const n = Number(trimmed);
-    if (Number.isFinite(n)) {
-      const wantsIntegerOnly = types.has("integer") && !types.has("number");
-      if (wantsIntegerOnly && !Number.isInteger(n)) return { value, changed: false };
-      // Guard against lossy coercion of large id-like strings: only coerce when
-      // the numeric value round-trips safely as an integer. Genuine fractional
-      // numbers (which contain a '.') are unaffected by the safe-integer check.
-      if (Number.isInteger(n) && !Number.isSafeInteger(n)) return { value, changed: false };
-      return { value: n, changed: true };
+  // Match against the ORIGINAL string (no trim): leading/trailing whitespace is sloppy
+  // input we leave for the repair-ticket rather than silently accepting.
+  const wantsIntegerOnly = types.has("integer") && !types.has("number");
+  if (wantsIntegerOnly) {
+    // Integer-only: strict integer grammar (rejects `-0`, `1.0`, `1e3`, whitespace).
+    if (STRICT_INTEGER.test(value)) {
+      const n = Number(value);
+      if (Number.isSafeInteger(n)) return { value: n, changed: true };
+    }
+  } else if (types.has("number") || types.has("integer")) {
+    // `number` (may be fractional/exponent): canonical JSON number on the original string.
+    if (CANONICAL_NUMBER.test(value)) {
+      const n = Number(value);
+      // Guard against lossy coercion of large id-like strings: only coerce when an
+      // integer value round-trips safely. Genuine fractional numbers are unaffected.
+      if (Number.isFinite(n) && !(Number.isInteger(n) && !Number.isSafeInteger(n))) {
+        return { value: n, changed: true };
+      }
     }
   }
 
   if (types.has("boolean")) {
-    if (trimmed === "true") return { value: true, changed: true };
-    if (trimmed === "false") return { value: false, changed: true };
+    if (value === "true") return { value: true, changed: true };
+    if (value === "false") return { value: false, changed: true };
   }
 
   return { value, changed: false };

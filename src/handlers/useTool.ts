@@ -1029,12 +1029,14 @@ export async function handleUseTool(
   }
 
   // R3 — per-tool top-level key-alias normalisation. Rewrites the agent's
-  // mistaken key into the canonical key the schema accepts (e.g. limit→count
-  // for Slack message tools, snake_case→camelCase for Microsoft Graph,
-  // body→properties.hs_note_body for HubSpot create_hubspot_note). Runs after
-  // R1/R2/R5 so we know the final package/tool id. Target-wins on collision.
-  // See super-mcp/src/config/paramAliasMap.ts for the map and direction
-  // rationale.
+  // mistaken key into the canonical key the schema accepts. Post-Stage-0 the
+  // alias map holds ONLY the irreducible entries the schema-driven auto-repair
+  // below cannot reproduce: true synonyms (limit→count for Slack search/history
+  // tools) and nested-target renames (body→properties.hs_note_body for HubSpot).
+  // Pure camelCase↔snake_case casing is now handled by canonicalKeyNormalize in
+  // the validate-before-send auto-repair seam (see below). Runs after R1/R2/R5 so
+  // we know the final package/tool id. Target-wins on collision. See
+  // super-mcp/src/config/paramAliasMap.ts for the (shrunk) map and rationale.
   {
     const { args: rewritten, breadcrumbs } = normalizeArgKeys(args, {
       handler: "use_tool",
