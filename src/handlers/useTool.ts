@@ -7,7 +7,16 @@ import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/t
 import { getLogger } from "../logging.js";
 import { getSecurityPolicy } from "../security.js";
 import { findBestMatch } from "../utils/fuzzyMatch.js";
-import { coerceStringifiedBoolean, coerceStringifiedNumber, normalizeArgKeys, formatKeyAliasBreadcrumb } from "../utils/normalizeInput.js";
+import {
+  coerceStringifiedBoolean,
+  coerceStringifiedNumber,
+  normalizeArgKeys,
+  formatKeyAliasBreadcrumb,
+  canonicalKeyNormalize,
+  coerceArgsToSchema,
+  formatAutoRepairBreadcrumb,
+  type AutoRepairBreadcrumb,
+} from "../utils/normalizeInput.js";
 import { materializeOutput, extractImageContentBlocks, SUPPORTED_IMAGE_MIME_TYPES } from "./materializeOutput.js";
 import { parseUseToolInput } from "./useToolInput.js";
 
@@ -1038,13 +1047,59 @@ export async function handleUseTool(
     }
   }
 
-  // Validate arguments unconditionally (before checking dry_run)
+  // Validate arguments unconditionally (before checking dry_run).
+  //
+  // Snapshot the args BEFORE validating: `validator.validate` strips unknown
+  // top-level keys IN PLACE (documented + tested contract — see validator.ts
+  // and test/validator.test.ts), so the pre-strip values must be captured first
+  // for the auto-repair pass below. We keep the snapshot approach rather than
+  // making the validator non-mutating because in-place stripping is a contract
+  // existing callers/tests rely on (MA0b).
   const validationAttemptKey = getValidationAttemptKey(package_id, tool_id);
   const downstreamValidationAttemptKey = `${validationAttemptKey}::downstream`;
+  const preValidationSnapshot =
+    args && typeof args === "object" && !Array.isArray(args)
+      ? (structuredClone(args) as Record<string, unknown>)
+      : null;
   const validationResult = validator.validate(schema, args, { package_id, tool_id });
-  const strippedArgs = validationResult.strippedArgs;
+  let strippedArgs = validationResult.strippedArgs;
+  let isValid = validationResult.valid;
 
-  if (!validationResult.valid || strippedArgs.length > 0) {
+  // Stage 0 — deterministic, schema-driven validate-before-send auto-repair.
+  // Triggered ONLY when validation fails because of (a) camelCase↔snake_case
+  // key casing or (b) stringified scalars. We repair a snapshot, re-validate,
+  // and adopt the repaired args ONLY if they now pass cleanly
+  // (`valid && strippedArgs.length === 0`). Otherwise we fall through unchanged
+  // to the existing -33003 repair-ticket. See normalizeInput.ts (S6 spike).
+  if ((!isValid || strippedArgs.length > 0) && preValidationSnapshot) {
+    const repaired = structuredClone(preValidationSnapshot) as Record<string, unknown>;
+    const repairCrumbs: AutoRepairBreadcrumb[] = [];
+    const { breadcrumbs: keyCrumbs } = canonicalKeyNormalize(repaired, schema);
+    repairCrumbs.push(...keyCrumbs);
+    const { breadcrumbs: coerceCrumbs } = coerceArgsToSchema(repaired, schema);
+    repairCrumbs.push(...coerceCrumbs);
+
+    if (repairCrumbs.length > 0) {
+      const reValidation = validator.validate(schema, repaired, { package_id, tool_id });
+      if (reValidation.valid && reValidation.strippedArgs.length === 0) {
+        // Accept the repair: dispatch with the repaired args and record breadcrumbs.
+        args = repaired as typeof args;
+        isValid = true;
+        strippedArgs = [];
+        for (const crumb of repairCrumbs) {
+          normalisations.push(formatAutoRepairBreadcrumb(crumb));
+        }
+        logger.info("Auto-repaired tool args (schema-driven validate-before-send)", {
+          handler: "use_tool",
+          package_id,
+          tool_id,
+          repairs: repairCrumbs.map(formatAutoRepairBreadcrumb),
+        });
+      }
+    }
+  }
+
+  if (!isValid || strippedArgs.length > 0) {
     resetValidationAttempt(downstreamValidationAttemptKey);
     const attempt = incrementValidationAttempt(validationAttemptKey);
     const repairTicket = buildRepairTicket(schema, validationResult.errors, strippedArgs, attempt);

@@ -447,7 +447,11 @@ describe("use_tool repair tickets", () => {
     expect(repairTicket.unknown_fields).toContain("qurey");
   });
 
-  it("matches snake/camel variants via normalization", async () => {
+  it("Stage 0: snake/camel variant is now AUTO-REPAIRED (no repair ticket)", async () => {
+    // Previously this produced a repair ticket with a `did_you_mean` hint.
+    // The Stage 0 schema-driven auto-repair now renames the unambiguous
+    // camelCase key to its canonical snake_case schema property and the call
+    // succeeds, so no -33003 ticket is raised. See useTool.ts auto-repair seam.
     const schema = {
       type: "object",
       properties: { channel_id: { type: "string" } },
@@ -455,9 +459,23 @@ describe("use_tool repair tickets", () => {
       additionalProperties: false,
     };
 
-    const error = await runValidationFailure({ schema, args: { channelId: "123" } });
-    const repairTicket = expectRepairTicket(error);
-    expect(repairTicket.did_you_mean).toEqual({ channelId: "channel_id" });
+    const { registry, catalog, validator } = createUseToolDeps(schema);
+    const response = await handleUseTool(
+      {
+        package_id: nextId("pkg"),
+        tool_id: nextId("tool"),
+        args: { channelId: "123" },
+        dry_run: true,
+      },
+      registry as any,
+      catalog as any,
+      validator,
+    );
+
+    expect(response.isError).toBe(false);
+    const meta = (response as { _meta?: Record<string, unknown> })._meta;
+    const superMcp = meta?.superMcp as Record<string, unknown> | undefined;
+    expect(superMcp?.normalisations).toEqual(["auto_repair_key:channelId→channel_id"]);
   });
 
   it("matches close typos via Levenshtein fallback", async () => {

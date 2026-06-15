@@ -18,25 +18,19 @@ const ctx = (tool_id: string, package_id = "pkg") => ({
   tool_id,
 });
 
-describe("normalizeArgKeys — alias map directions", () => {
-  it("Slack search_slack_messages: limit → count", () => {
+// NOTE (Stage 0, 2026-06-16): after the alias-map split only the irreducible
+// synonym (Slack `limit→count`) and nested-target rename (HubSpot
+// `body/note_body→properties.hs_note_body`) entries remain. The Microsoft Graph
+// and Google Workspace camelCase↔snake_case entries were removed — those
+// re-casing repairs are now done by the schema-driven `canonicalKeyNormalize`
+// auto-repair (see test/autoRepair-normalize.test.ts + test/useTool-auto-repair.test.ts).
+describe("normalizeArgKeys — alias map directions (retained entries only)", () => {
+  it("Slack search_slack_messages: limit → count (true synonym, retained)", () => {
     const aliases = getAliasesForTool("Slack-test", "search_slack_messages");
     expect(aliases).toEqual([{ from: "limit", to: "count" }]);
   });
 
-  it("Microsoft calendar list: start_datetime/end_datetime/device_timezone → camelCase", () => {
-    const aliases = getAliasesForTool(
-      "Microsoft-foo",
-      "list_workspace_calendar_events"
-    );
-    expect(aliases).toEqual([
-      { from: "start_datetime", to: "startDateTime" },
-      { from: "end_datetime", to: "endDateTime" },
-      { from: "device_timezone", to: "deviceTimezone" },
-    ]);
-  });
-
-  it("HubSpot create_hubspot_note: body / note_body → properties.hs_note_body (nested)", () => {
+  it("HubSpot create_hubspot_note: body / note_body → properties.hs_note_body (nested rename, retained)", () => {
     const aliases = getAliasesForTool("HubSpot-x", "create_hubspot_note");
     expect(aliases).toEqual([
       { from: "body", to: "properties.hs_note_body" },
@@ -44,17 +38,17 @@ describe("normalizeArgKeys — alias map directions", () => {
     ]);
   });
 
-  it("Google Workspace create_workspace_draft: stale camelCase → snake_case", () => {
-    const aliases = getAliasesForTool(
-      "GoogleWorkspace-alexs-mindstone-com",
-      "create_workspace_draft"
-    );
-    expect(aliases).toEqual([
-      { from: "isHtml", to: "is_html" },
-      { from: "replyToMessageId", to: "reply_to_message_id" },
-      { from: "threadId", to: "thread_id" },
-      { from: "inReplyTo", to: "in_reply_to" },
-    ]);
+  it("Microsoft package family now has NO alias entries (casing → auto-repair)", () => {
+    expect(getAliasesForTool("Microsoft-foo", "list_workspace_calendar_events")).toEqual([]);
+  });
+
+  it("Google Workspace package family now has NO alias entries (casing → auto-repair)", () => {
+    expect(
+      getAliasesForTool("GoogleWorkspace-alexs-mindstone-com", "list_workspace_calendar_events"),
+    ).toEqual([]);
+    expect(
+      getAliasesForTool("GoogleWorkspace-alexs-mindstone-com", "create_workspace_draft"),
+    ).toEqual([]);
   });
 
   it("returns [] for a tool with no aliases", () => {
@@ -63,70 +57,6 @@ describe("normalizeArgKeys — alias map directions", () => {
 
   it("returns [] when a shared tool name belongs to a different package family", () => {
     expect(getAliasesForTool("Slack-test", "create_workspace_draft")).toEqual([]);
-  });
-
-  it("Google Workspace list_workspace_calendar_events: stale camelCase → snake_case (REBEL-13Y)", () => {
-    const aliases = getAliasesForTool(
-      "GoogleWorkspace-alexs-mindstone-com",
-      "list_workspace_calendar_events"
-    );
-    expect(aliases).toEqual([
-      { from: "calendarId", to: "calendar_id" },
-      { from: "maxResults", to: "max_results" },
-      { from: "timeMin", to: "time_min" },
-      { from: "timeMax", to: "time_max" },
-      { from: "returnJson", to: "return_json" },
-      { from: "deviceTimezone", to: "device_timezone" },
-    ]);
-  });
-
-  it("Microsoft list_workspace_calendar_events keeps the opposite direction (snake_case → camelCase)", () => {
-    // Same tool id, opposite canonical casing — the package-family scoping in
-    // getAliasesForTool is what keeps these two from clobbering each other.
-    const aliases = getAliasesForTool(
-      "Microsoft-foo",
-      "list_workspace_calendar_events"
-    );
-    expect(aliases).toEqual([
-      { from: "start_datetime", to: "startDateTime" },
-      { from: "end_datetime", to: "endDateTime" },
-      { from: "device_timezone", to: "deviceTimezone" },
-    ]);
-  });
-
-  it("Google Workspace manage_workspace_calendar_event: camelCase → snake_case (REBEL-13Y review F3)", () => {
-    const aliases = getAliasesForTool(
-      "GoogleWorkspace-alexs-mindstone-com",
-      "manage_workspace_calendar_event"
-    );
-    expect(aliases).toEqual([
-      { from: "eventId", to: "event_id" },
-      { from: "newTimes", to: "new_times" },
-      { from: "colorId", to: "color_id" },
-    ]);
-  });
-
-  it("Google Workspace delete_workspace_calendar_event: camelCase → snake_case (REBEL-13Y review F3)", () => {
-    const aliases = getAliasesForTool(
-      "GoogleWorkspace-alexs-mindstone-com",
-      "delete_workspace_calendar_event"
-    );
-    expect(aliases).toEqual([
-      { from: "eventId", to: "event_id" },
-      { from: "sendUpdates", to: "send_updates" },
-      { from: "deletionScope", to: "deletion_scope" },
-    ]);
-  });
-
-  it("Google Workspace respond_to_workspace_calendar_event: includes eventId → event_id (REBEL-13Y review F3)", () => {
-    const aliases = getAliasesForTool(
-      "GoogleWorkspace-alexs-mindstone-com",
-      "respond_to_workspace_calendar_event"
-    );
-    expect(aliases).toEqual([
-      { from: "eventId", to: "event_id" },
-      { from: "calendarId", to: "calendar_id" },
-    ]);
   });
 });
 
@@ -142,164 +72,22 @@ describe("normalizeArgKeys — top-level replacement semantics", () => {
     expect(formatKeyAliasBreadcrumb(breadcrumbs[0])).toBe("key_alias:limit→count");
   });
 
-  it("replaces multiple keys in one call", () => {
+  it("camelCase keys for removed Microsoft/Google entries now no-op (handled by auto-repair)", () => {
     const args = {
       start_datetime: "2026-05-17T00:00:00Z",
-      end_datetime: "2026-05-17T23:59:59Z",
       device_timezone: "America/New_York",
     };
     const { args: out, breadcrumbs } = normalizeArgKeys(
       args,
       ctx("list_workspace_calendar_events", "Microsoft365Calendar-work")
     );
+    // Alias entries removed → normalizeArgKeys leaves them for the schema-driven
+    // auto-repair pass; no key_alias breadcrumbs here.
     expect(out).toEqual({
-      startDateTime: "2026-05-17T00:00:00Z",
-      endDateTime: "2026-05-17T23:59:59Z",
-      deviceTimezone: "America/New_York",
+      start_datetime: "2026-05-17T00:00:00Z",
+      device_timezone: "America/New_York",
     });
-    expect(breadcrumbs).toHaveLength(3);
-    expect(breadcrumbs.every((b) => b.kind === "applied")).toBe(true);
-  });
-
-  it("rewrites Google Workspace draft camelCase keys before validation", () => {
-    const args = {
-      to: ["debug-recipient@example.com"],
-      subject: "REBEL-609 draft routing test",
-      body: "This is a draft routing test.",
-      isHtml: false,
-      threadId: "thread-123",
-      inReplyTo: "message-123",
-    };
-    const { args: out, breadcrumbs } = normalizeArgKeys(
-      args,
-      ctx("create_workspace_draft", "GoogleWorkspace-alexs-mindstone-com")
-    );
-    expect(out).toEqual({
-      to: ["debug-recipient@example.com"],
-      subject: "REBEL-609 draft routing test",
-      body: "This is a draft routing test.",
-      is_html: false,
-      thread_id: "thread-123",
-      in_reply_to: "message-123",
-    });
-    expect(breadcrumbs).toEqual([
-      { kind: "applied", from: "isHtml", to: "is_html" },
-      { kind: "applied", from: "threadId", to: "thread_id" },
-      { kind: "applied", from: "inReplyTo", to: "in_reply_to" },
-    ]);
-  });
-
-  it("rewrites Google Workspace calendar camelCase → snake_case (REBEL-13Y)", () => {
-    const args = {
-      email: "user@example.com",
-      timeMin: "2026-05-17T00:00:00Z",
-      timeMax: "2026-05-17T23:59:59Z",
-      maxResults: 25,
-      returnJson: true,
-      deviceTimezone: "Europe/London",
-      calendarId: "primary",
-    };
-    const { args: out, breadcrumbs } = normalizeArgKeys(
-      args,
-      ctx("list_workspace_calendar_events", "GoogleWorkspace-alexs-mindstone-com")
-    );
-    expect(out).toEqual({
-      email: "user@example.com",
-      calendar_id: "primary",
-      max_results: 25,
-      time_min: "2026-05-17T00:00:00Z",
-      time_max: "2026-05-17T23:59:59Z",
-      return_json: true,
-      device_timezone: "Europe/London",
-    });
-    // Order matches the alias-map declaration order.
-    expect(breadcrumbs).toEqual([
-      { kind: "applied", from: "calendarId", to: "calendar_id" },
-      { kind: "applied", from: "maxResults", to: "max_results" },
-      { kind: "applied", from: "timeMin", to: "time_min" },
-      { kind: "applied", from: "timeMax", to: "time_max" },
-      { kind: "applied", from: "returnJson", to: "return_json" },
-      { kind: "applied", from: "deviceTimezone", to: "device_timezone" },
-    ]);
-  });
-
-  it("does NOT rewrite Google Workspace calendar deviceTimezone for the Microsoft package family", () => {
-    // Package scoping means the same tool id (list_workspace_calendar_events)
-    // applies the *Microsoft* alias direction (snake → camel), so a stray
-    // camelCase deviceTimezone passes through unchanged for Microsoft.
-    const args = { deviceTimezone: "Europe/London" };
-    const { args: out, breadcrumbs } = normalizeArgKeys(
-      args,
-      ctx("list_workspace_calendar_events", "Microsoft365Calendar-work")
-    );
-    expect(out).toEqual({ deviceTimezone: "Europe/London" });
     expect(breadcrumbs).toEqual([]);
-  });
-
-  it("rewrites Google Workspace manage_workspace_calendar_event camelCase → snake_case (REBEL-13Y review F3)", () => {
-    const args = {
-      email: "user@example.com",
-      eventId: "abc123",
-      action: "update_time",
-      newTimes: [{ start: { dateTime: "2026-06-01T09:00:00Z" }, end: { dateTime: "2026-06-01T10:00:00Z" } }],
-      colorId: "7",
-    };
-    const { args: out, breadcrumbs } = normalizeArgKeys(
-      args,
-      ctx("manage_workspace_calendar_event", "GoogleWorkspace-alexs-mindstone-com")
-    );
-    expect(out).toEqual({
-      email: "user@example.com",
-      event_id: "abc123",
-      action: "update_time",
-      new_times: [{ start: { dateTime: "2026-06-01T09:00:00Z" }, end: { dateTime: "2026-06-01T10:00:00Z" } }],
-      color_id: "7",
-    });
-    expect(breadcrumbs).toEqual([
-      { kind: "applied", from: "eventId", to: "event_id" },
-      { kind: "applied", from: "newTimes", to: "new_times" },
-      { kind: "applied", from: "colorId", to: "color_id" },
-    ]);
-  });
-
-  it("rewrites Google Workspace delete_workspace_calendar_event camelCase → snake_case (REBEL-13Y review F3)", () => {
-    const args = {
-      email: "user@example.com",
-      eventId: "abc123",
-      sendUpdates: "all",
-      deletionScope: "this_and_following",
-    };
-    const { args: out, breadcrumbs } = normalizeArgKeys(
-      args,
-      ctx("delete_workspace_calendar_event", "GoogleWorkspace-alexs-mindstone-com")
-    );
-    expect(out).toEqual({
-      email: "user@example.com",
-      event_id: "abc123",
-      send_updates: "all",
-      deletion_scope: "this_and_following",
-    });
-    expect(breadcrumbs).toEqual([
-      { kind: "applied", from: "eventId", to: "event_id" },
-      { kind: "applied", from: "sendUpdates", to: "send_updates" },
-      { kind: "applied", from: "deletionScope", to: "deletion_scope" },
-    ]);
-  });
-
-  it("rewrites Google Workspace respond_to_workspace_calendar_event eventId → event_id (REBEL-13Y review F3)", () => {
-    const args = { email: "user@example.com", eventId: "abc123", action: "accept" };
-    const { args: out, breadcrumbs } = normalizeArgKeys(
-      args,
-      ctx("respond_to_workspace_calendar_event", "GoogleWorkspace-alexs-mindstone-com")
-    );
-    expect(out).toEqual({
-      email: "user@example.com",
-      event_id: "abc123",
-      action: "accept",
-    });
-    expect(breadcrumbs).toEqual([
-      { kind: "applied", from: "eventId", to: "event_id" },
-    ]);
   });
 
   it("is a no-op when the agent already used the canonical key", () => {
