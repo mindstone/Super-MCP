@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [2.6.0] - 2026-06-18
+
+### Added
+- **Schema-driven validate-before-send argument auto-repair in `use_tool`**. When a tool call fails validation, `use_tool` now repairs a snapshot of the args against the tool's own JSON schema, re-validates, and only dispatches the repaired call when it passes cleanly (otherwise it falls through to the usual validation-failure result, unchanged). Two conservative, schema-driven repairs: (1) **canonical key normalization** — renames a top-level key to a schema property when their case/separator-insensitive forms match *unambiguously* (exactly one candidate), catching camelCase↔snake_case drift without fuzzy matching; (2) **scalar type coercion** — coerces a stringified scalar (`"20"`→`20`, `"true"`→`true`) only when the property's declared type is exactly numeric/boolean and a string/enum/const is not also accepted, using a strict-integer grammar and a safe-integer guard against lossy id coercion. Every repair is logged and recorded in `_meta.superMcp.normalisations`. True synonyms and nested-target renames stay explicit in `paramAliasMap` — schema shape cannot infer those safely.
+
+### Changed
+- **`paramAliasMap` shrunk to the irreducible entries.** Pure casing/separator aliases are now handled generically by the schema-driven normalization above; only true synonyms (e.g. Slack `limit`→`count`) and nested-target renames (e.g. HubSpot `body`→`properties.hs_note_body`) remain as hand-maintained entries.
+
 ### Documentation
 - **`docs/TIMEOUT_CONFIGURATION.md` and `src/types.ts` JSDoc updated to reflect the 30-minute default**. The default tool execution timeout was raised from 300,000ms (5 minutes) to 1,800,000ms (30 minutes) in commit `035f2fb` (no version bump at the time) to align with Rebel Core's `TOOL_CALL_TIMEOUT`, but the documentation kept claiming 5 minutes. Source of truth lives in `src/clients/stdioClient.ts` and `src/clients/httpClient.ts` as the `'1800000'` env-var fallback.
 
