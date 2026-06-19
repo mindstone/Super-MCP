@@ -82,10 +82,12 @@ src/
 
 ## Security
 
+- This is a public, MIT-licensed repository — treat everything you add as public.
 - Never commit credentials or API keys
 - Use environment variables for sensitive data
 - Sanitize/redact tokens in logs
 - Use secure file permissions (0600) for token files
+- Keep private data out of source, docs, examples, fixtures, and commit messages — no PII (names, email addresses, conversation excerpts), no real customer / design-partner / prospect company names, and no internal hostnames, endpoint URLs, or ticket references. Illustrative content must use fictional placeholders (`Acme Corp`, `jane@example.com`) — never a real name.
 
 ## Testing
 
