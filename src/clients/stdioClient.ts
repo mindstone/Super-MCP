@@ -110,12 +110,40 @@ const killProcessTree = async (pid: number): Promise<void> => {
 // - https://github.com/jlowin/fastmcp/issues/1625
 const STDIO_CONCURRENCY = 1;
 
+// Bounded ring-buffer caps for captured child stderr. We keep the LAST N lines
+// AND a total byte cap (whichever bound is hit first), so a chatty or hostile
+// connector child cannot grow unbounded memory while we still retain the most
+// recent (most diagnostic) output for the connect-failure surface.
+const STDERR_MAX_LINES = 50;
+const STDERR_MAX_BYTES = 16 * 1024; // 16 KiB
+
 export class StdioMcpClient implements McpClient {
   private client: Client;
   private transport: StdioClientTransport;
   private packageId: string;
   private config: PackageConfig;
   private requestQueue: PQueue;
+
+  // --- Per-package connect diagnostics (B1) ---
+  // Bounded ring buffer of the connector child's most recent stderr lines.
+  private stderrRing: string[] = [];
+  // Pending (not-yet-newline-terminated) stderr fragment.
+  private stderrPartial = "";
+  // Running byte total across the ring + partial, to enforce STDERR_MAX_BYTES.
+  private stderrBytes = 0;
+  // Whether the child was OBSERVED to emit any stderr / start during THIS connect
+  // attempt. Distinguishes a fresh child that spawned then died (stderr likely
+  // present) from a reused/already-closed transport that fast-fails with no real
+  // spawn this call (no stderr — the ~81ms transport-reuse race case).
+  private spawnObservedThisCall = false;
+  // Spawn-level 'error' event message (e.g. ENOENT), if the SDK surfaced one via
+  // transport.onerror during this connect attempt.
+  private spawnErrorMessage: string | null = null;
+  // Whether the child process was observed to close during this connect attempt.
+  // NOTE: the installed @modelcontextprotocol/sdk (1.28.0) drops the child's exit
+  // CODE in its onclose handler (`(_code) => ...`), so the numeric exit code is
+  // NOT reachable through the public SDK API — we can only observe THAT it closed.
+  private childClosedThisCall = false;
 
   constructor(packageId: string, config: PackageConfig) {
     this.packageId = packageId;
@@ -143,6 +171,69 @@ export class StdioMcpClient implements McpClient {
       env: config.env,
       cwd: config.cwd,
     });
+  }
+
+  /**
+   * Reset all per-call connect diagnostics. Called at the start of each connect
+   * attempt and after a SUCCESSFUL connect (so a later failure on a re-connect
+   * reflects only that attempt's output, not stale data).
+   */
+  private resetConnectDiagnostics(): void {
+    this.stderrRing = [];
+    this.stderrPartial = "";
+    this.stderrBytes = 0;
+    this.spawnObservedThisCall = false;
+    this.spawnErrorMessage = null;
+    this.childClosedThisCall = false;
+  }
+
+  /**
+   * Append a chunk of child stderr into the bounded ring buffer. Splits on
+   * newlines, keeps at most STDERR_MAX_LINES lines, and trims from the front
+   * once the total retained bytes exceed STDERR_MAX_BYTES (whichever bound is
+   * hit first).
+   */
+  private appendStderr(chunk: Buffer | string): void {
+    const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+    if (text.length === 0) return;
+    this.spawnObservedThisCall = true;
+
+    const combined = this.stderrPartial + text;
+    const parts = combined.split("\n");
+    // The last element is the (possibly empty) not-yet-terminated partial line.
+    this.stderrPartial = parts.pop() ?? "";
+
+    for (const line of parts) {
+      this.stderrRing.push(line);
+      this.stderrBytes += Buffer.byteLength(line, "utf8") + 1; // + newline
+    }
+
+    // Enforce line cap (drop oldest first).
+    while (this.stderrRing.length > STDERR_MAX_LINES) {
+      const dropped = this.stderrRing.shift();
+      if (dropped !== undefined) {
+        this.stderrBytes -= Buffer.byteLength(dropped, "utf8") + 1;
+      }
+    }
+    // Enforce byte cap (drop oldest first), but always keep at least one line so
+    // a single huge line still yields something diagnostic.
+    while (this.stderrBytes > STDERR_MAX_BYTES && this.stderrRing.length > 1) {
+      const dropped = this.stderrRing.shift();
+      if (dropped !== undefined) {
+        this.stderrBytes -= Buffer.byteLength(dropped, "utf8") + 1;
+      }
+    }
+  }
+
+  /**
+   * Return the captured stderr tail (most recent lines + any trailing partial
+   * line) from the most recent connect attempt, or null if nothing was captured.
+   */
+  getStderrTail(): string | null {
+    const lines = [...this.stderrRing];
+    if (this.stderrPartial.length > 0) lines.push(this.stderrPartial);
+    if (lines.length === 0) return null;
+    return lines.join("\n");
   }
 
   async connect(): Promise<void> {
@@ -205,31 +296,80 @@ export class StdioMcpClient implements McpClient {
       (process as any).type = 'utility';
     }
 
+    // Reset per-call diagnostics so a failure reflects only THIS attempt.
+    this.resetConnectDiagnostics();
+
     try {
-      // Create the transport
-      // Let the SDK handle environment variable merging with safe defaults
+      // Create the transport.
+      // `stderr: 'pipe'` makes the SDK expose `transport.stderr` as a readable
+      // PassThrough IMMEDIATELY (before start()), so we can attach a listener
+      // before client.connect() and not lose early child error output (B1).
+      // Let the SDK handle environment variable merging with safe defaults.
       this.transport = new StdioClientTransport({
         command: this.config.command || "echo",
         args: this.config.args || [],
         env: mergedEnv,
         cwd: this.config.cwd,
+        stderr: "pipe",
       });
+
+      // Attach the stderr listener BEFORE connecting so we capture any output
+      // emitted during the spawn/handshake window.
+      const stderrStream = this.transport.stderr;
+      if (stderrStream) {
+        stderrStream.on("data", (chunk: Buffer | string) => {
+          this.appendStderr(chunk);
+        });
+      }
+
+      // Capture spawn-level errors (e.g. ENOENT) and child close, which the
+      // raw thrown error often doesn't carry cleanly. The SDK invokes onerror
+      // for spawn failures and onclose when the child exits; note the SDK drops
+      // the exit code, so we can record THAT it closed but not the code.
+      this.transport.onerror = (err: Error) => {
+        this.spawnObservedThisCall = true;
+        this.spawnErrorMessage = err instanceof Error ? err.message : String(err);
+      };
+      this.transport.onclose = () => {
+        this.childClosedThisCall = true;
+      };
 
       // Connect the client to the transport
       await this.client.connect(this.transport);
+
+      // Successful connect: a real child spawned and handshook. Clear the
+      // captured diagnostics so they can't leak into a later failure.
+      this.resetConnectDiagnostics();
 
       logger.info("Successfully connected to stdio MCP", {
         package_id: this.packageId,
       });
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
+
+      // Per-call diagnostics (B1): give the next investigator enough to tell a
+      // fresh-child death (stderr present, spawn observed) from a reused/closed
+      // transport that fast-failed without a real spawn this call (no stderr).
+      const stderrTail = this.getStderrTail();
+      const childExitObserved = this.childClosedThisCall;
+      const spawnObserved = this.spawnObservedThisCall;
+      const spawnErrorMessage = this.spawnErrorMessage;
+
       logger.error("Failed to connect to stdio MCP", {
         package_id: this.packageId,
         command: this.config.command,
         args: this.config.args,
         error: errorMessage,
+        // B1 diagnostics:
+        stderr_tail: stderrTail,
+        spawn_observed_this_call: spawnObserved,
+        spawn_error: spawnErrorMessage,
+        child_close_observed: childExitObserved,
+        // Exit CODE is not reachable via the installed SDK (it drops _code in
+        // onclose); we surface only whether the child was observed to close.
+        child_exit_code: null,
       });
-      
+
       // Provide detailed diagnostic information
       let diagnosticMessage = `Failed to connect to MCP server '${this.packageId}'.\n`;
       
@@ -270,10 +410,38 @@ export class StdioMcpClient implements McpClient {
         }
       }
       
+      // Surface the per-call diagnostics to the Rebel boundary (which shows the
+      // connect-failure error to users/logs) — not just inside super-mcp's log.
+      // The "spawn-observed-this-call" marker is the key disambiguator for the
+      // -32000 transport-reuse race: no spawn observed + no stderr + fast fail
+      // => the reused/already-closed-transport case, NOT a connector boot crash.
+      diagnosticMessage += `\n\n— Connect diagnostics —`;
+      diagnosticMessage += `\nChild spawn observed this attempt: ${spawnObserved ? "yes" : "no"}`;
+      diagnosticMessage += `\nChild close observed this attempt: ${childExitObserved ? "yes" : "no"}`;
+      if (spawnErrorMessage) {
+        diagnosticMessage += `\nSpawn error: ${spawnErrorMessage}`;
+      }
+      if (stderrTail) {
+        diagnosticMessage += `\nChild stderr (tail):\n${stderrTail}`;
+      } else {
+        diagnosticMessage += `\nChild stderr: (none captured)`;
+      }
+
       const enhancedError = new Error(diagnosticMessage);
       enhancedError.name = "MCPConnectionError";
       (enhancedError as any).originalError = error;
       (enhancedError as any).packageId = this.packageId;
+      // Structured diagnostics for any consumer that reads error.data rather
+      // than parsing the message string.
+      (enhancedError as any).data = {
+        packageId: this.packageId,
+        stderrTail,
+        spawnObservedThisCall: spawnObserved,
+        spawnError: spawnErrorMessage,
+        childCloseObserved: childExitObserved,
+        // Not reachable via the installed SDK — see field comment above.
+        childExitCode: null,
+      };
       throw enhancedError;
     } finally {
       if (needsWindowsHideFix) {
