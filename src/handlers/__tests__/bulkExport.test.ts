@@ -45,6 +45,10 @@ function createRegistry(callTool: ReturnType<typeof vi.fn>): PackageRegistry {
       catalogId: "test-catalog",
     }),
     getClient: vi.fn().mockResolvedValue({ callTool }),
+    // Stage 6: bulk_export now dispatches via `registry.callTool`; delegate to
+    // the inner mock client's `callTool` so existing `(toolId, args)`
+    // assertions hold. Mirrors the lease-guarded dispatch in production.
+    callTool: vi.fn((_pkg: string, toolId: string, args: unknown) => callTool(toolId, args)),
     notifyActivity: vi.fn(),
   } as unknown as PackageRegistry;
 }
@@ -136,6 +140,7 @@ describe("handleBulkExport", () => {
         catalogId: "test-catalog",
       }),
       getClient: vi.fn().mockResolvedValue(client),
+      callTool: vi.fn((_pkg: string, toolId: string, args: unknown) => callTool(toolId, args)),
       notifyActivity: vi.fn(),
     } as unknown as PackageRegistry;
     const catalog = new Catalog(registry);

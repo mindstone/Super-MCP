@@ -146,6 +146,11 @@ describe('PackageRegistry Stage 6 reaper-race fix', () => {
     expect(freshClient.callTool).toHaveBeenCalledTimes(1);
     expect(result).toEqual({ content: ['ok'] });
     // No -32000 surfaced.
+
+    // FIX 2: the re-establish observability counter incremented exactly once
+    // for this package and is surfaced via getChildStats().
+    const stats = registry.getChildStats().find((s) => s.package_id === 'stale-pkg');
+    expect(stats?.reestablish_count).toBe(1);
   });
 
   it('does NOT retry when the transport closes MID-call (-32000 propagates once)', async () => {

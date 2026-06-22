@@ -879,9 +879,16 @@ export async function handleBulkExport(
       pagination: parsedInput.pagination,
       executeTool: async (toolName, args) => {
         try {
-          const client = await registry.getClient(parsedInput.packageId);
+          // Stage 6 review FIX 1: route through `registry.callTool` so each
+          // (long-lived, paginated, multi-call) stdio dispatch is bracketed by
+          // the active-use lease and gets the atomic pre-send liveness
+          // re-establish — closing the idle-reaper -32000 race for bulk_export.
+          // Abort/cancellation parity is preserved by the existing external
+          // `Promise.race` against the abort signal below; `registry.callTool`
+          // takes no signal (the underlying `client.callTool` doesn't either),
+          // so no signal threading is needed.
           const toolResult = await Promise.race([
-            client.callTool(toolName, args),
+            registry.callTool(parsedInput.packageId, toolName, args),
             new Promise<never>((_resolve, reject) => {
               if (signal.aborted) {
                 reject(new Error(getAbortMessage(signal)));

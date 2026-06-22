@@ -115,6 +115,8 @@ export interface ChildStatsEntry {
   reap_count: number;
   /** Cumulative non-reap, non-user eviction closures (unhealthy-client replacements). */
   eviction_count: number;
+  /** Cumulative pre-send liveness re-establishes in `callTool` (closed-transport recovery). */
+  reestablish_count: number;
 }
 
 export class PackageRegistry {
@@ -142,6 +144,15 @@ export class PackageRegistry {
   private spawnCounts: Map<string, number> = new Map();
   private reapCounts: Map<string, number> = new Map();
   private evictionCounts: Map<string, number> = new Map();
+  // `reestablishCounts` — incremented exactly once per pre-send liveness
+  //   re-establish in `callTool` (the `isTransportClosed()` branch: a stdio
+  //   transport closed BEFORE any bytes were sent, so we delete + recreate the
+  //   client). Surfaced in `getChildStats()` so diagnostics can distinguish
+  //   healthy idle-reap recovery (occasional) from thrashing on a broken
+  //   connector (rapidly climbing). NOT a spawn-substitute: the re-establish's
+  //   downstream `getClient()` separately bumps `spawnCounts` when it actually
+  //   creates a fresh client.
+  private reestablishCounts: Map<string, number> = new Map();
 
   // ── Stage 6: per-package active-use lease (idle-reaper exclusion) ────
   // Counts in-flight `callTool` brackets per package. Acquired synchronously
@@ -946,6 +957,7 @@ export class PackageRegistry {
           package_id: packageId,
           tool_id: toolId,
         });
+        this.reestablishCounts.set(packageId, (this.reestablishCounts.get(packageId) ?? 0) + 1);
         this.clients.delete(packageId);
         client = await this.getClient(packageId);
       }
@@ -1293,6 +1305,7 @@ export class PackageRegistry {
         spawn_count: this.spawnCounts.get(pkg.id) ?? 0,
         reap_count: this.reapCounts.get(pkg.id) ?? 0,
         eviction_count: this.evictionCounts.get(pkg.id) ?? 0,
+        reestablish_count: this.reestablishCounts.get(pkg.id) ?? 0,
       };
     });
   }
