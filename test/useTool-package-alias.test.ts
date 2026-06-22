@@ -38,6 +38,9 @@ function createMocks(opts: { packages: PackageConfig[] }) {
       return opts.packages.filter(p => p.id.toLowerCase().startsWith(prefix));
     }),
     getClient: vi.fn().mockResolvedValue(mockClient),
+    // Stage 6: useTool now dispatches via registry.callTool (lease + liveness gate);
+    // delegate to the same mocked client so existing callTool assertions hold.
+    callTool: async (_pkg: string, toolId: string, toolArgs: unknown) => mockClient.callTool(toolId, toolArgs),
     notifyActivity: vi.fn(),
   } as unknown as PackageRegistry;
 

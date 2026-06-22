@@ -32,6 +32,9 @@ describe("Materialization Integration (I1-I4)", () => {
     const mockRegistry = {
       getPackage: vi.fn().mockReturnValue({ id: "pkg1" }),
       getClient: vi.fn().mockResolvedValue(mockClient),
+      // Stage 6: useTool now dispatches via registry.callTool (lease + liveness gate);
+      // delegate to the same mocked client so existing callTool assertions hold.
+      callTool: async (_pkg: string, toolId: string, toolArgs: unknown) => mockClient.callTool(toolId, toolArgs),
       notifyActivity: vi.fn(),
     } as unknown as PackageRegistry;
 

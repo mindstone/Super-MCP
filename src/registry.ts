@@ -143,6 +143,15 @@ export class PackageRegistry {
   private reapCounts: Map<string, number> = new Map();
   private evictionCounts: Map<string, number> = new Map();
 
+  // ── Stage 6: per-package active-use lease (idle-reaper exclusion) ────
+  // Counts in-flight `callTool` brackets per package. Acquired synchronously
+  // BEFORE the first `await` in `callTool` and released in its `finally`, so a
+  // client that is actively being used can never be reaped mid-flight by
+  // `sweepIdleClients` — closing the TOCTOU window that previously rejected an
+  // in-flight request with `McpError(ConnectionClosed)` = -32000.
+  // Invariant: leased (count > 0) ⇒ not reaped.
+  private activeLeases: Map<string, number> = new Map();
+
   constructor(config: SuperMcpConfig) {
     this.config = config;
     this.packages = this.normalizeConfig(config);
@@ -886,6 +895,68 @@ export class PackageRegistry {
   }
   
   /**
+   * Stage 6: acquire an active-use lease on a package. MUST be called
+   * synchronously (before any `await`) to close the reaper race. Idempotent
+   * re-entry is supported via the counter (nested/concurrent calls each hold
+   * their own ref).
+   */
+  private acquireLease(packageId: string): void {
+    this.activeLeases.set(packageId, (this.activeLeases.get(packageId) ?? 0) + 1);
+  }
+
+  /**
+   * Stage 6: release an active-use lease. Deletes the entry once the count
+   * drops to zero so a never-leased package stays absent from the map.
+   */
+  private releaseLease(packageId: string): void {
+    const next = (this.activeLeases.get(packageId) ?? 0) - 1;
+    if (next <= 0) {
+      this.activeLeases.delete(packageId);
+    } else {
+      this.activeLeases.set(packageId, next);
+    }
+  }
+
+  /**
+   * Stage 6: liveness-gated tool dispatch.
+   *
+   * Brackets `getClient` + `callTool` under an active-use lease so the idle
+   * reaper cannot close the client mid-flight (Part A). Between the health
+   * probe in `getClient` and the actual dispatch we re-check transport
+   * liveness (Part B): if a stdio transport has closed BEFORE any bytes were
+   * sent for this call (`isTransportClosed()` true), we delete + re-establish
+   * a fresh client — safe, because no request reached the wire.
+   *
+   * CRITICAL safety invariant: a transport that closes MID-call (bytes already
+   * sent, side effect possibly applied) is NEVER auto-retried. The re-establish
+   * happens ONLY when `isTransportClosed()` is true before `client.callTool` is
+   * invoked; the actual `client.callTool` call has no retry around it, so an
+   * in-flight close propagates -32000 to the caller unchanged.
+   */
+  async callTool(packageId: string, toolId: string, args: any): Promise<any> {
+    this.acquireLease(packageId);
+    try {
+      let client = await this.getClient(packageId);
+      // Pre-send liveness re-check: the lease blocks the reaper, but the client
+      // could already have a dead transport (e.g. closed between a prior reap
+      // sweep and this call, or never spawned). Re-establishing here is safe
+      // because no bytes have gone out for THIS call yet.
+      if (client instanceof StdioMcpClient && client.isTransportClosed()) {
+        logger.debug("Stdio transport closed before send; re-establishing", {
+          package_id: packageId,
+          tool_id: toolId,
+        });
+        this.clients.delete(packageId);
+        client = await this.getClient(packageId);
+      }
+      // No retry wraps this call: a mid-call close propagates -32000 as-is.
+      return await client.callTool(toolId, args);
+    } finally {
+      this.releaseLease(packageId);
+    }
+  }
+
+  /**
    * Notify that a package was actively used (e.g., after a tool call).
    * Resets the idle timer for the given package.
    */
@@ -963,6 +1034,15 @@ export class PackageRegistry {
       // Skip if the client has in-flight or queued requests
       if (client.hasPendingRequests?.()) {
         logger.debug("Skipping reap: pending requests", { package_id: packageId });
+        continue;
+      }
+
+      // Stage 6: skip if an active-use lease is held — a client mid-`callTool`
+      // must never be reaped (closing it would reject the in-flight request
+      // with -32000). The lease is the lock that `hasPendingRequests` (a racy
+      // TOCTOU snapshot) is not.
+      if ((this.activeLeases.get(packageId) ?? 0) > 0) {
+        logger.debug("Skipping reap: active lease", { package_id: packageId });
         continue;
       }
 

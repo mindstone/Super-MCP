@@ -27,6 +27,9 @@ function createUseToolDeps(
     getClient: async () => ({
       callTool: async (toolId: string, args: any) => callTool(toolId, args),
     }),
+    // Stage 6: useTool dispatches via registry.callTool (lease + liveness gate);
+    // delegate to the same closure so existing callTool assertions hold.
+    callTool: async (_pkg: string, toolId: string, args: any) => callTool(toolId, args),
     notifyActivity: () => {},
   };
 

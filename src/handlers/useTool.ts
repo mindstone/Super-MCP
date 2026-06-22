@@ -1157,8 +1157,11 @@ export async function handleUseTool(
 
   const startTime = Date.now();
   try {
-    const client = await registry.getClient(package_id);
-    let toolResult = await client.callTool(tool_id, args);
+    // Stage 6: route through the liveness-gated `registry.callTool` so the idle
+    // reaper cannot close the client mid-flight and a transport that closed
+    // before any bytes were sent is re-established (no auto-retry on mid-call
+    // close). Replaces the separate `getClient` + `client.callTool` seam.
+    let toolResult = await registry.callTool(package_id, tool_id, args);
     const downstreamIsError = isRecord(toolResult) && toolResult.isError === true;
     // Capture spec-passthrough fields off the inner tool_result BEFORE any
     // truncation/safety-net/materialisation rewrites. See

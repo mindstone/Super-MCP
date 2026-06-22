@@ -621,4 +621,18 @@ export class StdioMcpClient implements McpClient {
   hasPendingRequests(): boolean {
     return this.requestQueue.pending > 0 || this.requestQueue.size > 0;
   }
+
+  /**
+   * Stage 6: report whether the underlying child process is gone.
+   *
+   * The SDK's `StdioClientTransport` exposes `pid`, which is `null` before the
+   * child is spawned and after it exits/closes. We use it as the liveness
+   * signal for the pre-send re-establish in `PackageRegistry.callTool`: a
+   * closed transport (`pid == null`) means no live child, so a fresh client
+   * must be created before dispatching. Same field the SDK uses in `close()`
+   * (see `this.transport.pid` above) and in registry `getChildStats()`.
+   */
+  isTransportClosed(): boolean {
+    return this.transport.pid == null;
+  }
 }
