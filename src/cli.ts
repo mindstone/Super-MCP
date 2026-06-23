@@ -150,7 +150,7 @@ async function main() {
   if (args[0] === 'add') {
     return handleAddCommand();
   }
-  
+
   const configPaths = await getConfigPaths();
   const logLevel = getArg("log-level", "info");
   const transportArg = getArg("transport", "stdio");
@@ -160,7 +160,26 @@ async function main() {
   // Initialize logger
   initLogger(logLevel as any);
 
-  await startServer({ configPaths, logLevel, transport, port });
+  // Owner-liveness watchdog flags — emitted by Rebel when spawning super-mcp.
+  // All three must be present and valid for the watchdog to activate; standalone
+  // super-mcp invocations (no flags) are completely unaffected.
+  const ownerPidRaw = getArg("rebel-owner-pid");
+  const ownerStartRaw = getArg("rebel-owner-start");
+  const ownerIdRaw = getArg("rebel-owner-id");
+
+  const ownerPid = ownerPidRaw ? parseInt(ownerPidRaw, 10) : NaN;
+  const ownerStartMs = ownerStartRaw ? parseInt(ownerStartRaw, 10) : NaN;
+  const ownerId = ownerIdRaw;
+
+  // Activation gate: all three flags present and numerically valid.
+  const ownerInfo =
+    Number.isFinite(ownerPid) && ownerPid > 0 &&
+    Number.isFinite(ownerStartMs) && ownerStartMs > 0 &&
+    ownerId
+      ? { ownerPid, ownerStartMs, ownerId }
+      : undefined;
+
+  await startServer({ configPaths, logLevel, transport, port, ownerInfo });
 }
 
 // Run main

@@ -29,6 +29,7 @@ import {
   extractRawToolId,
 } from "./handlers/index.js";
 import { formatError } from "./utils/formatError.js";
+import { startWatchdog, type WatchdogHandle } from "./ownerWatchdog.js";
 
 const logger = getLogger();
 
@@ -298,8 +299,10 @@ export async function startServer(options: {
   logLevel?: string;
   transport?: "stdio" | "http";
   port?: number;
+  /** Owner-liveness watchdog info.  Present only when spawned by Rebel with owner flags. */
+  ownerInfo?: { ownerPid: number; ownerStartMs: number; ownerId: string };
 }): Promise<void> {
-  const { configPath, configPaths, logLevel = "info", transport = "stdio", port = 3000 } = options;
+  const { configPath, configPaths, logLevel = "info", transport = "stdio", port = 3000, ownerInfo } = options;
   
   const paths = configPaths || (configPath ? [configPath] : ["super-mcp-config.json"]);
 
@@ -931,16 +934,15 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       app.get("/mcp", mcpHandler);
       app.delete("/mcp", mcpHandler);
 
-      const httpServer = app.listen(port, '127.0.0.1', () => {
-        logger.info("Super MCP Router started successfully", {
-          transport: "http",
-          port,
-          endpoint: `http://localhost:${port}/mcp`,
-        });
-      });
+      // watchdog is started after the listener is up (below).
+      let watchdogHandle: WatchdogHandle | null = null;
 
-      const shutdown = async () => {
-        logger.info("Shutting down HTTP server...");
+      const shutdown = async (reason?: string) => {
+        // Stop the owner-liveness watchdog before tearing down so it doesn't
+        // re-trigger shutdown while we're already shutting down.
+        watchdogHandle?.stop();
+
+        logger.info("Shutting down HTTP server...", { reason });
         clearInterval(gcInterval);
         await configWatcher.stop();
         httpServer.close(() => {
@@ -955,8 +957,28 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
         process.exit(0);
       };
 
-      process.on("SIGINT", shutdown);
-      process.on("SIGTERM", shutdown);
+      process.on("SIGINT", () => shutdown());
+      process.on("SIGTERM", () => shutdown());
+
+      const httpServer = app.listen(port, '127.0.0.1', () => {
+        logger.info("Super MCP Router started successfully", {
+          transport: "http",
+          port,
+          endpoint: `http://localhost:${port}/mcp`,
+        });
+
+        // Start the owner-liveness watchdog AFTER the listener is up.
+        // Only activates when the three --rebel-owner-* flags were passed
+        // (ownerInfo present); standalone super-mcp invocations are unaffected.
+        if (ownerInfo) {
+          watchdogHandle = startWatchdog({
+            ownerPid: ownerInfo.ownerPid,
+            ownerStartMs: ownerInfo.ownerStartMs,
+            ownerId: ownerInfo.ownerId,
+            onOwnerDead: () => shutdown("owner_dead"),
+          });
+        }
+      });
     } else {
       const server = createMcpServer();
       const stdioTransport = new StdioServerTransport();
@@ -966,15 +988,28 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
         transport: "stdio",
       });
 
-      const shutdown = async () => {
-        logger.info("Shutting down...");
+      let watchdogHandle: WatchdogHandle | null = null;
+
+      const shutdown = async (reason?: string) => {
+        watchdogHandle?.stop();
+        logger.info("Shutting down...", { reason });
         await configWatcher.stop();
         await registry.closeAll();
         process.exit(0);
       };
 
-      process.on("SIGINT", shutdown);
-      process.on("SIGTERM", shutdown);
+      process.on("SIGINT", () => shutdown());
+      process.on("SIGTERM", () => shutdown());
+
+      // Start owner-liveness watchdog for stdio transport too.
+      if (ownerInfo) {
+        watchdogHandle = startWatchdog({
+          ownerPid: ownerInfo.ownerPid,
+          ownerStartMs: ownerInfo.ownerStartMs,
+          ownerId: ownerInfo.ownerId,
+          onOwnerDead: () => shutdown("owner_dead"),
+        });
+      }
     }
     
   } catch (error) {
