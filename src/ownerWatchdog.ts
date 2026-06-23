@@ -265,12 +265,17 @@ export async function probeProcessStartTimeMs(pid: number): Promise<number | nul
  * macOS: use `ps -o lstart= -p <pid>` which prints the human-readable start
  * date/time of the process (empty output = no such PID).
  *
+ * Locale is pinned to C (LC_ALL/LANG/LC_TIME) so that Date.parse succeeds
+ * regardless of the user's locale — matches the app's processStartTime.ts
+ * runCommand() env pin.
+ *
  * Example output: "Mon Jun 23 13:45:02 2026"
  */
 async function probeDarwin(pid: number): Promise<number | null> {
   try {
     const { stdout } = await execFileAsync("ps", ["-o", "lstart=", "-p", String(pid)], {
       timeout: 3_000,
+      env: { ...process.env, LC_ALL: "C", LANG: "C", LC_TIME: "C" },
     });
     const trimmed = stdout.trim();
     if (!trimmed) return null;
@@ -283,21 +288,48 @@ async function probeDarwin(pid: number): Promise<number | null> {
 
 /**
  * Linux: read /proc/<pid>/stat and extract the process start time (field 22,
- * clock ticks since boot), then combine with the boot time from /proc/stat.
+ * clock ticks since boot), then combine with the boot epoch from /proc/uptime.
  *
- * Falls back to `ps -o lstart= -p <pid>` if /proc is unavailable.
+ * Formula matches the app's processStartTime.ts exactly:
+ *   bootEpochMs = Date.now() - (uptimeSec * 1000)
+ *   startTimeMs = bootEpochMs + (startTicks * 1000) / clkTck
+ *
+ * Using /proc/uptime (not /proc/stat btime) is important because the two
+ * boot-epoch sources can diverge by 1-2 s on some kernels (btime is an integer
+ * second truncated at boot; uptime is a live float computed from the kernel
+ * monotonic clock), which would push the comparison outside the 2 s tolerance.
+ *
+ * CLK_TCK is resolved via `getconf CLK_TCK` (falls back to 100 only when
+ * getconf is unavailable — which is exceedingly rare on any modern Linux).
+ *
+ * Falls back to `ps -o lstart=` (with locale pin) if /proc is unavailable.
  */
 async function probeLinux(pid: number): Promise<number | null> {
   try {
-    // Try /proc/<pid>/stat first.
     const { readFile } = await import("node:fs/promises");
 
+    // --- resolve CLK_TCK via getconf (matches app's getLinuxClockTicksPerSecond) ---
+    let clkTck = 100; // safe default; overridden when getconf succeeds
+    try {
+      const { stdout: clkStdout } = await execFileAsync("getconf", ["CLK_TCK"], {
+        timeout: 2_000,
+        env: { ...process.env, LC_ALL: "C" },
+      });
+      const parsed = parseInt(clkStdout.trim(), 10);
+      if (Number.isInteger(parsed) && parsed > 0) {
+        clkTck = parsed;
+      }
+    } catch {
+      // getconf unavailable — use default 100 (correct on virtually all Linux systems).
+    }
+
+    // --- read starttime ticks from /proc/<pid>/stat ---
     let statContent: string;
     try {
       statContent = await readFile(`/proc/${pid}/stat`, "utf8");
     } catch {
-      // /proc not available — fall back to ps.
-      return await probeDarwin(pid); // ps -o lstart= works on most Linux distros too.
+      // /proc not available — fall back to ps (with locale pin).
+      return await probeDarwin(pid);
     }
 
     // Field 22 (0-indexed: field 21) is starttime in clock ticks since boot.
@@ -305,26 +337,29 @@ async function probeLinux(pid: number): Promise<number | null> {
     // closing paren to locate subsequent fields safely.
     const closeParen = statContent.lastIndexOf(")");
     if (closeParen === -1) return null;
-    const afterComm = statContent.slice(closeParen + 2); // skip ") "
-    const fields = afterComm.split(" ");
+    const afterComm = statContent.slice(closeParen + 1).trim();
+    const fields = afterComm.split(/\s+/);
     const starttimeTicks = parseInt(fields[19], 10); // field 22 = fields[19] after comm
-    if (!Number.isFinite(starttimeTicks)) return null;
+    if (!Number.isFinite(starttimeTicks) || starttimeTicks < 0) return null;
 
-    // Read boot time from /proc/stat.
-    let procStatContent: string;
+    // --- derive boot epoch from /proc/uptime (matches app's initializeLinuxClockInfo) ---
+    // We sample Date.now() and /proc/uptime as close together as possible to
+    // minimise jitter.  The app does the same at init time; on the same host
+    // both readings will agree within a few ms, well inside the 2 s tolerance.
+    let uptimeContent: string;
     try {
-      procStatContent = await readFile("/proc/stat", "utf8");
+      uptimeContent = await readFile("/proc/uptime", "utf8");
     } catch {
       return null;
     }
-    const btimeLine = procStatContent.split("\n").find((l) => l.startsWith("btime "));
-    if (!btimeLine) return null;
-    const bootTimeSec = parseInt(btimeLine.split(" ")[1], 10);
-    if (!Number.isFinite(bootTimeSec)) return null;
+    const uptimeSeconds = parseFloat(uptimeContent.trim().split(/\s+/)[0] ?? "");
+    if (!Number.isFinite(uptimeSeconds) || uptimeSeconds < 0) return null;
 
-    const clkTck = 100; // sysconf(_SC_CLK_TCK) — 100 on virtually all Linux systems
-    const startTimeSec = bootTimeSec + starttimeTicks / clkTck;
-    return Math.round(startTimeSec * 1_000);
+    const bootEpochMs = Date.now() - uptimeSeconds * 1_000;
+    const startTimeMs = bootEpochMs + (starttimeTicks * 1_000) / clkTck;
+    if (!Number.isFinite(startTimeMs)) return null;
+
+    return Math.round(startTimeMs);
   } catch {
     return null;
   }

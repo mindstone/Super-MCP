@@ -161,21 +161,38 @@ async function main() {
   initLogger(logLevel as any);
 
   // Owner-liveness watchdog flags — emitted by Rebel when spawning super-mcp.
-  // All three must be present and valid for the watchdog to activate; standalone
-  // super-mcp invocations (no flags) are completely unaffected.
+  // All three must be present and strictly valid for the watchdog to activate;
+  // standalone super-mcp invocations (no flags) are completely unaffected.
   const ownerPidRaw = getArg("rebel-owner-pid");
   const ownerStartRaw = getArg("rebel-owner-start");
   const ownerIdRaw = getArg("rebel-owner-id");
 
-  const ownerPid = ownerPidRaw ? parseInt(ownerPidRaw, 10) : NaN;
-  const ownerStartMs = ownerStartRaw ? parseInt(ownerStartRaw, 10) : NaN;
+  // Strict integer parse: reject "123abc", leading/trailing junk, and non-safe integers.
+  // parseInt("123abc") = 123; this guard requires String(n) === raw (whole-string match).
+  function parseStrictInt(raw: string | undefined): number {
+    if (!raw) return NaN;
+    const n = parseInt(raw, 10);
+    if (!Number.isSafeInteger(n)) return NaN;
+    if (String(n) !== raw.trim()) return NaN; // rejects partial-match like "123abc"
+    return n;
+  }
+
+  // UUID shape: 8-4-4-4-12 hex (matches crypto.randomUUID() output used by the app).
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  function isUuidShaped(s: string | undefined): s is string {
+    return typeof s === "string" && UUID_RE.test(s);
+  }
+
+  const ownerPid = parseStrictInt(ownerPidRaw);
+  const ownerStartMs = parseStrictInt(ownerStartRaw);
   const ownerId = ownerIdRaw;
 
-  // Activation gate: all three flags present and numerically valid.
+  // Activation gate: all three flags present and strictly valid.
+  // A partial or garbage flag set must NOT enable the watchdog.
   const ownerInfo =
     Number.isFinite(ownerPid) && ownerPid > 0 &&
     Number.isFinite(ownerStartMs) && ownerStartMs > 0 &&
-    ownerId
+    isUuidShaped(ownerId)
       ? { ownerPid, ownerStartMs, ownerId }
       : undefined;
 

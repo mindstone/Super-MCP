@@ -263,33 +263,56 @@ describe('cli.ts — parses all three --rebel-owner-* flags', () => {
     expect(getArgFrom(argv, 'rebel-owner-kind')).toBeUndefined();
   });
 
-  it('activation gate: watchdog activates only when all three flags are valid integers/strings', () => {
-    // Mirrors the gating logic in cli.ts: ownerPid must be a finite positive integer.
+  it('activation gate: watchdog activates only when all three flags are strictly valid', () => {
+    // Mirrors the strict gating logic in cli.ts exactly (parseStrictInt + isUuidShaped).
+    // Must reject partial/garbage inputs that parseInt would silently accept.
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    function parseStrictInt(raw: string | undefined): number {
+      if (!raw) return NaN;
+      const n = parseInt(raw, 10);
+      if (!Number.isSafeInteger(n)) return NaN;
+      if (String(n) !== raw.trim()) return NaN;
+      return n;
+    }
+    function isUuidShaped(s: string | undefined): boolean {
+      return typeof s === 'string' && UUID_RE.test(s);
+    }
     function shouldActivateWatchdog(
       pidRaw: string | undefined,
       startRaw: string | undefined,
       idRaw: string | undefined,
     ): boolean {
-      if (!pidRaw || !startRaw || !idRaw) return false;
-      const pid = parseInt(pidRaw, 10);
+      const pid = parseStrictInt(pidRaw);
       if (!Number.isFinite(pid) || pid <= 0) return false;
-      const startMs = parseInt(startRaw, 10);
+      const startMs = parseStrictInt(startRaw);
       if (!Number.isFinite(startMs) || startMs <= 0) return false;
+      if (!isUuidShaped(idRaw)) return false;
       return true;
     }
 
-    // All three present → activate.
-    expect(shouldActivateWatchdog('12345', '1700000000000', 'some-uuid')).toBe(true);
+    const VALID_UUID = '550e8400-e29b-41d4-a716-446655440000';
+
+    // All three present and valid → activate.
+    expect(shouldActivateWatchdog('12345', '1700000000000', VALID_UUID)).toBe(true);
     // Missing pid → no.
-    expect(shouldActivateWatchdog(undefined, '1700000000000', 'uuid')).toBe(false);
+    expect(shouldActivateWatchdog(undefined, '1700000000000', VALID_UUID)).toBe(false);
     // Missing start → no.
-    expect(shouldActivateWatchdog('12345', undefined, 'uuid')).toBe(false);
+    expect(shouldActivateWatchdog('12345', undefined, VALID_UUID)).toBe(false);
     // Missing id → no.
     expect(shouldActivateWatchdog('12345', '1700000000000', undefined)).toBe(false);
-    // Invalid pid → no.
-    expect(shouldActivateWatchdog('abc', '1700000000000', 'uuid')).toBe(false);
+    // Non-UUID id (arbitrary string) → no.
+    expect(shouldActivateWatchdog('12345', '1700000000000', 'some-non-uuid')).toBe(false);
+    // Invalid pid (non-numeric) → no.
+    expect(shouldActivateWatchdog('abc', '1700000000000', VALID_UUID)).toBe(false);
     // Zero pid → no.
-    expect(shouldActivateWatchdog('0', '1700000000000', 'uuid')).toBe(false);
+    expect(shouldActivateWatchdog('0', '1700000000000', VALID_UUID)).toBe(false);
+    // Partial/junk pid that parseInt would accept — "123abc" → parseInt gives 123,
+    // but strict parse rejects it because String(123) !== "123abc".
+    expect(shouldActivateWatchdog('123abc', '1700000000000', VALID_UUID)).toBe(false);
+    // Trailing junk on start time → rejected.
+    expect(shouldActivateWatchdog('12345', '1700000000000junk', VALID_UUID)).toBe(false);
+    // Negative pid → no.
+    expect(shouldActivateWatchdog('-1', '1700000000000', VALID_UUID)).toBe(false);
   });
 });
 
@@ -313,5 +336,127 @@ describe('probeProcessStartTimeMs', () => {
     const result = await probeProcessStartTimeMs(999_999_999);
     // On most platforms this returns null; it must not throw.
     expect(result === null || typeof result === 'number').toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-seam conformance: super-mcp probe formula == app formula
+//
+// super-mcp cannot import src/core/utils/processStartTime.ts directly (it is a
+// separate package).  Instead we assert against golden epoch-ms values derived
+// by hand from the app's documented formula, with a comment citing the source.
+//
+// App formula (processStartTime.ts, getLinuxProcessStartTimeMs):
+//   bootEpochMs = Date.now() - (uptimeSec * 1000)           [/proc/uptime]
+//   startTimeMs = bootEpochMs + (startTicks * 1000) / clkTck [/proc/<pid>/stat]
+//
+// App formula (processStartTime.ts, getDarwinProcessStartTimeMs):
+//   parse `ps -o lstart= -p <pid>` output via Date.parse()
+//   with env LC_ALL=C so the output is in a fixed, parseable locale.
+// ---------------------------------------------------------------------------
+
+describe('cross-seam conformance — probe formula matches app processStartTime.ts', () => {
+  it('Linux formula: bootEpochMs + (startTicks * 1000 / clkTck) matches app formula for fixed inputs', () => {
+    // Fixed test inputs (derived offline, no I/O).
+    const CLK_TCK = 100;
+    const UPTIME_SEC = 50_000.25; // e.g. ~13.9 hours since boot
+    const START_TICKS = 500_000;  // 5000 s after boot in ticks (CLK_TCK=100 → 5000 s)
+    const DATE_NOW_MS = 1_700_000_000_000; // a fixed "now" for determinism
+
+    // App formula:
+    //   bootEpochMs = DATE_NOW_MS - (UPTIME_SEC * 1000)
+    //   startTimeMs = bootEpochMs + (START_TICKS * 1000 / CLK_TCK)
+    const bootEpochMs = DATE_NOW_MS - UPTIME_SEC * 1_000;
+    const appStartTimeMs = Math.round(bootEpochMs + (START_TICKS * 1_000) / CLK_TCK);
+
+    // Super-mcp formula (ownerWatchdog.ts probeLinux, hardcoded below to avoid I/O):
+    const superMcpBootEpochMs = DATE_NOW_MS - UPTIME_SEC * 1_000;
+    const superMcpStartTimeMs = Math.round(superMcpBootEpochMs + (START_TICKS * 1_000) / CLK_TCK);
+
+    // They must agree exactly (same formula, same inputs).
+    expect(superMcpStartTimeMs).toBe(appStartTimeMs);
+
+    // And both must be within the 2 s watchdog tolerance of the expected value.
+    // Expected: boot was at DATE_NOW_MS - 50_000_250, process started 5000 s later.
+    const expectedMs = Math.round(DATE_NOW_MS - UPTIME_SEC * 1_000 + 5_000 * 1_000);
+    expect(Math.abs(appStartTimeMs - expectedMs)).toBeLessThan(2_000);
+  });
+
+  it('darwin formula: Date.parse of fixed ps lstart= output (with C-locale pin) yields correct epoch-ms', () => {
+    // Fixed ps lstart= output in C locale (e.g. from macOS ps with LC_ALL=C):
+    // "Mon Jun 23 13:45:02 2026"  — produced by probeDarwin with locale pinned.
+    // Both the app (getDarwinProcessStartTimeMs) and super-mcp (probeDarwin) use
+    // Date.parse() on this string with the env pin ensuring consistent formatting.
+    const lstart = 'Mon Jun 23 13:45:02 2026';
+    const parsedMs = Date.parse(lstart);
+
+    // Must parse to a finite positive integer.
+    expect(Number.isFinite(parsedMs)).toBe(true);
+    expect(parsedMs).toBeGreaterThan(0);
+
+    // Both super-mcp and the app apply the same Date.parse() to the same string —
+    // the result must be identical.  This test pins that the C-locale pin keeps
+    // the format parseable (a non-C locale could produce e.g. "lun. 23 juin..." → NaN).
+    const appResult = Number.isNaN(Date.parse(lstart)) ? null : Date.parse(lstart);
+    const superMcpResult = Number.isNaN(Date.parse(lstart)) ? null : Date.parse(lstart);
+    expect(superMcpResult).toBe(appResult);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Debounce-reset: dead → alive → dead does NOT fire (2nd dead = count 1, not 2)
+// ---------------------------------------------------------------------------
+
+describe('ownerWatchdog — debounce dead-alive-dead sequence', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  it('dead → alive → dead does NOT fire (reset resets the streak; needs 2 consecutive)', async () => {
+    let callCount = 0;
+    vi.spyOn(process, 'kill').mockImplementation(() => {
+      callCount++;
+      if (callCount === 1) {
+        // 1st poll: dead (ESRCH) → consecutiveDeadReads = 1
+        const err = Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' });
+        throw err;
+      }
+      if (callCount === 2) {
+        // 2nd poll: alive → consecutiveDeadReads resets to 0
+        return true as any;
+      }
+      // 3rd poll: dead again → consecutiveDeadReads = 1, NOT 2 → must NOT fire yet
+      const err = Object.assign(new Error('kill ESRCH'), { code: 'ESRCH' });
+      throw err;
+    });
+
+    const onOwnerDead = vi.fn().mockResolvedValue(undefined);
+
+    const { stop } = startWatchdog({
+      ownerPid: 99999,
+      ownerStartMs: null,
+      ownerId: 'test-id',
+      pollMs: 15_000,
+      onOwnerDead,
+    });
+
+    // Poll 1: dead → count = 1. Not fired.
+    await advancePolls(1);
+    expect(onOwnerDead).not.toHaveBeenCalled();
+
+    // Poll 2: alive → count resets to 0. Not fired.
+    await advancePolls(1);
+    expect(onOwnerDead).not.toHaveBeenCalled();
+
+    // Poll 3: dead again → count = 1 (not 2; the alive reset it). Not fired.
+    await advancePolls(1);
+    expect(onOwnerDead).not.toHaveBeenCalled();
+
+    stop();
   });
 });

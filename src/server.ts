@@ -937,7 +937,12 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       // watchdog is started after the listener is up (below).
       let watchdogHandle: WatchdogHandle | null = null;
 
+      // Re-entrancy guard: concurrent owner_dead + SIGTERM must not double-teardown.
+      let shutdownInProgress = false;
       const shutdown = async (reason?: string) => {
+        if (shutdownInProgress) return;
+        shutdownInProgress = true;
+
         // Stop the owner-liveness watchdog before tearing down so it doesn't
         // re-trigger shutdown while we're already shutting down.
         watchdogHandle?.stop();
@@ -990,7 +995,12 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
 
       let watchdogHandle: WatchdogHandle | null = null;
 
+      // Re-entrancy guard: concurrent owner_dead + SIGTERM must not double-teardown.
+      let shutdownInProgress = false;
       const shutdown = async (reason?: string) => {
+        if (shutdownInProgress) return;
+        shutdownInProgress = true;
+
         watchdogHandle?.stop();
         logger.info("Shutting down...", { reason });
         await configWatcher.stop();
