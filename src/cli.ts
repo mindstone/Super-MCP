@@ -69,10 +69,6 @@ const getArg = (name: string, d?: string) => {
   return i >= 0 ? args[i + 1] : d;
 };
 
-const hasFlag = (name: string) => {
-  return args.includes(`--${name}`);
-};
-
 // Simple CLI for adding MCPs
 async function handleAddCommand() {
   const serverType = args[1];
