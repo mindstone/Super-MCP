@@ -124,15 +124,24 @@ export function startWatchdog(options: WatchdogOptions): WatchdogHandle {
       reason: "owner_dead",
     });
 
+    let cleanupThrew = false;
     try {
       await onOwnerDead();
     } catch (err) {
-      // If the shutdown callback itself throws, still log and exit.
+      // Cleanup threw — log but don't let it prevent the exit below.
+      cleanupThrew = true;
       logger.error("onOwnerDead threw during owner-death teardown", {
         ownerPid,
         ownerId,
         error: String(err),
       });
+    } finally {
+      // Guarantee exit regardless of whether cleanup succeeded or threw.
+      // The timer is already stopped (handle.stop() above), so without this
+      // a throwing cleanup would leave the process stranded — exactly the
+      // orphan this watchdog is meant to prevent.
+      // Non-zero on the cleanup-threw path preserves the operational signal.
+      process.exit(cleanupThrew ? 1 : 0);
     }
   };
 
@@ -309,7 +318,10 @@ async function probeLinux(pid: number): Promise<number | null> {
     const { readFile } = await import("node:fs/promises");
 
     // --- resolve CLK_TCK via getconf (matches app's getLinuxClockTicksPerSecond) ---
-    let clkTck = 100; // safe default; overridden when getconf succeeds
+    // On getconf failure we return null (fail-safe: treat owner as alive) rather than
+    // assuming 100 — this matches src/core/utils/processStartTime.ts exactly, keeping
+    // the seam identical and preventing a spurious dead verdict on rare Linux systems.
+    let clkTck: number | null = null;
     try {
       const { stdout: clkStdout } = await execFileAsync("getconf", ["CLK_TCK"], {
         timeout: 2_000,
@@ -320,8 +332,9 @@ async function probeLinux(pid: number): Promise<number | null> {
         clkTck = parsed;
       }
     } catch {
-      // getconf unavailable — use default 100 (correct on virtually all Linux systems).
+      // getconf unavailable — return null (fail-safe: treat owner as alive, matches app).
     }
+    if (clkTck === null) return null;
 
     // --- read starttime ticks from /proc/<pid>/stat ---
     let statContent: string;

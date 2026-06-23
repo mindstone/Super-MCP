@@ -214,6 +214,69 @@ describe('ownerWatchdog — startWatchdog', () => {
     expect(onOwnerDead).not.toHaveBeenCalled();
   });
 
+  it('process.exit is called even when onOwnerDead cleanup throws (F2 guarantee)', async () => {
+    // Owner is dead (ESRCH on every poll).
+    vi.spyOn(process, 'kill').mockImplementation(() => {
+      const err = Object.assign(new Error('kill ESRCH 99999'), { code: 'ESRCH' });
+      throw err;
+    });
+
+    // Mock process.exit so it doesn't actually exit the test runner.
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+
+    // onOwnerDead throws during cleanup.
+    const onOwnerDead = vi.fn().mockRejectedValue(new Error('cleanup exploded'));
+
+    const { stop } = startWatchdog({
+      ownerPid: 99999,
+      ownerStartMs: null,
+      ownerId: 'test-id',
+      pollMs: 15_000,
+      onOwnerDead,
+    });
+
+    // Two consecutive dead reads to fire the watchdog.
+    await advancePolls(1);
+    await advancePolls(1);
+
+    // onOwnerDead was called (cleanup was attempted).
+    expect(onOwnerDead).toHaveBeenCalledTimes(1);
+
+    // process.exit MUST have been called despite the cleanup throw.
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    // Non-zero exit code when cleanup threw (preserves operational signal).
+    expect(exitSpy).toHaveBeenCalledWith(1);
+
+    stop();
+  });
+
+  it('process.exit(0) is called when onOwnerDead succeeds cleanly', async () => {
+    vi.spyOn(process, 'kill').mockImplementation(() => {
+      const err = Object.assign(new Error('kill ESRCH 99999'), { code: 'ESRCH' });
+      throw err;
+    });
+
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation((() => {}) as any);
+    const onOwnerDead = vi.fn().mockResolvedValue(undefined);
+
+    const { stop } = startWatchdog({
+      ownerPid: 99999,
+      ownerStartMs: null,
+      ownerId: 'test-id',
+      pollMs: 15_000,
+      onOwnerDead,
+    });
+
+    await advancePolls(1);
+    await advancePolls(1);
+
+    expect(onOwnerDead).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(0);
+
+    stop();
+  });
+
   it('timer is unref()d so it does not keep the process alive on its own', () => {
     vi.spyOn(process, 'kill').mockReturnValue(true as any);
     const onOwnerDead = vi.fn();
