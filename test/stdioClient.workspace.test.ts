@@ -67,7 +67,7 @@ function createConfig(env?: Record<string, string>): PackageConfig {
     name: 'Nano Banana',
     transport: 'stdio',
     command: 'npx',
-    args: ['-y', '@mindstone-engineering/mcp-server-nano-banana'],
+    args: ['-y', '@mindstone/mcp-server-nano-banana'],
     visibility: 'default',
     ...(env ? { env } : {}),
   };
