@@ -7,6 +7,7 @@
  * Uses fake timers so poll intervals advance synchronously.
  */
 
+import { readFileSync } from 'node:fs';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // Mocks must be declared before the dynamic import below (vitest hoists vi.mock calls).
@@ -429,5 +430,47 @@ describe('ownerWatchdog — debounce dead-alive-dead sequence', () => {
     expect(onOwnerDead).not.toHaveBeenCalled();
 
     stop();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Structural fitness guard — the watchdog must NEVER re-introduce a start-time
+// probe (REBEL-6ED).  This is the executable form of the design rule GPT and
+// Claude both endorsed: self-exit may only be coupled to a CONCLUSIVE liveness
+// signal (ESRCH), never to a duplicated cross-platform heuristic.
+//
+// The original 0.4.50 self-exit loop came from the watchdog independently
+// probing the owner PID's start time (shelling out to wmic / powershell /
+// ps / cat /proc) and comparing it against --rebel-owner-start.  The Windows
+// branch read LOCAL time, diverged from the app's UTC by the timezone offset,
+// blew the tolerance, and declared a live owner "dead" on every launch.
+//
+// Any future start-time probe necessarily shells out to read OS process
+// metadata, so we assert the watchdog SOURCE contains no child-process /
+// start-time-probe machinery (comments stripped, so the historical docblock
+// explanation does not trip it).  Owner start-time identity now has exactly
+// one implementation, app-side in src/core/utils/processStartTime.ts.
+// ---------------------------------------------------------------------------
+
+describe('ownerWatchdog — structural fitness (ESRCH-only, no start-time probe) [REBEL-6ED]', () => {
+  const source = readFileSync(new URL('../src/ownerWatchdog.ts', import.meta.url), 'utf8');
+  // Strip block + line comments so the historical Get-Date/UFormat explanation
+  // in the docblock does not count as live probe machinery.
+  const code = source
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/\/\/.*$/gm, '');
+
+  it('does not shell out or import child-process APIs (any start-time probe would)', () => {
+    expect(code).not.toMatch(/child_process|execFile|\bspawn\b|\bexec\s*\(/);
+  });
+
+  it('does not re-implement a start-time probe or tolerance comparison', () => {
+    expect(code).not.toMatch(/START_TIME_TOLERANCE/);
+    expect(code).not.toMatch(/UFormat|Get-Date|\bwmic\b|ToUniversalTime|\/proc\/|lstart/i);
+    expect(code).not.toMatch(/probeWindows|probeDarwin|probeLinux|probeProcessStartTime/);
+  });
+
+  it('determines liveness solely via process.kill(ownerPid, 0)', () => {
+    expect(code).toMatch(/process\.kill\([^,]+,\s*0\)/);
   });
 });
