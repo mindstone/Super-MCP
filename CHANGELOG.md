@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [2.7.1] - 2026-06-25
+
+### Fixed
+- **Owner-liveness watchdog no longer self-terminates super-mcp on Windows (REBEL-6ED).** The watchdog had duplicated the owner process-start-time probe to guard against PID reuse, but its Windows implementation (`Get-Date -UFormat %s`) returns **local-time** seconds on Windows PowerShell 5.1, not UTC epoch-seconds — so on any non-UTC machine it disagreed with the UTC value the spawning app passes via `--rebel-owner-start` by the machine's UTC offset (hours), far exceeding the 2 s reuse-guard tolerance. The watchdog read this as "PID reused → owner dead" and called `process.exit()` ~30 s after every launch, tearing down super-mcp and all MCP children. The fix is **structural**: the watchdog is now **ESRCH-only** — it treats `process.kill(pid, 0)` success as conclusively alive and only a missing process (ESRCH) as dead. The duplicate start-time probe (`probeProcessStartTimeMs` and its platform helpers) is **deleted**, leaving a single start-time implementation on the app side (`processStartTime.ts`, used by the cross-launch orphan reaper) so the seam-mismatch class cannot recur. Owner start-time is retained only for log correlation.
+
+## [2.7.0] - 2026-06-20
+
+### Added
+- **Owner-liveness self-watchdog.** super-mcp now self-exits when its spawning owner (the Rebel app) dies, so it doesn't accumulate as an orphan process. When spawned with `--rebel-owner-pid/--rebel-owner-start/--rebel-owner-id`, it polls owner liveness on a ~15 s interval and gracefully shuts down (closing downstream MCP children) once the owner is confirmed gone. Standalone invocations (no owner flags) are unaffected. (See 2.7.1 for the Windows start-time hardening.)
+
 ## [2.6.0] - 2026-06-18
 
 ### Added

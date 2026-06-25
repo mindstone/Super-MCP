@@ -21,7 +21,7 @@ vi.mock('../src/logging.js', () => ({
 
 // We test the module functions directly; dynamic import lets us re-require after
 // mocking (needed because vi.mock is hoisted but module cache persists).
-const { startWatchdog, probeProcessStartTimeMs } = await import('../src/ownerWatchdog.js');
+const { startWatchdog } = await import('../src/ownerWatchdog.js');
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -104,38 +104,35 @@ describe('ownerWatchdog — startWatchdog', () => {
     stop();
   });
 
-  it('fires when start-time mismatch indicates PID reuse (kill succeeds but wrong process)', async () => {
-    // kill(pid, 0) succeeds — pid is live.
+  // Pins REBEL-6ED: when kill(0) succeeds the watchdog MUST NOT fire, regardless
+  // of any (now-absent) start-time signal.  The watchdog is ESRCH-only by design.
+  // Previously a start-time mismatch (e.g. Windows local-time probe bug) could
+  // trigger self-exit; that class of bug is now structurally impossible because
+  // no non-ESRCH signal may ever re-couple to self-exit.
+  it('does NOT fire when kill(0) succeeds — ESRCH-only design pins REBEL-6ED', async () => {
+    // kill(pid, 0) succeeds on every poll — PID is occupied.
     vi.spyOn(process, 'kill').mockReturnValue(true as any);
-
-    // But the live process has a DIFFERENT start time (PID reused by unrelated proc).
-    const ownerStartMs = 1_700_000_000_000;
-    const impostorStartMs = 1_700_000_099_000; // ~99s later — different process
 
     const onOwnerDead = vi.fn().mockResolvedValue(undefined);
 
     const { stop } = startWatchdog({
       ownerPid: 1234,
-      ownerStartMs,
+      // ownerStartMs provided — the watchdog holds it for correlation but must
+      // NEVER use it to gate a verdict (probe deleted; assertion below proves it).
+      ownerStartMs: 1_700_000_000_000,
       ownerId: 'test-id',
       pollMs: 15_000,
       onOwnerDead,
-      // Inject a start-time prober that returns the impostor's start time.
-      _probeStartTimeMs: vi.fn().mockResolvedValue(impostorStartMs),
     });
 
-    // 1st read: mismatch → dead-count = 1.
-    await advancePolls(1);
+    // Advance many polls — kill(0) always succeeds, onOwnerDead must never fire.
+    await advancePolls(10);
     expect(onOwnerDead).not.toHaveBeenCalled();
-
-    // 2nd consecutive mismatch → fires.
-    await advancePolls(1);
-    expect(onOwnerDead).toHaveBeenCalledTimes(1);
 
     stop();
   });
 
-  it('does NOT fire when start-time probe returns null (fail-safe: treat alive)', async () => {
+  it('does NOT fire when ownerStartMs is set and kill(0) succeeds (correlation-only, no verdict)', async () => {
     // kill(pid, 0) succeeds — pid is live.
     vi.spyOn(process, 'kill').mockReturnValue(true as any);
 
@@ -147,8 +144,6 @@ describe('ownerWatchdog — startWatchdog', () => {
       ownerId: 'test-id',
       pollMs: 15_000,
       onOwnerDead,
-      // Probe unavailable — returns null (platform can't determine start time).
-      _probeStartTimeMs: vi.fn().mockResolvedValue(null),
     });
 
     await advancePolls(5);
@@ -376,93 +371,6 @@ describe('cli.ts — parses all three --rebel-owner-* flags', () => {
     expect(shouldActivateWatchdog('12345', '1700000000000junk', VALID_UUID)).toBe(false);
     // Negative pid → no.
     expect(shouldActivateWatchdog('-1', '1700000000000', VALID_UUID)).toBe(false);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// probeProcessStartTimeMs (the cross-platform start-time helper)
-// ---------------------------------------------------------------------------
-
-describe('probeProcessStartTimeMs', () => {
-  it('returns a positive number or null — never throws', async () => {
-    // Probe our own PID (guaranteed to exist).
-    const result = await probeProcessStartTimeMs(process.pid);
-    // It should either succeed (number) or gracefully return null.
-    if (result !== null) {
-      expect(typeof result).toBe('number');
-      expect(result).toBeGreaterThan(0);
-    }
-  });
-
-  it('returns null for a non-existent PID — never throws', async () => {
-    // PID 999999999 is practically guaranteed not to exist.
-    const result = await probeProcessStartTimeMs(999_999_999);
-    // On most platforms this returns null; it must not throw.
-    expect(result === null || typeof result === 'number').toBe(true);
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Cross-seam conformance: super-mcp probe formula == app formula
-//
-// super-mcp cannot import src/core/utils/processStartTime.ts directly (it is a
-// separate package).  Instead we assert against golden epoch-ms values derived
-// by hand from the app's documented formula, with a comment citing the source.
-//
-// App formula (processStartTime.ts, getLinuxProcessStartTimeMs):
-//   bootEpochMs = Date.now() - (uptimeSec * 1000)           [/proc/uptime]
-//   startTimeMs = bootEpochMs + (startTicks * 1000) / clkTck [/proc/<pid>/stat]
-//
-// App formula (processStartTime.ts, getDarwinProcessStartTimeMs):
-//   parse `ps -o lstart= -p <pid>` output via Date.parse()
-//   with env LC_ALL=C so the output is in a fixed, parseable locale.
-// ---------------------------------------------------------------------------
-
-describe('cross-seam conformance — probe formula matches app processStartTime.ts', () => {
-  it('Linux formula: bootEpochMs + (startTicks * 1000 / clkTck) matches app formula for fixed inputs', () => {
-    // Fixed test inputs (derived offline, no I/O).
-    const CLK_TCK = 100;
-    const UPTIME_SEC = 50_000.25; // e.g. ~13.9 hours since boot
-    const START_TICKS = 500_000;  // 5000 s after boot in ticks (CLK_TCK=100 → 5000 s)
-    const DATE_NOW_MS = 1_700_000_000_000; // a fixed "now" for determinism
-
-    // App formula:
-    //   bootEpochMs = DATE_NOW_MS - (UPTIME_SEC * 1000)
-    //   startTimeMs = bootEpochMs + (START_TICKS * 1000 / CLK_TCK)
-    const bootEpochMs = DATE_NOW_MS - UPTIME_SEC * 1_000;
-    const appStartTimeMs = Math.round(bootEpochMs + (START_TICKS * 1_000) / CLK_TCK);
-
-    // Super-mcp formula (ownerWatchdog.ts probeLinux, hardcoded below to avoid I/O):
-    const superMcpBootEpochMs = DATE_NOW_MS - UPTIME_SEC * 1_000;
-    const superMcpStartTimeMs = Math.round(superMcpBootEpochMs + (START_TICKS * 1_000) / CLK_TCK);
-
-    // They must agree exactly (same formula, same inputs).
-    expect(superMcpStartTimeMs).toBe(appStartTimeMs);
-
-    // And both must be within the 2 s watchdog tolerance of the expected value.
-    // Expected: boot was at DATE_NOW_MS - 50_000_250, process started 5000 s later.
-    const expectedMs = Math.round(DATE_NOW_MS - UPTIME_SEC * 1_000 + 5_000 * 1_000);
-    expect(Math.abs(appStartTimeMs - expectedMs)).toBeLessThan(2_000);
-  });
-
-  it('darwin formula: Date.parse of fixed ps lstart= output (with C-locale pin) yields correct epoch-ms', () => {
-    // Fixed ps lstart= output in C locale (e.g. from macOS ps with LC_ALL=C):
-    // "Mon Jun 23 13:45:02 2026"  — produced by probeDarwin with locale pinned.
-    // Both the app (getDarwinProcessStartTimeMs) and super-mcp (probeDarwin) use
-    // Date.parse() on this string with the env pin ensuring consistent formatting.
-    const lstart = 'Mon Jun 23 13:45:02 2026';
-    const parsedMs = Date.parse(lstart);
-
-    // Must parse to a finite positive integer.
-    expect(Number.isFinite(parsedMs)).toBe(true);
-    expect(parsedMs).toBeGreaterThan(0);
-
-    // Both super-mcp and the app apply the same Date.parse() to the same string —
-    // the result must be identical.  This test pins that the C-locale pin keeps
-    // the format parseable (a non-C locale could produce e.g. "lun. 23 juin..." → NaN).
-    const appResult = Number.isNaN(Date.parse(lstart)) ? null : Date.parse(lstart);
-    const superMcpResult = Number.isNaN(Date.parse(lstart)) ? null : Date.parse(lstart);
-    expect(superMcpResult).toBe(appResult);
   });
 });
 
