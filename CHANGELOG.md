@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [2.7.2] - 2026-07-01
+
+### Fixed
+- **OAuth refresh-token rotation race no longer wedges connectors (Notion / Linear "keeps needing re-authentication").** Providers that issue **single-use, rotating** refresh tokens (Notion rolled this out ~2026-06-04, Linear ~2026-06-22) broke super-mcp's silent hourly refresh: multiple concurrent super-mcp processes share one on-disk token file written **non-atomically with no cross-process lock**, and `tokens()` served a per-process in-memory cache — so two refreshes raced, one rotated the token, the other replayed the now-dead one → `invalid_grant` / "Grant not found". "Refresh-only mode" then refused to discard the dead grant, so the connector stayed wedged until a manual interactive re-auth. The fix makes token refresh a **single transactional chokepoint** in the SDK fetch wrapper, serialized by a **per-package cross-process lock** (`proper-lockfile`, mirroring the app's HubSpot credential-lock semantics) plus an in-process mutex: under the lock it re-reads disk (the source of truth), short-circuits when a peer already minted a still-valid access token (no network POST, no burned single-use token), otherwise refreshes with the freshest disk token and **persists atomically (temp+rename+fsync) under the lock before returning** to the SDK. `tokens()` now reads disk fresh; `saveTokens()` is atomic and guarded against stale-write downgrades (a bounded authoritative-echo set absorbs the SDK's unavoidable second save) and **fails closed** if persisting a freshly-rotated token fails. A genuinely revoked grant is now detected (after a bounded re-read to absorb a peer mid-rotation), cleared, and marked for reconnect with an observable error log — instead of silently wedging. General across all rotating-refresh OAuth connectors (no provider-specific branches).
+
 ## [2.7.1] - 2026-06-25
 
 ### Fixed

@@ -7,6 +7,7 @@ import { McpClient, PackageConfig, ReadResourceResult } from "../types.js";
 import { getLogger } from "../logging.js";
 import { SimpleOAuthProvider, RefreshOnlyOAuthProvider } from "../auth/providers/index.js";
 import type { OAuthErrorSummary, StaticOAuthCredentials } from "../auth/providers/simple.js";
+import { runRefreshTransaction } from "../auth/refreshTransaction.js";
 
 const logger = getLogger();
 
@@ -25,6 +26,7 @@ const logger = getLogger();
 function createResponseNormalizingFetch(
   baseFetch: typeof fetch,
   onOAuthError?: (error: OAuthErrorSummary) => void,
+  refreshProvider?: SimpleOAuthProvider,
 ): typeof fetch {
   // OAuth refresh / code-exchange failures (invalid_grant, invalid_client, …) hit the
   // authorization server's token endpoint. Scope error capture to that endpoint so a
@@ -77,8 +79,35 @@ function createResponseNormalizingFetch(
     }
   };
 
+  // Detect a refresh-token grant POST so the wrapper can run it as a
+  // package-scoped atomic transaction (the rotation-race fix). Only the refresh
+  // grant is intercepted; the authorization_code exchange and all other requests
+  // flow through unchanged.
+  const isRefreshGrantBody = (init?: RequestInit): boolean => {
+    const body = init?.body;
+    let params: URLSearchParams | undefined;
+    if (body instanceof URLSearchParams) {
+      params = body;
+    } else if (typeof body === "string") {
+      try {
+        params = new URLSearchParams(body);
+      } catch {
+        return false;
+      }
+    }
+    return params?.get("grant_type") === "refresh_token";
+  };
+
   return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
-    const response: unknown = await baseFetch(input, init);
+    // Token-endpoint refresh POSTs run through the transactional path: re-read
+    // disk under a per-package cross-process lock, short-circuit on a still-valid
+    // disk token, present the freshest refresh token, and recover/clear on
+    // invalid_grant. The transaction internally calls baseFetch, so the result
+    // still flows through the normalization + error-capture below.
+    const response: unknown =
+      refreshProvider && isOAuthTokenEndpoint(input) && isRefreshGrantBody(init)
+        ? await runRefreshTransaction({ provider: refreshProvider, baseFetch }, input, init)
+        : await baseFetch(input, init);
     let normalizedResponse: Response;
     if (
       response !== null &&
@@ -440,9 +469,13 @@ export class HttpMcpClient implements McpClient {
     //   "[object Response]" is not valid JSON
     // This wrapper re-creates the Response using globalThis.Response when a mismatch
     // is detected, ensuring the SDK can properly read the response body.
-    options.fetch = createResponseNormalizingFetch(fetch, (error) => {
-      this.simpleOAuthProvider?.setLastOAuthError(error);
-    });
+    options.fetch = createResponseNormalizingFetch(
+      fetch,
+      (error) => {
+        this.simpleOAuthProvider?.setLastOAuthError(error);
+      },
+      this.simpleOAuthProvider,
+    );
 
     return options;
   }

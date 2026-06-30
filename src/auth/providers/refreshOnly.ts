@@ -62,12 +62,11 @@ export class RefreshOnlyOAuthProvider implements OAuthClientProvider {
   
   async invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier') {
     if (scope === 'tokens') {
-      const oauthError = this.delegate.consumeLastOAuthError();
-      logger.warn("Ignoring token invalidation request in refresh-only mode", {
-        message: "Background connection attempts must not delete persisted OAuth tokens. Use authenticate() to replace expired credentials.",
-        ...(oauthError ? oauthError : {}),
-      });
-      return;
+      // Disk-compare aware (replaces the old unconditional swallow): a genuinely
+      // dead grant (already flagged by the transactional fetch wrapper) clears so
+      // the connector un-wedges, while a peer's freshly-rotated on-disk token is
+      // preserved. See SimpleOAuthProvider.invalidateTokensRefreshOnly().
+      return this.delegate.invalidateTokensRefreshOnly();
     }
 
     return this.delegate.invalidateCredentials(scope);

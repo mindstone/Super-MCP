@@ -342,6 +342,14 @@ describe('HttpMcpClient cross-realm Response handling', () => {
   it('surfaces the captured token-endpoint error through the shared provider on refresh-only token invalidation (end-to-end wiring)', async () => {
     const provider = new SimpleOAuthProvider('test-oauth-error-wiring', 5203);
     await provider.initialize();
+    // Seed on-disk tokens so the (post-fix) disk-compare refresh-only invalidation
+    // takes the "preserve" path — which is the one that surfaces the captured
+    // OAuth error fields (an absent token file is treated as already-cleared).
+    await provider.saveTokens({
+      access_token: 'wiring-access',
+      refresh_token: 'wiring-refresh',
+      expires_in: 3600,
+    });
 
     const config = oauthHttpPackage('test-oauth-error-wiring');
     const client = new HttpMcpClient('test-oauth-error-wiring', config, {
@@ -363,21 +371,27 @@ describe('HttpMcpClient cross-realm Response handling', () => {
     await options.fetch('https://oauth.example/token', { method: 'POST' });
 
     // The refresh-only wrapper used on background connects shares the SAME provider
-    // instance the fetch wrapper wrote to — so its "ignoring token invalidation" warn
-    // must carry the captured error, prove the seam end-to-end, and still NOT delete tokens.
+    // instance the fetch wrapper wrote to — so its disk-compare-preserve warn must
+    // carry the captured error, prove the seam end-to-end, and still NOT delete tokens.
     const refreshOnly = new RefreshOnlyOAuthProvider(provider);
     mockLogger.warn.mockClear();
     await refreshOnly.invalidateCredentials('tokens');
 
     const warnWithError = mockLogger.warn.mock.calls.find(
       (call: unknown[]) =>
-        String(call[0] ?? '').includes('Ignoring token invalidation request in refresh-only mode'),
+        String(call[0] ?? '').includes('Token invalidation (refresh-only): preserving on-disk tokens'),
     );
     expect(warnWithError).toBeDefined();
     expect(warnWithError?.[1]).toMatchObject({
       error: 'invalid_grant',
       error_description: 'Refresh token expired',
     });
+
+    // Tokens preserved (peer may have rotated; a dead grant is cleared by the
+    // transactional fetch wrapper, not here).
+    const tokenFile = path.join(tempDir, 'test-oauth-error-wiring_tokens.json');
+    const saved = JSON.parse(await fs.readFile(tokenFile, 'utf8'));
+    expect(saved).toMatchObject({ refresh_token: 'wiring-refresh' });
 
     // Consumed and cleared — no stale carryover into a later invalidation.
     expect(provider.consumeLastOAuthError()).toBeUndefined();

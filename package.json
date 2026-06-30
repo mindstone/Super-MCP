@@ -1,6 +1,6 @@
 {
   "name": "super-mcp-router",
-  "version": "2.7.1",
+  "version": "2.7.2",
   "description": "A local MCP router that aggregates multiple MCPs into a single interface for Claude",
   "private": false,
   "type": "module",
@@ -56,6 +56,7 @@
     "graceful-fs": "4.2.11",
     "keytar": "^7.9.0",
     "p-queue": "^9.0.0",
+    "proper-lockfile": "^4.1.2",
     "safe-regex2": "^5.0.0",
     "wink-bm25-text-search": "^3.1.2",
     "zod": "^4.3.6"
@@ -63,6 +64,7 @@
   "devDependencies": {
     "@types/graceful-fs": "^4.1.9",
     "@types/node": "^20.0.0",
+    "@types/proper-lockfile": "^4.1.4",
     "tsx": "^4.7.0",
     "typescript": "^5.5.4",
     "vitest": "^2.0.0"
