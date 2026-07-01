@@ -483,4 +483,60 @@ describe("OAuth refresh-token rotation race (red harness)", () => {
     const disk = await readDiskTokens(tempDir, packageId);
     expect(disk?.refresh_token).toBe("peer-rotated-refresh");
   });
+
+  // -------------------------------------------------------------------------
+  // Soak — high-N concurrency: many processes race the SAME seed refresh token.
+  // Extends FM1 (N=2) to N contenders to stress the lock + short-circuit path
+  // at scale. Post-fix invariant: the lock serializes all contenders, the POST
+  // only ever happens under the held lock, so exactly ONE server-side rotation
+  // is consumed; every later contender re-reads the freshly-rotated (still-valid)
+  // access token under the lock and short-circuits WITHOUT a network POST, so
+  // nobody replays a dead token. No reconnect marker is written — the grant is
+  // alive throughout. N is kept within the lock retry budget so the test is
+  // deterministic (not timing-flaky): rotation count is lock-gated, not raced.
+  // -------------------------------------------------------------------------
+  it("soak: N concurrent refreshes converge — exactly one rotation, zero invalid_grant, no marker", async () => {
+    const packageId = "Notion-soak";
+    const seedRefresh = "seed-refresh-soak";
+    const N = 6;
+
+    const seeder = new SimpleOAuthProvider(packageId, 5173);
+    await seeder.initialize();
+    // Already-expired access token so a refresh is genuinely triggered.
+    await seeder.saveTokens({
+      access_token: "seed-access",
+      refresh_token: seedRefresh,
+      expires_in: 0,
+    });
+
+    // Default expiresIn (3600) so the winner's rotated access token is valid,
+    // letting every later contender short-circuit under the lock (no POST).
+    const endpoint = createMockTokenEndpoint({ initialRefreshToken: seedRefresh });
+
+    const processes = await Promise.all(
+      Array.from({ length: N }, () => makeProcess(packageId, endpoint)),
+    );
+
+    const outcomes = await Promise.all(
+      processes.map((p) =>
+        runSdkRefreshCycle(p.provider, p.wrappedFetch, { refreshOnly: true }),
+      ),
+    );
+
+    // No contender ends wedged on invalid_grant.
+    const losers = outcomes.filter((o) => o.invalidGrant && !o.ok);
+    expect(losers.length).toBe(0);
+
+    // Despite N contenders replaying the same single-use seed, exactly one
+    // rotation is consumed against the server — the rest short-circuit.
+    expect(endpoint.successCount()).toBe(1);
+
+    // Disk converges on the server's latest valid refresh token.
+    const disk = await readDiskTokens(tempDir, packageId);
+    expect(disk?.refresh_token).toBe(endpoint.currentValidRefreshToken());
+
+    // The grant never died, so no reconnect marker was written.
+    const reconnectMarker = path.join(tempDir, `${packageId}_needsReconnect.json`);
+    await expect(fs.access(reconnectMarker)).rejects.toThrow();
+  });
 });

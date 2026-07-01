@@ -689,7 +689,16 @@ export class HttpMcpClient implements McpClient {
     if ('finishAuth' in this.transport && typeof this.transport.finishAuth === 'function') {
       await this.transport.finishAuth(authCode);
       logger.info("OAuth token exchange completed", { package_id: this.packageId });
-      
+
+      // A completed browser re-auth means any prior dead-grant marker is now
+      // stale — clear it so the host stops surfacing a reconnect prompt for a
+      // connector that just reconnected. The refresh path clears the marker on a
+      // successful rotation (refreshTransaction.ts); this is the sibling clear
+      // for the interactive authorization-code path, which persists tokens via
+      // the SDK's saveTokens() (which does NOT itself clear the marker). Gated on
+      // the marker existing, so the common first-time-connect path is a no-op.
+      await this.simpleOAuthProvider?.clearNeedsReconnectMarker();
+
       try {
         try {
           await this.client.close();

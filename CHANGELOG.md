@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [2.7.3] - 2026-07-01
+
+### Fixed
+- **A completed browser re-authentication now clears the dead-grant reconnect marker.** When a rotating-refresh grant genuinely dies, super-mcp clears its tokens and writes a `${packageId}_needsReconnect.json` marker (2.7.2) so the host can surface a reconnect prompt. The refresh path cleared that marker on a successful rotation, but the **interactive authorization-code path (`finishOAuth`) did not** — so after a user reconnected via the browser, the marker lingered and the host kept prompting. `finishOAuth` now clears the marker on a successful token exchange (gated on the marker existing, so first-time connects stay a no-op). This is what lets an in-app "Reconnect" visibly resolve the prompt.
+
+### Testing
+- Added a high-N (N=6) concurrency **soak** to the rotation-race suite: many processes racing the same seed refresh token converge to exactly one server-side rotation, zero `invalid_grant`, and no reconnect marker on a live grant — extending the existing N=2 FM1 coverage to scale.
+
 ## [2.7.2] - 2026-07-01
 
 ### Fixed
