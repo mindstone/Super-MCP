@@ -292,6 +292,10 @@ export interface AuthManager {
  * a stable contract field instead of parsing the human-readable message.
  * Legacy fields (`blocked_reason`, `user_disabled`, `admin_disabled`) are kept
  * alongside for backward compatibility — do not remove them.
+ *
+ * The Rebel host mirrors this union literally in
+ * `src/main/ipc/mcpAppsHandlers.ts` (`TOOL_BLOCKED_REASONS`); both copies are
+ * pinned by their own contract tests, so keep them in sync when adding a reason.
  */
 export type ToolBlockedReason = "user-disabled" | "admin-disabled" | "security-policy";
 
