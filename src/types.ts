@@ -286,6 +286,15 @@ export interface AuthManager {
   getAuthHeaders(packageId: string): Promise<Record<string, string>>;
 }
 
+/**
+ * Closed discriminator for why a tool call was rejected with TOOL_BLOCKED.
+ * Emitted as `data.reason` on every TOOL_BLOCKED error so hosts can branch on
+ * a stable contract field instead of parsing the human-readable message.
+ * Legacy fields (`blocked_reason`, `user_disabled`, `admin_disabled`) are kept
+ * alongside for backward compatibility — do not remove them.
+ */
+export type ToolBlockedReason = "user-disabled" | "admin-disabled" | "security-policy";
+
 export const ERROR_CODES = {
   INVALID_PARAMS: -32602,
   PACKAGE_NOT_FOUND: -33001,

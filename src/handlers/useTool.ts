@@ -1,5 +1,5 @@
 import { randomUUID } from "crypto";
-import { UseToolInput, UseToolOutput, ERROR_CODES } from "../types.js";
+import { UseToolInput, UseToolOutput, ERROR_CODES, type ToolBlockedReason } from "../types.js";
 import { PackageRegistry } from "../registry.js";
 import { Catalog } from "../catalog.js";
 import type { ValidationResult } from "../validator.js";
@@ -945,7 +945,7 @@ export async function handleUseTool(
     throw {
       code: ERROR_CODES.TOOL_BLOCKED,
       message: blockCheck.reason || `Tool '${package_id}__${tool_id}' is blocked by security policy`,
-      data: { package_id, tool_id, blocked_reason: blockCheck.reason },
+      data: { package_id, tool_id, blocked_reason: blockCheck.reason, reason: "security-policy" satisfies ToolBlockedReason },
     };
   }
 
@@ -961,7 +961,7 @@ export async function handleUseTool(
     throw {
       code: ERROR_CODES.TOOL_BLOCKED,
       message: `Tool '${package_id}__${tool_id}' is disabled by your organization's administrator`,
-      data: { package_id, tool_id, blocked_reason: "Disabled by administrator", admin_disabled: true },
+      data: { package_id, tool_id, blocked_reason: "Disabled by administrator", admin_disabled: true, reason: "admin-disabled" satisfies ToolBlockedReason },
     };
   }
 
@@ -974,7 +974,7 @@ export async function handleUseTool(
     throw {
       code: ERROR_CODES.TOOL_BLOCKED,
       message: `Tool '${package_id}__${tool_id}' is disabled by user preference. Re-enable it in Settings to use.`,
-      data: { package_id, tool_id, blocked_reason: "Disabled by user", user_disabled: true },
+      data: { package_id, tool_id, blocked_reason: "Disabled by user", user_disabled: true, reason: "user-disabled" satisfies ToolBlockedReason },
     };
   }
   if (!packageConfig) {
