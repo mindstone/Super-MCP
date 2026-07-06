@@ -95,6 +95,21 @@ export class TokenRefreshLockError extends Error {
   }
 }
 
+/**
+ * Thrown when a refresh is requested after shutdown has begun (FM6 review F1).
+ * Retryable in the abstract, but in practice the process is exiting; the point
+ * is to fail BEFORE presenting a single-use token so the on-disk token survives.
+ */
+export class TokenRefreshShutdownError extends Error {
+  readonly retryable = true;
+  readonly packageId: string;
+  constructor(packageId: string) {
+    super(`Token refresh refused for package '${packageId}' (process is shutting down)`);
+    this.name = "TokenRefreshShutdownError";
+    this.packageId = packageId;
+  }
+}
+
 /** Thrown when an acquired lock is compromised mid-critical-section. */
 export class TokenRefreshLockCompromisedError extends Error {
   readonly packageId: string;
@@ -117,19 +132,96 @@ export class TokenRefreshLockCompromisedError extends Error {
 // ---------------------------------------------------------------------------
 const inProcessChains = new Map<string, Promise<unknown>>();
 
+// FM6 (260706): once shutdown has begun we must refuse to START any new
+// single-use refresh. A refresh that begins after the drain snapshot would not
+// be awaited by drainInFlightTokenRefreshes and could be interrupted by
+// process.exit() mid-persist — re-opening the exact FM6 window the drain closes
+// (cross-family review F1). Refusing BEFORE the token is presented to the
+// provider is fail-closed: no single-use token is consumed, so the on-disk token
+// stays valid and the next launch succeeds without a reconnect. Set-once (the
+// process is exiting); `beginTokenRefreshShutdown()` is called synchronously
+// right before the drain snapshot, so single-threaded JS guarantees no refresh
+// can slip between the flag and the snapshot.
+let refreshShutdownStarted = false;
+
+/** Refuse new refreshes from here on (idempotent). Call before the drain snapshot. */
+export function beginTokenRefreshShutdown(): void {
+  refreshShutdownStarted = true;
+}
+
+/** True once {@link beginTokenRefreshShutdown} has been called. */
+export function isTokenRefreshShutdownStarted(): boolean {
+  return refreshShutdownStarted;
+}
+
+/** Test-only: reset the set-once shutdown flag so suites stay isolated. */
+export function __resetTokenRefreshShutdownForTests(): void {
+  refreshShutdownStarted = false;
+}
+
 function withInProcessMutex<T>(packageId: string, fn: () => Promise<T>): Promise<T> {
   const prior = inProcessChains.get(packageId) ?? Promise.resolve();
   // Run fn after the prior holder settles (success OR failure).
   const run = prior.then(fn, fn);
   // Keep the chain alive but never let a rejection poison the next waiter.
-  inProcessChains.set(
-    packageId,
-    run.then(
-      () => undefined,
-      () => undefined,
-    ),
+  const settledMarker = run.then(
+    () => undefined,
+    () => undefined,
   );
+  inProcessChains.set(packageId, settledMarker);
+  // FM6 review F2: drop the entry once it settles (unless a newer refresh has
+  // already replaced it), so the map reflects only genuinely in-flight refreshes
+  // — keeping drainInFlightTokenRefreshes' `tracked` count honest and the map
+  // from retaining settled chains indefinitely.
+  void settledMarker.then(() => {
+    if (inProcessChains.get(packageId) === settledMarker) {
+      inProcessChains.delete(packageId);
+    }
+  });
   return run;
+}
+
+/**
+ * Wait for any in-flight token-refresh transactions to settle, bounded by
+ * `timeoutMs`. A refresh chain settles only AFTER its atomic on-disk persist
+ * completes, so awaiting it guarantees a rotated single-use refresh token has
+ * been written before the caller proceeds to tear the process down.
+ *
+ * This is the graceful-shutdown half of the FM6 fix
+ * (260706_mcp-oauth-fm6-graceful-drain): the Notion refresh token is single-use
+ * and rotating, so a process killed between the server consuming the old token
+ * and the disk persist leaves a dead token on disk → forced reconnect. Draining
+ * here (invoked from the router's `shutdown()`) closes that window for every
+ * graceful trigger (SIGTERM / SIGINT / owner-dead).
+ *
+ * Returns `{ drained: true }` if all tracked chains settled within the budget,
+ * `{ drained: false }` if the timeout won the race (the caller should still
+ * proceed to exit — an over-budget refresh is a rare residual, not a reason to
+ * hang shutdown past the host's cleanup budget). `tracked` is the number of
+ * per-package chains awaited (already-settled chains resolve immediately).
+ */
+export async function drainInFlightTokenRefreshes(
+  timeoutMs: number,
+): Promise<{ drained: boolean; tracked: number }> {
+  const chains = [...inProcessChains.values()];
+  if (chains.length === 0) {
+    return { drained: true, tracked: 0 };
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<"timeout">((resolve) => {
+    timer = setTimeout(() => resolve("timeout"), timeoutMs);
+    // Do not keep the event loop alive solely for this timer.
+    (timer as { unref?: () => void }).unref?.();
+  });
+  const settled = Promise.allSettled(chains).then(() => "settled" as const);
+  try {
+    const result = await Promise.race([settled, timeout]);
+    return { drained: result === "settled", tracked: chains.length };
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 /**
@@ -159,6 +251,14 @@ export async function withTokenRefreshLock<T>(
   fn: (assertLockHealthy: () => void) => Promise<T>,
   options?: TokenRefreshLockOptions,
 ): Promise<T> {
+  // FM6 review F1: refuse to START a new refresh once shutdown has begun, BEFORE
+  // any lock is taken or token is presented. Checked synchronously here (no await
+  // before beginTokenRefreshShutdown()'s effect and the drain snapshot are in the
+  // same tick), so a refresh either registered its chain before the flag (→ in the
+  // drain snapshot, awaited) or is refused here — never interrupted mid-persist.
+  if (refreshShutdownStarted) {
+    throw new TokenRefreshShutdownError(packageId);
+  }
   return withInProcessMutex(packageId, async () => {
     // Ensure the lock target exists (proper-lockfile locks an existing path).
     try {

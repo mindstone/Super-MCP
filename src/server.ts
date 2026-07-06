@@ -30,6 +30,40 @@ import {
 } from "./handlers/index.js";
 import { formatError } from "./utils/formatError.js";
 import { startWatchdog, type WatchdogHandle } from "./ownerWatchdog.js";
+import {
+  beginTokenRefreshShutdown,
+  drainInFlightTokenRefreshes,
+} from "./auth/tokenRefreshLock.js";
+
+// FM6 (260706_mcp-oauth-fm6-graceful-drain): give an in-flight single-use
+// refresh-token rotation time to finish its atomic persist before we exit, so a
+// quit/restart mid-refresh can't leave a consumed-but-unpersisted token on disk.
+// Bounded so shutdown stays within the host's per-service cleanup budget (3s):
+// drain 1.5s + host SIGTERM grace 2s keeps worst-case stop ~2.2s.
+const TOKEN_REFRESH_DRAIN_TIMEOUT_MS = 1500;
+
+async function drainRefreshesForShutdown(): Promise<void> {
+  const logger = getLogger();
+  // FM6 review F1: stop accepting NEW refreshes before we snapshot the in-flight
+  // ones, so a refresh triggered by an HTTP request still draining after
+  // httpServer.close() can't start (and be interrupted mid-persist) after the
+  // drain has already taken its snapshot. Synchronous + set-once; both shutdown
+  // variants (HTTP + stdio) route through here, so both are covered.
+  beginTokenRefreshShutdown();
+  try {
+    const result = await drainInFlightTokenRefreshes(TOKEN_REFRESH_DRAIN_TIMEOUT_MS);
+    logger.info("Token refresh drain complete before shutdown", {
+      drained: result.drained,
+      tracked: result.tracked,
+      timeout_ms: TOKEN_REFRESH_DRAIN_TIMEOUT_MS,
+    });
+  } catch (error) {
+    // Never let drain failure block shutdown — log and proceed to exit.
+    logger.warn("Token refresh drain errored before shutdown", {
+      error: formatError(error),
+    });
+  }
+}
 
 const logger = getLogger();
 
@@ -948,18 +982,34 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
         watchdogHandle?.stop();
 
         logger.info("Shutting down HTTP server...", { reason });
-        clearInterval(gcInterval);
-        await configWatcher.stop();
-        httpServer.close(() => {
-          logger.info("HTTP server closed");
-        });
-        for (const [id, entry] of sessions) {
-          await entry.server.close().catch(() => {});
-          sessions.delete(id);
+        // FM6 (review F3): the teardown below runs AFTER drainRefreshesForShutdown()
+        // sets the set-once refresh-shutdown flag. A teardown step that rejects
+        // must never strand the router alive with that flag set — it would then
+        // refuse every future refresh indefinitely (the app-managed path escalates
+        // to SIGKILL, but owner-dead / standalone / SIGINT have no external
+        // escalation). try/finally guarantees we always reach process.exit().
+        try {
+          // FM6: finish any in-flight single-use refresh-token rotation FIRST, so
+          // its atomic persist completes before we tear anything down or exit.
+          await drainRefreshesForShutdown();
+          clearInterval(gcInterval);
+          await configWatcher.stop();
+          httpServer.close(() => {
+            logger.info("HTTP server closed");
+          });
+          for (const [id, entry] of sessions) {
+            await entry.server.close().catch(() => {});
+            sessions.delete(id);
+          }
+          logger.info("All MCP sessions closed");
+          await registry.closeAll();
+        } catch (error) {
+          logger.error("Error during HTTP shutdown teardown; exiting anyway", {
+            error: formatError(error),
+          });
+        } finally {
+          process.exit(0);
         }
-        logger.info("All MCP sessions closed");
-        await registry.closeAll();
-        process.exit(0);
       };
 
       process.on("SIGINT", () => shutdown());
@@ -1003,9 +1053,21 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
 
         watchdogHandle?.stop();
         logger.info("Shutting down...", { reason });
-        await configWatcher.stop();
-        await registry.closeAll();
-        process.exit(0);
+        // FM6 (review F3): try/finally guarantees process.exit() even if a
+        // teardown step rejects, so a teardown error can't strand the router
+        // alive with the refresh-shutdown flag set (refusing every refresh).
+        try {
+          // FM6: drain in-flight refresh-token rotation before teardown/exit.
+          await drainRefreshesForShutdown();
+          await configWatcher.stop();
+          await registry.closeAll();
+        } catch (error) {
+          logger.error("Error during stdio shutdown teardown; exiting anyway", {
+            error: formatError(error),
+          });
+        } finally {
+          process.exit(0);
+        }
       };
 
       process.on("SIGINT", () => shutdown());
