@@ -1,4 +1,5 @@
 import * as fs from "fs/promises";
+import { createHash } from "node:crypto";
 import { OAuthTokensSchema } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { getLogger } from "../logging.js";
 import {
@@ -30,6 +31,24 @@ function jitteredDelay(attempt: number): number {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Non-reversible short identity of a token for diagnostics. NEVER logs the token
+ * material itself — a truncated SHA-256 (32 bits) is enough to compare identity
+ * across log lines (presented-vs-disk, before-vs-after rotation) but far too
+ * little to reconstruct the secret. `"none"` for an absent token. This is the
+ * load-bearing discriminator for the residual grant-death investigation
+ * (260630_mcp-oauth-refresh-race): at invalid_grant, `disk_matches_presented`
+ * being true is the crash-before-persist (FM6) signature — the token we
+ * presented is still the one on disk and it is dead, i.e. a peer consumed the
+ * rotation but never persisted the replacement.
+ */
+function tokenFp(token: unknown): string {
+  if (typeof token !== "string" || token.length === 0) {
+    return "none";
+  }
+  return createHash("sha256").update(token).digest("hex").slice(0, 8);
 }
 
 /** Compute remaining lifetime (ms) of a persisted access token, or undefined. */
@@ -234,6 +253,19 @@ export async function runRefreshTransaction(
       disk = undefined;
     }
 
+    // Diagnostics (info-level so it survives the default deployed log level):
+    // capture the identity of what we're about to work with. This is the entry
+    // point for the residual grant-death investigation — pid + fingerprints let a
+    // post-mortem reconstruct whether two processes presented the same token and
+    // whether disk moved under us.
+    logger.info("Refresh transaction: evaluating", {
+      package_id: packageId,
+      pid: process.pid,
+      disk_refresh_fp: tokenFp(disk?.refresh_token),
+      supplied_refresh_fp: tokenFp(supplied.refreshToken),
+      disk_access_remaining_ms: disk?.access_token ? remainingLifetimeMs(disk) : undefined,
+    });
+
     // (2) Short-circuit: disk already has a still-valid access token (a peer
     // refreshed). Avoid a network POST AND avoid burning a single-use refresh
     // token. The SDK parses the synthesized response and re-persists idempotently.
@@ -257,6 +289,17 @@ export async function runRefreshTransaction(
       // honestly.
       return baseFetch(input, init);
     }
+
+    // Diagnostics: we are about to consume a single-use refresh token on the
+    // wire. If the process dies between here and the persist below, the on-disk
+    // token becomes dead-but-unrotated (FM6). Logging the presented fingerprint
+    // lets a later invalid_grant be matched back to this exact attempt.
+    logger.info("Refresh transaction: presenting refresh token to server", {
+      package_id: packageId,
+      pid: process.pid,
+      presented_refresh_fp: tokenFp(refreshTokenToSend),
+      source: diskRefreshToken ? "disk" : "sdk-supplied",
+    });
 
     assertLockHealthy();
     const requestInit = rewriteBodyWithRefreshToken(init, refreshTokenToSend);
@@ -357,6 +400,12 @@ export async function runRefreshTransaction(
       }
 
       await provider.clearNeedsReconnectMarker();
+      logger.info("Refresh transaction: rotated and persisted under lock", {
+        package_id: packageId,
+        pid: process.pid,
+        presented_refresh_fp: tokenFp(refreshTokenToSend),
+        new_refresh_fp: tokenFp(persisted?.refresh_token),
+      });
       // N1 — Return a Response built from the MERGED PERSISTED token set (what we
       // actually wrote to disk under the lock), NOT the raw parsed `rotated` body.
       //
@@ -378,6 +427,14 @@ export async function runRefreshTransaction(
     // (4) invalid_grant on the token we presented. Distinguish a lost race
     // (peer rotated, hasn't persisted yet — FM5 TOCTOU) from a genuinely dead
     // grant via bounded re-reads with jittered backoff.
+    logger.info("Refresh transaction: invalid_grant on presented token; checking for peer rotation", {
+      package_id: packageId,
+      pid: process.pid,
+      presented_refresh_fp: tokenFp(refreshTokenToSend),
+      ...(summary
+        ? { server_error: summary.error, server_error_description: summary.error_description }
+        : {}),
+    });
     for (let attempt = 0; attempt < TOCTOU_MAX_ATTEMPTS; attempt++) {
       assertLockHealthy();
       let recheck: any;
@@ -412,8 +469,28 @@ export async function runRefreshTransaction(
     // (5) Disk unchanged across the backoff window → the grant is genuinely dead.
     // Clear tokens + write the needsReconnect marker, and let the error response
     // reach the SDK (which will throw InvalidGrantError).
+    //
+    // `disk_matches_presented` is the residual-death discriminator:
+    //   true  → the token we presented is STILL the one on disk and it is dead:
+    //           a peer consumed the rotation but never persisted the replacement
+    //           (crash/kill in the consume→persist window, FM6).
+    //   false → disk moved to a different token that ALSO failed / we presented a
+    //           stale token disk had already superseded: points at a lock or
+    //           stale-in-memory path rather than a crash window.
+    let finalDisk: any;
+    try {
+      finalDisk = await provider.readDiskTokens();
+    } catch {
+      finalDisk = undefined;
+    }
+    const presentedFp = tokenFp(refreshTokenToSend);
+    const finalDiskFp = tokenFp(finalDisk?.refresh_token);
     logger.error("Refresh grant is genuinely dead after bounded re-read", {
       package_id: packageId,
+      pid: process.pid,
+      presented_refresh_fp: presentedFp,
+      disk_refresh_fp: finalDiskFp,
+      disk_matches_presented: presentedFp !== "none" && presentedFp === finalDiskFp,
       ...(summary ? summary : {}),
     });
     await provider.clearTokensAndMarkNeedsReconnect(summary);

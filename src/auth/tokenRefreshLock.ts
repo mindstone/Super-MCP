@@ -185,6 +185,13 @@ export async function withTokenRefreshLock<T>(
     let release: (() => Promise<void>) | undefined;
     let primaryError: unknown;
 
+    // Timing is logged at info so the deployed (info-level) logs reveal whether
+    // the cross-process lock is actually engaging and ever contended — the
+    // residual grant-death investigation (260630_mcp-oauth-refresh-race) was
+    // blind here because acquire/release were debug-only.
+    const acquireStart = Date.now();
+    let holdStart = acquireStart;
+
     try {
       const releaseFn = await properLockfile.lock(tokenFilePath, {
         stale: options?.staleMs ?? resolveStaleMs(),
@@ -202,7 +209,14 @@ export async function withTokenRefreshLock<T>(
       release = async () => {
         await releaseFn();
       };
-      logger.debug("Acquired token refresh lock", { package_id: packageId });
+      holdStart = Date.now();
+      logger.info("Acquired token refresh lock", {
+        package_id: packageId,
+        pid: process.pid,
+        // Non-trivial wait = a peer process held the lock (genuine cross-process
+        // contention), the signal we previously could not see.
+        wait_ms: holdStart - acquireStart,
+      });
     } catch (error) {
       // Distinguish genuine contention (proper-lockfile exhausts retries with
       // ELOCKED) from an infrastructural failure (missing dir, EACCES, disk).
@@ -247,7 +261,11 @@ export async function withTokenRefreshLock<T>(
       if (release) {
         try {
           await release();
-          logger.debug("Released token refresh lock", { package_id: packageId });
+          logger.info("Released token refresh lock", {
+            package_id: packageId,
+            pid: process.pid,
+            hold_ms: Date.now() - holdStart,
+          });
         } catch (releaseError) {
           if (primaryError === undefined) {
             throw new TokenRefreshLockCompromisedError(packageId, releaseError);
