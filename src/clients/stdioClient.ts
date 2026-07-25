@@ -273,16 +273,37 @@ export class StdioMcpClient implements McpClient {
       mergedEnv = { ...(this.config.env ?? {}), MCP_WORKSPACE_PATH: workspacePath };
     }
 
+    // Declared-Space symlink roots injection — scoped to the openai-image
+    // connector ONLY. Unscoped injection would leak every declared-Space
+    // absolute path (which carries account/mount names) to unrelated
+    // third-party stdio connectors. The host serialises the roots into
+    // REBEL_ALLOWED_SYMLINK_ROOTS at super-mcp spawn (same seam as
+    // REBEL_WORKSPACE_PATH); the connector re-canonicalises each entry per
+    // call, mirroring the built-in file tools' `checkZone`. See
+    // docs/plans/260724_openai-image-fence-timeout/PLAN.md Stage 4 (2).
+    //
+    // The `MCP_` prefix follows the OSS-connector convention noted above —
+    // the connector reads `MCP_ALLOWED_SYMLINK_ROOTS`, never the parent
+    // `REBEL_` name.
+    const rebelRootsTrimmed = process.env.REBEL_ALLOWED_SYMLINK_ROOTS?.trim();
+    if (rebelRootsTrimmed && this.config.catalogId === 'openai-image-generation') {
+      mergedEnv = { ...(mergedEnv ?? {}), MCP_ALLOWED_SYMLINK_ROOTS: rebelRootsTrimmed };
+    }
+
     logger.info("Connecting to stdio MCP", {
       package_id: this.packageId,
       command: this.config.command,
       args: this.config.args,
       workspace: workspacePath ? 'set' : 'unset',
+      // Boolean only — never log the raw roots value (carries account/mount names).
+      allowed_symlink_roots: rebelRootsTrimmed ? 'set' : 'unset',
     });
 
     logger.debug("stdio subprocess workspace env (debug only)", {
       package_id: this.packageId,
       workspace_path: workspacePath ?? null,
+      // Boolean only — values are sensitive (see SENSITIVE_ENV_KEY_EXACT).
+      allowed_symlink_roots_set: Boolean(rebelRootsTrimmed),
     });
 
     // Workaround: MCP SDK gates windowsHide on isElectron() which checks
