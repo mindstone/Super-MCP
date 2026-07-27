@@ -11,6 +11,140 @@ import { runRefreshTransaction } from "../auth/refreshTransaction.js";
 
 const logger = getLogger();
 
+export type OAuthDiscoveryKind =
+  | "protected-resource"
+  | "authorization-server"
+  | "openid-configuration"
+  | "registration"
+  | "jwks"
+  | "token"
+  | "other-well-known";
+
+export type OAuthDiscoveryScope = "path-relative" | "origin";
+export type OAuthDiscoveryStatusClass = "2xx" | "3xx" | "4xx" | "5xx" | "network-error";
+
+export interface OAuthDiscoveryTraceEntry {
+  kind: OAuthDiscoveryKind;
+  scope: OAuthDiscoveryScope;
+  statusClass: OAuthDiscoveryStatusClass;
+  timestampMs: number;
+}
+
+export const OAUTH_DISCOVERY_TRACE_ERROR_MARKER = "\n[super-mcp-oauth-discovery-trace:v1]";
+const OAUTH_DISCOVERY_TRACE_CAPACITY = 10;
+
+type OAuthDiscoveryClassification = Pick<OAuthDiscoveryTraceEntry, "kind" | "scope">;
+
+const WELL_KNOWN_DISCOVERY_PATHS: ReadonlyArray<{
+  path: string;
+  kind: OAuthDiscoveryKind;
+}> = [
+  { path: "/.well-known/oauth-protected-resource", kind: "protected-resource" },
+  {
+    path: "/.well-known/oauth-authorization-server",
+    kind: "authorization-server",
+  },
+  { path: "/.well-known/openid-configuration", kind: "openid-configuration" },
+];
+
+const OAUTH_ENDPOINT_PATHS: ReadonlyArray<{
+  path: string;
+  kind: OAuthDiscoveryKind;
+}> = [
+  { path: "/register", kind: "registration" },
+  { path: "/jwks", kind: "jwks" },
+  { path: "/token", kind: "token" },
+];
+
+function getRequestUrl(input: RequestInfo | URL): string | undefined {
+  if (typeof input === "string") {
+    return input;
+  }
+  if (input instanceof URL) {
+    return input.toString();
+  }
+  if (typeof input === "object" && input !== null && "url" in input) {
+    const url = (input as { url?: unknown }).url;
+    return typeof url === "string" ? url : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Classify OAuth discovery traffic without retaining any URL component.
+ * Only the parsed pathname participates; hosts, queries, and fragments are discarded.
+ */
+export function classifyOAuthDiscoveryRequest(input: RequestInfo | URL): OAuthDiscoveryClassification | undefined {
+  const rawUrl = getRequestUrl(input);
+  if (!rawUrl) {
+    return undefined;
+  }
+
+  let pathname: string;
+  try {
+    pathname = new URL(rawUrl, "https://invalid.local").pathname;
+  } catch {
+    return undefined;
+  }
+
+  for (const candidate of WELL_KNOWN_DISCOVERY_PATHS) {
+    const markerIndex = pathname.indexOf(candidate.path);
+    if (markerIndex === -1) {
+      continue;
+    }
+    const trailingPath = pathname.slice(markerIndex + candidate.path.length);
+    if (trailingPath !== "" && trailingPath !== "/" && !trailingPath.startsWith("/")) {
+      continue;
+    }
+    return {
+      kind: candidate.kind,
+      scope: trailingPath === "" || trailingPath === "/" ? "origin" : "path-relative",
+    };
+  }
+
+  const otherWellKnownIndex = pathname.indexOf("/.well-known/");
+  if (otherWellKnownIndex !== -1) {
+    const wellKnownPath = pathname.slice(otherWellKnownIndex + "/.well-known/".length);
+    const segmentCount = wellKnownPath.split("/").filter(Boolean).length;
+    if (segmentCount > 0) {
+      return {
+        kind: "other-well-known",
+        scope: segmentCount > 1 ? "path-relative" : "origin",
+      };
+    }
+  }
+
+  for (const candidate of OAUTH_ENDPOINT_PATHS) {
+    if (pathname === candidate.path || pathname.endsWith(candidate.path)) {
+      return {
+        kind: candidate.kind,
+        scope: pathname === candidate.path ? "origin" : "path-relative",
+      };
+    }
+  }
+
+  return undefined;
+}
+
+function classifyOAuthDiscoveryStatus(status: unknown): OAuthDiscoveryStatusClass {
+  if (typeof status !== "number") {
+    return "network-error";
+  }
+  if (status >= 200 && status < 300) {
+    return "2xx";
+  }
+  if (status >= 300 && status < 400) {
+    return "3xx";
+  }
+  if (status >= 400 && status < 500) {
+    return "4xx";
+  }
+  if (status >= 500 && status < 600) {
+    return "5xx";
+  }
+  return "network-error";
+}
+
 /**
  * Wraps a fetch function to normalize Response objects from foreign realms.
  *
@@ -27,6 +161,10 @@ function createResponseNormalizingFetch(
   baseFetch: typeof fetch,
   onOAuthError?: (error: OAuthErrorSummary) => void,
   refreshProvider?: SimpleOAuthProvider,
+  onOAuthDiscoveryRequest?: (
+    classification: OAuthDiscoveryClassification,
+    statusClass: OAuthDiscoveryStatusClass,
+  ) => void,
 ): typeof fetch {
   // OAuth refresh / code-exchange failures (invalid_grant, invalid_client, …) hit the
   // authorization server's token endpoint. Scope error capture to that endpoint so a
@@ -99,15 +237,31 @@ function createResponseNormalizingFetch(
   };
 
   return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const discoveryClassification = classifyOAuthDiscoveryRequest(input);
     // Token-endpoint refresh POSTs run through the transactional path: re-read
     // disk under a per-package cross-process lock, short-circuit on a still-valid
     // disk token, present the freshest refresh token, and recover/clear on
     // invalid_grant. The transaction internally calls baseFetch, so the result
     // still flows through the normalization + error-capture below.
-    const response: unknown =
-      refreshProvider && isOAuthTokenEndpoint(input) && isRefreshGrantBody(init)
-        ? await runRefreshTransaction({ provider: refreshProvider, baseFetch }, input, init)
-        : await baseFetch(input, init);
+    let response: unknown;
+    try {
+      response =
+        refreshProvider && isOAuthTokenEndpoint(input) && isRefreshGrantBody(init)
+          ? await runRefreshTransaction({ provider: refreshProvider, baseFetch }, input, init)
+          : await baseFetch(input, init);
+    } catch (error) {
+      if (discoveryClassification) {
+        onOAuthDiscoveryRequest?.(discoveryClassification, "network-error");
+      }
+      throw error;
+    }
+    if (discoveryClassification) {
+      const status =
+        response !== null && typeof response === "object" && "status" in response
+          ? (response as { status?: unknown }).status
+          : undefined;
+      onOAuthDiscoveryRequest?.(discoveryClassification, classifyOAuthDiscoveryStatus(status));
+    }
     let normalizedResponse: Response;
     if (
       response !== null &&
@@ -167,6 +321,7 @@ export class HttpMcpClient implements McpClient {
   private externalOAuthProvider?: SimpleOAuthProvider;
   private simpleOAuthProvider?: SimpleOAuthProvider;
   private usedSseFallback: boolean = false;
+  private oauthDiscoveryTrace: OAuthDiscoveryTraceEntry[] = [];
 
   constructor(packageId: string, config: PackageConfig, options?: HttpMcpClientOptions) {
     this.packageId = packageId;
@@ -196,6 +351,40 @@ export class HttpMcpClient implements McpClient {
       };
     }
     return undefined;
+  }
+
+  private getOAuthDiscoveryTrace(): OAuthDiscoveryTraceEntry[] {
+    return this.oauthDiscoveryTrace.map((entry) => ({ ...entry }));
+  }
+
+  private recordOAuthDiscoveryRequest(
+    classification: OAuthDiscoveryClassification,
+    statusClass: OAuthDiscoveryStatusClass,
+  ): void {
+    this.oauthDiscoveryTrace.push({
+      ...classification,
+      statusClass,
+      timestampMs: Date.now(),
+    });
+    if (this.oauthDiscoveryTrace.length > OAUTH_DISCOVERY_TRACE_CAPACITY) {
+      this.oauthDiscoveryTrace.splice(0, this.oauthDiscoveryTrace.length - OAUTH_DISCOVERY_TRACE_CAPACITY);
+    }
+  }
+
+  private attachOAuthDiscoveryTrace<T extends Error>(
+    error: T,
+  ): T & { oauthDiscoveryTrace: OAuthDiscoveryTraceEntry[] } {
+    const oauthDiscoveryTrace = this.getOAuthDiscoveryTrace();
+    const markerIndex = error.message.lastIndexOf(OAUTH_DISCOVERY_TRACE_ERROR_MARKER);
+    const baseMessage = markerIndex === -1 ? error.message : error.message.slice(0, markerIndex);
+    error.message = `${baseMessage}${OAUTH_DISCOVERY_TRACE_ERROR_MARKER}${JSON.stringify(oauthDiscoveryTrace)}`;
+    Object.defineProperty(error, "oauthDiscoveryTrace", {
+      configurable: true,
+      enumerable: true,
+      value: oauthDiscoveryTrace,
+      writable: false,
+    });
+    return error as T & { oauthDiscoveryTrace: OAuthDiscoveryTraceEntry[] };
   }
 
   private isAuthLikeErrorMessage(message: string): boolean {
@@ -475,6 +664,9 @@ export class HttpMcpClient implements McpClient {
         this.simpleOAuthProvider?.setLastOAuthError(error);
       },
       this.simpleOAuthProvider,
+      (classification, statusClass) => {
+        this.recordOAuthDiscoveryRequest(classification, statusClass);
+      },
     );
 
     return options;
@@ -636,6 +828,7 @@ export class HttpMcpClient implements McpClient {
   }
 
   async connectWithOAuth(): Promise<void> {
+    this.oauthDiscoveryTrace = [];
     await this.initializeOAuthIfNeeded(true);
     
     this.useOAuth = true;
@@ -671,7 +864,7 @@ export class HttpMcpClient implements McpClient {
           package_id: this.packageId,
           error: authError.message
         });
-        throw authError;
+        throw this.attachOAuthDiscoveryTrace(authError);
       }
     }
   }
