@@ -115,6 +115,8 @@ export interface ChildStatsEntry {
   reap_count: number;
   /** Cumulative non-reap, non-user eviction closures (unhealthy-client replacements). */
   eviction_count: number;
+  /** Cumulative second connect attempts after an initial failure. */
+  connect_retry_count: number;
   /** Cumulative pre-send liveness re-establishes in `callTool` (closed-transport recovery). */
   reestablish_count: number;
 }
@@ -144,6 +146,8 @@ export class PackageRegistry {
   private spawnCounts: Map<string, number> = new Map();
   private reapCounts: Map<string, number> = new Map();
   private evictionCounts: Map<string, number> = new Map();
+  /** Incremented exactly once when a failed initial connect starts its bounded retry. */
+  private connectRetryCounts: Map<string, number> = new Map();
   // `reestablishCounts` — incremented exactly once per pre-send liveness
   //   re-establish in `callTool` (the `isTransportClosed()` branch: a stdio
   //   transport closed BEFORE any bytes were sent, so we delete + recreate the
@@ -858,7 +862,7 @@ export class PackageRegistry {
     });
 
     // Create the client creation promise
-    clientPromise = this.createAndConnectClient(packageId, config);
+    clientPromise = this.createAndConnectClientWithOneRetry(packageId, config);
     this.clientPromises.set(packageId, clientPromise);
     
     try {
@@ -1087,7 +1091,51 @@ export class PackageRegistry {
     }
   }
 
-  private async createAndConnectClient(packageId: string, config: PackageConfig): Promise<McpClient> {
+  private async createAndConnectClientWithOneRetry(
+    packageId: string,
+    config: PackageConfig,
+  ): Promise<McpClient> {
+    let firstClient: McpClient | undefined;
+    try {
+      return await this.createAndConnectClient(
+        packageId,
+        config,
+        (client) => {
+          firstClient = client;
+        },
+      );
+    } catch (firstError) {
+      if (firstClient) {
+        try {
+          await firstClient.close();
+        } catch (cleanupError) {
+          logger.warn("Failed to close MCP client after failed connect", {
+            package_id: packageId,
+            attempt: 1,
+            error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+          });
+        }
+      }
+
+      this.connectRetryCounts.set(
+        packageId,
+        (this.connectRetryCounts.get(packageId) ?? 0) + 1,
+      );
+      logger.warn("MCP client connect failed; retrying once", {
+        package_id: packageId,
+        attempt: 1,
+        error: firstError instanceof Error ? firstError.message : String(firstError),
+      });
+
+      return this.createAndConnectClient(packageId, config);
+    }
+  }
+
+  private async createAndConnectClient(
+    packageId: string,
+    config: PackageConfig,
+    onClientCreated?: (client: McpClient) => void,
+  ): Promise<McpClient> {
     let client: McpClient;
     
     if (config.transport === "stdio") {
@@ -1095,6 +1143,7 @@ export class PackageRegistry {
     } else {
       client = new HttpMcpClient(packageId, config);
     }
+    onClientCreated?.(client);
 
     try {
       // Connect the client
@@ -1305,6 +1354,7 @@ export class PackageRegistry {
         spawn_count: this.spawnCounts.get(pkg.id) ?? 0,
         reap_count: this.reapCounts.get(pkg.id) ?? 0,
         eviction_count: this.evictionCounts.get(pkg.id) ?? 0,
+        connect_retry_count: this.connectRetryCounts.get(pkg.id) ?? 0,
         reestablish_count: this.reestablishCounts.get(pkg.id) ?? 0,
       };
     });

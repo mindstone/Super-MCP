@@ -7,6 +7,7 @@
  *  - Known-but-uncreated stdio package → `connected: false, pid: null, spawn_count: 0`.
  *  - Post-successful-spawn path (via direct state poke, mirroring
  *    `registry-idle-reaping.test.ts`) → `connected: true, spawn_count: 1`.
+ *  - Connect retries are exposed via `connect_retry_count`.
  *  - Post-reap path → `reap_count: 1, connected: false, pid: null`.
  *  - `pending_requests: true` when the client's `hasPendingRequests()` returns true.
  *  - 500 + error log when `registry.getChildStats` throws.
@@ -183,6 +184,7 @@ describe("GET /stats route shape", () => {
         spawn_count: 0,
         reap_count: 0,
         eviction_count: 0,
+        connect_retry_count: 0,
         idle_ms: null,
         last_activity_at: null,
       });
@@ -224,6 +226,7 @@ describe("GET /stats route shape", () => {
         spawn_count: 1,
         reap_count: 0,
         eviction_count: 0,
+        connect_retry_count: 0,
         pending_requests: false,
         last_activity_at: expect.any(Number),
       });
@@ -256,6 +259,7 @@ describe("GET /stats route shape", () => {
         spawn_count: 1,
         reap_count: 1,
         eviction_count: 0,
+        connect_retry_count: 0,
       });
     } finally {
       await server.close();
