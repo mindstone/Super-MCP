@@ -8,6 +8,65 @@ import { SecurityPolicy, SecurityConfig, setSecurityPolicy } from "./security.js
 
 const logger = getLogger();
 
+const PERMANENT_CONNECT_ERROR_CODES = new Set(["ENOENT", "EACCES"]);
+const PERMANENT_CONNECT_MESSAGE_PATTERNS = [
+  /^spawn\b[^\r\n]*\b(?:ENOENT|EACCES)\b\s*$/im,
+  /^(?:[^\r\n]*:\s*)?command not found\s*$/im,
+  /^(?:[^\r\n]*:\s*)?permission denied\s*$/im,
+];
+const MAX_ERROR_CAUSE_NODES = 8;
+
+function isPermanentConnectFailure(error: unknown): boolean {
+  try {
+    const pending: unknown[] = [error];
+    const seen = new Set<object>();
+
+    while (pending.length > 0 && seen.size < MAX_ERROR_CAUSE_NODES) {
+      const current = pending.shift();
+      if (typeof current === "string") {
+        if (
+          PERMANENT_CONNECT_MESSAGE_PATTERNS.some((pattern) =>
+            pattern.test(current),
+          )
+        ) {
+          return true;
+        }
+        continue;
+      }
+      if (typeof current !== "object" || current === null || seen.has(current)) {
+        continue;
+      }
+      seen.add(current);
+
+      const causalError = current as {
+        code?: unknown;
+        message?: unknown;
+        cause?: unknown;
+        originalError?: unknown;
+      };
+      if (
+        typeof causalError.code === "string" &&
+        PERMANENT_CONNECT_ERROR_CODES.has(causalError.code)
+      ) {
+        return true;
+      }
+      if (
+        typeof causalError.message === "string" &&
+        PERMANENT_CONNECT_MESSAGE_PATTERNS.some((pattern) =>
+          pattern.test(causalError.message as string),
+        )
+      ) {
+        return true;
+      }
+      pending.push(causalError.cause, causalError.originalError);
+    }
+  } catch {
+    // Diagnostic classification must never replace the original connect error.
+  }
+
+  return false;
+}
+
 function preserveFirstAttemptDiagnostics(
   firstError: unknown,
   secondError: unknown,
@@ -160,6 +219,8 @@ export interface ChildStatsEntry {
   connect_retry_recovered_count: number;
   /** Cumulative bounded second attempts that also failed. */
   connect_retry_failed_count: number;
+  /** Cumulative initial failures not retried because they were known-permanent. */
+  connect_retry_skipped_permanent_count: number;
   /** Cumulative pre-send liveness re-establishes in `callTool` (closed-transport recovery). */
   reestablish_count: number;
 }
@@ -195,6 +256,8 @@ export class PackageRegistry {
   private connectRetryRecoveredCounts: Map<string, number> = new Map();
   /** Incremented when the bounded second connect attempt also fails. */
   private connectRetryFailedCounts: Map<string, number> = new Map();
+  /** Incremented when a known-permanent initial failure bypasses the retry. */
+  private connectRetrySkippedPermanentCounts: Map<string, number> = new Map();
   // `reestablishCounts` — incremented exactly once per pre-send liveness
   //   re-establish in `callTool` (the `isTransportClosed()` branch: a stdio
   //   transport closed BEFORE any bytes were sent, so we delete + recreate the
@@ -1164,6 +1227,19 @@ export class PackageRegistry {
         }
       }
 
+      if (isPermanentConnectFailure(firstError)) {
+        this.connectRetrySkippedPermanentCounts.set(
+          packageId,
+          (this.connectRetrySkippedPermanentCounts.get(packageId) ?? 0) + 1,
+        );
+        logger.warn("MCP client connect retry skipped for permanent failure", {
+          package_id: packageId,
+          attempt: 1,
+          error: firstError instanceof Error ? firstError.message : String(firstError),
+        });
+        throw firstError;
+      }
+
       this.connectRetryCounts.set(
         packageId,
         (this.connectRetryCounts.get(packageId) ?? 0) + 1,
@@ -1418,6 +1494,8 @@ export class PackageRegistry {
         connect_retry_count: this.connectRetryCounts.get(pkg.id) ?? 0,
         connect_retry_recovered_count: this.connectRetryRecoveredCounts.get(pkg.id) ?? 0,
         connect_retry_failed_count: this.connectRetryFailedCounts.get(pkg.id) ?? 0,
+        connect_retry_skipped_permanent_count:
+          this.connectRetrySkippedPermanentCounts.get(pkg.id) ?? 0,
         reestablish_count: this.reestablishCounts.get(pkg.id) ?? 0,
       };
     });

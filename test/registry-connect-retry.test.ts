@@ -97,6 +97,7 @@ describe("PackageRegistry connect retry", () => {
       connect_retry_count: 1,
       connect_retry_recovered_count: 1,
       connect_retry_failed_count: 0,
+      connect_retry_skipped_permanent_count: 0,
     });
     expect(loggerMock.warn).toHaveBeenCalledWith(
       "MCP client connect failed; retrying once",
@@ -106,6 +107,72 @@ describe("PackageRegistry connect retry", () => {
         error: firstError.message,
       }),
     );
+  });
+
+  it("skips retry for a causal ENOENT failure and rethrows the first error", async () => {
+    const packageId = "GoogleWorkspace-acme";
+    const registry = createRegistry(packageId);
+    const internals = registry as unknown as RegistryInternals;
+    const firstClient = createMockClient();
+    const spawnError = Object.assign(new Error("spawn fictional-mcp ENOENT"), {
+      code: "ENOENT",
+    });
+    const firstError = Object.assign(
+      new Error(`Failed to connect to MCP server '${packageId}'.`),
+      { originalError: { cause: spawnError } },
+    );
+    const createSpy = vi.spyOn(internals, "createAndConnectClient");
+
+    createSpy.mockImplementationOnce(async (_id, _config, onClientCreated) => {
+      onClientCreated?.(firstClient);
+      throw firstError;
+    });
+
+    await expect(registry.getClient(packageId)).rejects.toBe(firstError);
+
+    expect(createSpy).toHaveBeenCalledOnce();
+    expect(firstClient.close).toHaveBeenCalledOnce();
+    expect(internals.clientPromises.has(packageId)).toBe(false);
+    expect(registry.getChildStats()[0]).toMatchObject({
+      connect_retry_count: 0,
+      connect_retry_recovered_count: 0,
+      connect_retry_failed_count: 0,
+      connect_retry_skipped_permanent_count: 1,
+    });
+    expect(loggerMock.warn).toHaveBeenCalledWith(
+      "MCP client connect retry skipped for permanent failure",
+      expect.objectContaining({
+        package_id: packageId,
+        attempt: 1,
+        error: firstError.message,
+      }),
+    );
+  });
+
+  it("still retries an unrelated not-found message", async () => {
+    const packageId = "GoogleWorkspace-acme";
+    const registry = createRegistry(packageId);
+    const internals = registry as unknown as RegistryInternals;
+    const firstClient = createMockClient();
+    const connectedClient = createMockClient();
+    const createSpy = vi.spyOn(internals, "createAndConnectClient");
+
+    createSpy
+      .mockImplementationOnce(async (_id, _config, onClientCreated) => {
+        onClientCreated?.(firstClient);
+        throw new Error("HTTP resource not found");
+      })
+      .mockResolvedValueOnce(connectedClient);
+
+    await expect(registry.getClient(packageId)).resolves.toBe(connectedClient);
+
+    expect(createSpy).toHaveBeenCalledTimes(2);
+    expect(registry.getChildStats()[0]).toMatchObject({
+      connect_retry_count: 1,
+      connect_retry_recovered_count: 1,
+      connect_retry_failed_count: 0,
+      connect_retry_skipped_permanent_count: 0,
+    });
   });
 
   it("shares one retry across concurrent callers", async () => {
@@ -234,6 +301,7 @@ describe("PackageRegistry connect retry", () => {
       connect_retry_count: 1,
       connect_retry_recovered_count: 0,
       connect_retry_failed_count: 1,
+      connect_retry_skipped_permanent_count: 0,
     });
   });
 

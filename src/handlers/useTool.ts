@@ -167,6 +167,172 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+type ConnectDiagnosticErrorClass =
+  | "connect_timeout"
+  | "connection_closed"
+  | "spawn_error"
+  | "other";
+
+interface ConnectDiagnosticSummary {
+  attempt: number;
+  spawnObservedThisCall?: boolean;
+  childCloseObserved?: boolean;
+  childExitCode?: number | null;
+  stderrPresent?: boolean;
+  errorClass: ConnectDiagnosticErrorClass;
+}
+
+const CONNECT_DIAGNOSTIC_KEYS = [
+  "spawnObservedThisCall",
+  "spawnError",
+  "childCloseObserved",
+  "childExitCode",
+  "stderrTail",
+] as const;
+const CONNECT_DIAGNOSTIC_ERROR_CLASSES = new Set<ConnectDiagnosticErrorClass>([
+  "connect_timeout",
+  "connection_closed",
+  "spawn_error",
+  "other",
+]);
+
+function deriveConnectDiagnosticSummary(
+  value: unknown,
+  inferredAttempt: number,
+  errorMessage?: string,
+): ConnectDiagnosticSummary | undefined {
+  try {
+    if (!isRecord(value)) {
+      return undefined;
+    }
+    const hasConnectDiagnosticField = CONNECT_DIAGNOSTIC_KEYS.some((key) =>
+      Object.prototype.hasOwnProperty.call(value, key),
+    );
+    if (!hasConnectDiagnosticField) {
+      return undefined;
+    }
+
+    const sourceAttempt = value.attempt;
+    const attempt =
+      sourceAttempt === 1 || sourceAttempt === 2
+        ? sourceAttempt
+        : inferredAttempt;
+    const spawnObservedThisCall =
+      typeof value.spawnObservedThisCall === "boolean"
+        ? value.spawnObservedThisCall
+        : undefined;
+    const childCloseObserved =
+      typeof value.childCloseObserved === "boolean"
+        ? value.childCloseObserved
+        : undefined;
+    const childExitCode =
+      value.childExitCode === null ||
+      (typeof value.childExitCode === "number" &&
+        Number.isSafeInteger(value.childExitCode))
+        ? value.childExitCode
+        : undefined;
+    const stderrPresent =
+      typeof value.stderrTail === "string"
+        ? value.stderrTail.length > 0
+        : undefined;
+
+    let errorClass: ConnectDiagnosticErrorClass = "other";
+    if (
+      typeof value.errorClass === "string" &&
+      CONNECT_DIAGNOSTIC_ERROR_CLASSES.has(
+        value.errorClass as ConnectDiagnosticErrorClass,
+      )
+    ) {
+      errorClass = value.errorClass as ConnectDiagnosticErrorClass;
+    } else if (
+      typeof value.spawnError === "string" &&
+      value.spawnError.trim().length > 0
+    ) {
+      errorClass = "spawn_error";
+    } else if (
+      typeof errorMessage === "string" &&
+      /\b(?:ENOENT|EACCES)\b|command not found|permission denied/i.test(
+        errorMessage,
+      )
+    ) {
+      errorClass = "spawn_error";
+    } else if (
+      typeof errorMessage === "string" &&
+      /request timed out|connection timed out|connect timeout|ETIMEDOUT|-32001/i.test(
+        errorMessage,
+      )
+    ) {
+      errorClass = "connect_timeout";
+    } else if (
+      childCloseObserved === true ||
+      (typeof errorMessage === "string" &&
+        /connection (?:was )?closed|transport closed|ConnectionClosed/i.test(
+          errorMessage,
+        ))
+    ) {
+      errorClass = "connection_closed";
+    }
+
+    return {
+      attempt,
+      ...(spawnObservedThisCall !== undefined
+        ? { spawnObservedThisCall }
+        : {}),
+      ...(childCloseObserved !== undefined ? { childCloseObserved } : {}),
+      ...(childExitCode !== undefined ? { childExitCode } : {}),
+      ...(stderrPresent !== undefined ? { stderrPresent } : {}),
+      errorClass,
+    };
+  } catch {
+    // Malformed diagnostics must never mask the original downstream error.
+    return undefined;
+  }
+}
+
+function deriveAllowlistedConnectDiagnostics(
+  error: unknown,
+  errorMessage: string,
+): {
+  connect_summary?: ConnectDiagnosticSummary;
+  first_attempt_summary?: ConnectDiagnosticSummary;
+} {
+  try {
+    if (!isRecord(error)) {
+      return {};
+    }
+    const data = error.data;
+    if (!isRecord(data)) {
+      return {};
+    }
+
+    let firstAttemptData: unknown;
+    try {
+      firstAttemptData = data.firstAttempt;
+    } catch {
+      firstAttemptData = undefined;
+    }
+    const firstAttemptSummary = deriveConnectDiagnosticSummary(
+      firstAttemptData,
+      1,
+    );
+    const connectSummary = deriveConnectDiagnosticSummary(
+      data,
+      firstAttemptSummary ? 2 : 1,
+      errorMessage,
+    );
+
+    return {
+      ...(connectSummary ? { connect_summary: connectSummary } : {}),
+      ...(firstAttemptSummary
+        ? { first_attempt_summary: firstAttemptSummary }
+        : {}),
+    };
+  } catch {
+    // This is diagnostic-only enrichment; the original failure still surfaces.
+    return {};
+  }
+}
+
 /**
  * Spec-conformant passthrough fields hoisted onto super-mcp's outer use_tool
  * response block. The MCP spec carries `_meta` and `structuredContent` on the
@@ -1435,6 +1601,10 @@ export async function handleUseTool(
     registry.notifyActivity(package_id);
     const duration = Date.now() - startTime;
     const errorMessage = error instanceof Error ? error.message : String(error);
+    const connectDiagnostics = deriveAllowlistedConnectDiagnostics(
+      error,
+      errorMessage,
+    );
 
     if (
       error instanceof McpError
@@ -1548,6 +1718,7 @@ export async function handleUseTool(
         duration_ms: duration,
         original_error: errorMessage,
         args_provided: args ? Object.keys(args) : [],
+        ...connectDiagnostics,
       },
     };
   }

@@ -187,6 +187,7 @@ describe("GET /stats route shape", () => {
         connect_retry_count: 0,
         connect_retry_recovered_count: 0,
         connect_retry_failed_count: 0,
+        connect_retry_skipped_permanent_count: 0,
         idle_ms: null,
         last_activity_at: null,
       });
@@ -231,6 +232,7 @@ describe("GET /stats route shape", () => {
         connect_retry_count: 0,
         connect_retry_recovered_count: 0,
         connect_retry_failed_count: 0,
+        connect_retry_skipped_permanent_count: 0,
         pending_requests: false,
         last_activity_at: expect.any(Number),
       });
@@ -266,6 +268,7 @@ describe("GET /stats route shape", () => {
         connect_retry_count: 0,
         connect_retry_recovered_count: 0,
         connect_retry_failed_count: 0,
+        connect_retry_skipped_permanent_count: 0,
       });
     } finally {
       await server.close();

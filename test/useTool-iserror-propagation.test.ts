@@ -6,6 +6,7 @@ import { handleUseTool } from "../src/handlers/useTool.js";
 import { PackageRegistry } from "../src/registry.js";
 import { Catalog } from "../src/catalog.js";
 import { ValidationResult } from "../src/validator.js";
+import { ERROR_CODES } from "../src/types.js";
 
 function createUseToolMocks(toolResult: unknown) {
   const mockClient = {
@@ -152,5 +153,126 @@ describe("useTool isError propagation", () => {
       expect(response.isError).toBe(parsedInnerIsError);
       expect(response.isError).toBe(innerIsError);
     }
+  });
+});
+
+describe("useTool connect diagnostics", () => {
+  it("forwards only allowlisted connect diagnostics and never the stderr tail", async () => {
+    const sensitiveStderr = "synthetic connector output must not cross the boundary";
+    const connectError = Object.assign(
+      new Error("Failed to connect to MCP server 'pkg1': Request timed out (-32001)"),
+      {
+        data: {
+          stderrTail: sensitiveStderr,
+          spawnObservedThisCall: true,
+          spawnError: null,
+          childCloseObserved: false,
+          childExitCode: null,
+        },
+      },
+    );
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks({
+      content: [],
+    });
+    vi.spyOn(mockRegistry, "callTool").mockRejectedValue(connectError);
+
+    let thrown: unknown;
+    try {
+      await handleUseTool(
+        { package_id: "pkg1", tool_id: "tool1", args: {} },
+        mockRegistry,
+        mockCatalog,
+        mockValidator,
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toMatchObject({
+      code: ERROR_CODES.DOWNSTREAM_ERROR,
+      data: {
+        connect_summary: {
+          attempt: 1,
+          spawnObservedThisCall: true,
+          childCloseObserved: false,
+          childExitCode: null,
+          stderrPresent: true,
+          errorClass: "connect_timeout",
+        },
+      },
+    });
+    const serialized = JSON.stringify(thrown);
+    expect(serialized).not.toContain("stderrTail");
+    expect(serialized).not.toContain(sensitiveStderr);
+    expect(serialized).not.toContain("spawnError");
+  });
+
+  it("adds a separately allowlisted first-attempt summary on double failure", async () => {
+    const firstSensitiveStderr = "synthetic first-attempt connector output";
+    const secondSensitiveStderr = "synthetic second-attempt connector output";
+    const rawSpawnError = "spawn fictional-mcp ENOENT";
+    const connectError = Object.assign(
+      new Error("Failed to connect to MCP server 'pkg1': Connection closed"),
+      {
+        data: {
+          stderrTail: secondSensitiveStderr,
+          spawnObservedThisCall: false,
+          spawnError: null,
+          childCloseObserved: true,
+          childExitCode: 17,
+          firstAttempt: {
+            stderrTail: firstSensitiveStderr,
+            spawnObservedThisCall: true,
+            spawnError: rawSpawnError,
+            childCloseObserved: false,
+            childExitCode: null,
+          },
+        },
+      },
+    );
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks({
+      content: [],
+    });
+    vi.spyOn(mockRegistry, "callTool").mockRejectedValue(connectError);
+
+    let thrown: unknown;
+    try {
+      await handleUseTool(
+        { package_id: "pkg1", tool_id: "tool1", args: {} },
+        mockRegistry,
+        mockCatalog,
+        mockValidator,
+      );
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toMatchObject({
+      code: ERROR_CODES.DOWNSTREAM_ERROR,
+      data: {
+        connect_summary: {
+          attempt: 2,
+          spawnObservedThisCall: false,
+          childCloseObserved: true,
+          childExitCode: 17,
+          stderrPresent: true,
+          errorClass: "connection_closed",
+        },
+        first_attempt_summary: {
+          attempt: 1,
+          spawnObservedThisCall: true,
+          childCloseObserved: false,
+          childExitCode: null,
+          stderrPresent: true,
+          errorClass: "spawn_error",
+        },
+      },
+    });
+    const serialized = JSON.stringify(thrown);
+    expect(serialized).not.toContain("stderrTail");
+    expect(serialized).not.toContain(firstSensitiveStderr);
+    expect(serialized).not.toContain(secondSensitiveStderr);
+    expect(serialized).not.toContain("spawnError");
+    expect(serialized).not.toContain(rawSpawnError);
   });
 });
