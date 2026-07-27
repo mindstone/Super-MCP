@@ -8,6 +8,45 @@ import { SecurityPolicy, SecurityConfig, setSecurityPolicy } from "./security.js
 
 const logger = getLogger();
 
+function preserveFirstAttemptDiagnostics(
+  firstError: unknown,
+  secondError: unknown,
+  packageId: string,
+): void {
+  try {
+    if (
+      typeof firstError !== "object" ||
+      firstError === null ||
+      typeof secondError !== "object" ||
+      secondError === null
+    ) {
+      return;
+    }
+
+    const firstAttemptDiagnostics = (firstError as { data?: unknown }).data;
+    const secondAttemptDiagnostics = (secondError as { data?: unknown }).data;
+    if (
+      typeof firstAttemptDiagnostics !== "object" ||
+      firstAttemptDiagnostics === null ||
+      typeof secondAttemptDiagnostics !== "object" ||
+      secondAttemptDiagnostics === null
+    ) {
+      return;
+    }
+
+    (secondAttemptDiagnostics as Record<string, unknown>).firstAttempt =
+      firstAttemptDiagnostics;
+  } catch (enrichmentError) {
+    logger.warn("Failed to preserve first-attempt MCP connect diagnostics", {
+      package_id: packageId,
+      error:
+        enrichmentError instanceof Error
+          ? enrichmentError.message
+          : String(enrichmentError),
+    });
+  }
+}
+
 /**
  * Expands environment variables in a configuration object.
  * Supports ${VAR} syntax for environment variable substitution.
@@ -117,6 +156,10 @@ export interface ChildStatsEntry {
   eviction_count: number;
   /** Cumulative second connect attempts after an initial failure. */
   connect_retry_count: number;
+  /** Cumulative bounded second attempts that recovered the connection. */
+  connect_retry_recovered_count: number;
+  /** Cumulative bounded second attempts that also failed. */
+  connect_retry_failed_count: number;
   /** Cumulative pre-send liveness re-establishes in `callTool` (closed-transport recovery). */
   reestablish_count: number;
 }
@@ -148,6 +191,10 @@ export class PackageRegistry {
   private evictionCounts: Map<string, number> = new Map();
   /** Incremented exactly once when a failed initial connect starts its bounded retry. */
   private connectRetryCounts: Map<string, number> = new Map();
+  /** Incremented when the bounded second connect attempt succeeds. */
+  private connectRetryRecoveredCounts: Map<string, number> = new Map();
+  /** Incremented when the bounded second connect attempt also fails. */
+  private connectRetryFailedCounts: Map<string, number> = new Map();
   // `reestablishCounts` — incremented exactly once per pre-send liveness
   //   re-establish in `callTool` (the `isTransportClosed()` branch: a stdio
   //   transport closed BEFORE any bytes were sent, so we delete + recreate the
@@ -1127,7 +1174,21 @@ export class PackageRegistry {
         error: firstError instanceof Error ? firstError.message : String(firstError),
       });
 
-      return this.createAndConnectClient(packageId, config);
+      try {
+        const client = await this.createAndConnectClient(packageId, config);
+        this.connectRetryRecoveredCounts.set(
+          packageId,
+          (this.connectRetryRecoveredCounts.get(packageId) ?? 0) + 1,
+        );
+        return client;
+      } catch (secondError) {
+        this.connectRetryFailedCounts.set(
+          packageId,
+          (this.connectRetryFailedCounts.get(packageId) ?? 0) + 1,
+        );
+        preserveFirstAttemptDiagnostics(firstError, secondError, packageId);
+        throw secondError;
+      }
     }
   }
 
@@ -1355,6 +1416,8 @@ export class PackageRegistry {
         reap_count: this.reapCounts.get(pkg.id) ?? 0,
         eviction_count: this.evictionCounts.get(pkg.id) ?? 0,
         connect_retry_count: this.connectRetryCounts.get(pkg.id) ?? 0,
+        connect_retry_recovered_count: this.connectRetryRecoveredCounts.get(pkg.id) ?? 0,
+        connect_retry_failed_count: this.connectRetryFailedCounts.get(pkg.id) ?? 0,
         reestablish_count: this.reestablishCounts.get(pkg.id) ?? 0,
       };
     });

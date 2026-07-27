@@ -1,6 +1,6 @@
 {
   "name": "super-mcp-router",
-  "version": "2.7.4",
+  "version": "2.7.5",
   "description": "A local MCP router that aggregates multiple MCPs into a single interface for Claude",
   "private": false,
   "type": "module",

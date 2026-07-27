@@ -93,7 +93,11 @@ describe("PackageRegistry connect retry", () => {
 
     expect(createSpy).toHaveBeenCalledTimes(2);
     expect(internals.clientPromises.has(packageId)).toBe(false);
-    expect(registry.getChildStats()[0]?.connect_retry_count).toBe(1);
+    expect(registry.getChildStats()[0]).toMatchObject({
+      connect_retry_count: 1,
+      connect_retry_recovered_count: 1,
+      connect_retry_failed_count: 0,
+    });
     expect(loggerMock.warn).toHaveBeenCalledWith(
       "MCP client connect failed; retrying once",
       expect.objectContaining({
@@ -173,6 +177,92 @@ describe("PackageRegistry connect retry", () => {
         attempt: 1,
         error: "cleanup failed",
       }),
+    );
+  });
+
+  it("preserves both attempts' structured diagnostics when both connects fail", async () => {
+    const packageId = "GoogleWorkspace-acme";
+    const registry = createRegistry(packageId);
+    const internals = registry as unknown as RegistryInternals;
+    const firstClient = createMockClient();
+    const firstAttemptDiagnostics = {
+      packageId,
+      stderrTail: "first attempt stderr",
+      spawnObservedThisCall: true,
+      spawnError: "first spawn error",
+      childCloseObserved: false,
+      childExitCode: null,
+    };
+    const secondAttemptDiagnostics = {
+      packageId,
+      stderrTail: "second attempt stderr",
+      spawnObservedThisCall: false,
+      spawnError: null,
+      childCloseObserved: true,
+      childExitCode: null,
+    };
+    const firstError = Object.assign(
+      new Error(`Failed to connect to MCP server '${packageId}'.`),
+      { data: firstAttemptDiagnostics },
+    );
+    const secondError = Object.assign(
+      new Error(`Failed to connect to MCP server '${packageId}'.`),
+      { data: secondAttemptDiagnostics },
+    );
+    const createSpy = vi.spyOn(internals, "createAndConnectClient");
+
+    createSpy
+      .mockImplementationOnce(async (_id, _config, onClientCreated) => {
+        onClientCreated?.(firstClient);
+        throw firstError;
+      })
+      .mockRejectedValueOnce(secondError);
+
+    let thrown: unknown;
+    try {
+      await registry.getClient(packageId);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(thrown).toBe(secondError);
+    expect(secondError.data).toEqual({
+      ...secondAttemptDiagnostics,
+      firstAttempt: firstAttemptDiagnostics,
+    });
+    expect(registry.getChildStats()[0]).toMatchObject({
+      connect_retry_count: 1,
+      connect_retry_recovered_count: 0,
+      connect_retry_failed_count: 1,
+    });
+  });
+
+  it("never masks the second connect error when diagnostics cannot be enriched", async () => {
+    const packageId = "GoogleWorkspace-acme";
+    const registry = createRegistry(packageId);
+    const internals = registry as unknown as RegistryInternals;
+    const firstClient = createMockClient();
+    const firstError = Object.assign(
+      new Error(`Failed to connect to MCP server '${packageId}'.`),
+      { data: { stderrTail: "first attempt stderr" } },
+    );
+    const secondError = Object.assign(
+      new Error(`Failed to connect to MCP server '${packageId}'.`),
+      { data: Object.freeze({ stderrTail: "second attempt stderr" }) },
+    );
+    const createSpy = vi.spyOn(internals, "createAndConnectClient");
+
+    createSpy
+      .mockImplementationOnce(async (_id, _config, onClientCreated) => {
+        onClientCreated?.(firstClient);
+        throw firstError;
+      })
+      .mockRejectedValueOnce(secondError);
+
+    await expect(registry.getClient(packageId)).rejects.toBe(secondError);
+    expect(loggerMock.warn).toHaveBeenCalledWith(
+      "Failed to preserve first-attempt MCP connect diagnostics",
+      expect.objectContaining({ package_id: packageId }),
     );
   });
 
