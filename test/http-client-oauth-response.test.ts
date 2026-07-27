@@ -2,7 +2,11 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
-import { HttpMcpClient } from '../src/clients/httpClient.js';
+import {
+  HttpMcpClient,
+  OAUTH_DISCOVERY_TRACE_ERROR_MARKER,
+  classifyOAuthDiscoveryRequest,
+} from "../src/clients/httpClient.js";
 import { SimpleOAuthProvider } from '../src/auth/providers/simple.js';
 import { RefreshOnlyOAuthProvider } from '../src/auth/providers/refreshOnly.js';
 import type { PackageConfig } from '../src/types.js';
@@ -395,5 +399,171 @@ describe('HttpMcpClient cross-realm Response handling', () => {
 
     // Consumed and cleared — no stale carryover into a later invalidation.
     expect(provider.consumeLastOAuthError()).toBeUndefined();
+  });
+
+  describe("OAuth discovery failure trace", () => {
+    it("classifies path-relative and origin authorization-server discovery from pathname only", () => {
+      expect(
+        classifyOAuthDiscoveryRequest(
+          "https://mcp.swifteq.com/.well-known/oauth-authorization-server/api/mcp/sse?token=secret",
+        ),
+      ).toEqual({
+        kind: "authorization-server",
+        scope: "path-relative",
+      });
+      expect(classifyOAuthDiscoveryRequest("https://mcp.swifteq.com/.well-known/oauth-authorization-server")).toEqual({
+        kind: "authorization-server",
+        scope: "origin",
+      });
+      expect(classifyOAuthDiscoveryRequest("https://private-host.invalid/oauth/register")).toEqual({
+        kind: "registration",
+        scope: "path-relative",
+      });
+      expect(classifyOAuthDiscoveryRequest("https://private-host.invalid/jwks")).toEqual({
+        kind: "jwks",
+        scope: "origin",
+      });
+      expect(classifyOAuthDiscoveryRequest("https://private-host.invalid/oauth/token")).toEqual({
+        kind: "token",
+        scope: "path-relative",
+      });
+      expect(classifyOAuthDiscoveryRequest("https://private-host.invalid/.well-known/custom-discovery/tenant")).toEqual(
+        {
+          kind: "other-well-known",
+          scope: "path-relative",
+        },
+      );
+    });
+
+    it("records sanitized status classes at the transport fetch seam, including network errors", async () => {
+      const responses: Array<Response | Error> = [
+        new Response(null, { status: 204 }),
+        new Response(null, { status: 302 }),
+        new Response(null, { status: 404 }),
+        new Response(null, { status: 503 }),
+        new Error("synthetic network failure"),
+      ];
+      globalThis.fetch = vi.fn(async () => {
+        const next = responses.shift();
+        if (next instanceof Error) {
+          throw next;
+        }
+        return next!;
+      }) as unknown as typeof fetch;
+
+      const client = new HttpMcpClient(
+        "test-oauth-discovery-statuses",
+        oauthHttpPackage("test-oauth-discovery-statuses"),
+      );
+      const options = (client as any).getTransportOptions() as {
+        fetch: typeof fetch;
+      };
+      const urls = [
+        "https://private-host.invalid/.well-known/oauth-protected-resource",
+        "https://private-host.invalid/.well-known/oauth-authorization-server",
+        "https://private-host.invalid/.well-known/openid-configuration",
+        "https://private-host.invalid/register",
+        "https://private-host.invalid/token",
+      ];
+
+      for (const url of urls.slice(0, -1)) {
+        await options.fetch(url);
+      }
+      await expect(options.fetch(urls.at(-1)!)).rejects.toThrow("synthetic network failure");
+
+      expect((client as any).getOAuthDiscoveryTrace()).toEqual([
+        expect.objectContaining({
+          kind: "protected-resource",
+          scope: "origin",
+          statusClass: "2xx",
+        }),
+        expect.objectContaining({
+          kind: "authorization-server",
+          scope: "origin",
+          statusClass: "3xx",
+        }),
+        expect.objectContaining({
+          kind: "openid-configuration",
+          scope: "origin",
+          statusClass: "4xx",
+        }),
+        expect.objectContaining({
+          kind: "registration",
+          scope: "origin",
+          statusClass: "5xx",
+        }),
+        expect.objectContaining({
+          kind: "token",
+          scope: "origin",
+          statusClass: "network-error",
+        }),
+      ]);
+    });
+
+    it("evicts the oldest discovery entries beyond the ten-entry capacity", async () => {
+      let timestampMs = 1_000;
+      vi.spyOn(Date, "now").mockImplementation(() => timestampMs++);
+      globalThis.fetch = vi.fn(async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
+
+      const client = new HttpMcpClient("test-oauth-discovery-ring", oauthHttpPackage("test-oauth-discovery-ring"));
+      const options = (client as any).getTransportOptions() as {
+        fetch: typeof fetch;
+      };
+
+      for (let index = 0; index < 12; index += 1) {
+        await options.fetch(
+          `https://private-host.invalid/.well-known/oauth-authorization-server/private-path-${index}`,
+        );
+      }
+
+      const trace = (client as any).getOAuthDiscoveryTrace();
+      expect(trace).toHaveLength(10);
+      expect(trace.map((entry: { timestampMs: number }) => entry.timestampMs)).toEqual([
+        1_002, 1_003, 1_004, 1_005, 1_006, 1_007, 1_008, 1_009, 1_010, 1_011,
+      ]);
+      expect(trace.every((entry: { scope: string }) => entry.scope === "path-relative")).toBe(true);
+    });
+
+    it("attaches only the bounded classification trace to an OAuth error", async () => {
+      globalThis.fetch = vi.fn(async () => new Response(null, { status: 404 })) as unknown as typeof fetch;
+
+      const client = new HttpMcpClient(
+        "test-oauth-discovery-redaction",
+        oauthHttpPackage("test-oauth-discovery-redaction"),
+      );
+      (client as any).initializeOAuthIfNeeded = vi.fn();
+      (client as any).connect = vi.fn(async () => {
+        const options = (client as any).getTransportOptions() as {
+          fetch: typeof fetch;
+        };
+        await options.fetch(
+          "https://mcp.swifteq.com/.well-known/oauth-authorization-server/api/mcp/sse?access_token=secret",
+        );
+        throw new Error("fetch failed");
+      });
+
+      let error: Error & { oauthDiscoveryTrace?: unknown };
+      try {
+        await client.connectWithOAuth();
+        throw new Error("Expected connectWithOAuth to fail");
+      } catch (caught) {
+        error = caught as Error & { oauthDiscoveryTrace?: unknown };
+      }
+      const serialized = JSON.stringify(error.oauthDiscoveryTrace);
+
+      expect(error.message).toContain(OAUTH_DISCOVERY_TRACE_ERROR_MARKER);
+      expect(error.message).not.toContain("swifteq");
+      expect(serialized).not.toContain("swifteq");
+      expect(serialized).not.toContain("access_token");
+      expect(serialized).not.toContain("secret");
+      expect(serialized).not.toContain("/api/mcp/sse");
+      expect(error.oauthDiscoveryTrace).toEqual([
+        expect.objectContaining({
+          kind: "authorization-server",
+          scope: "path-relative",
+          statusClass: "4xx",
+        }),
+      ]);
+    });
   });
 });
