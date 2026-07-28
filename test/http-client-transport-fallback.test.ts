@@ -4,6 +4,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { HttpMcpClient } from '../src/clients/httpClient.js';
 import { SimpleOAuthProvider } from '../src/auth/providers/simple.js';
+import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import type { PackageConfig } from '../src/types.js';
 
 const mockLogger = vi.hoisted(() => ({
@@ -215,6 +217,117 @@ describe('HttpMcpClient SSE -> StreamableHTTP transport fallback', () => {
     expect((client as any).usedStreamableHttpFallback).toBe(false);
     expect(warnCallsText()).not.toContain('Streamable HTTP');
   });
+
+  it('R1: auth-like fallback error propagates unwrapped with no error-level log', async () => {
+    // SSE 405 -> StreamableHTTP fallback -> POST initialize 401 (no auth provider)
+    // -> SDK throws StreamableHTTPError whose message contains "Unauthorized"
+    // (auth-like). connect() must rethrow the ORIGINAL error unwrapped (no
+    // "Transport negotiation failed" wrap) and log at debug, not error.
+    const calls: FetchCall[] = [];
+    globalThis.fetch = vi.fn(async (url: any, init?: RequestInit) => {
+      const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url;
+      const method = init?.method ?? 'GET';
+      calls.push({ url: urlStr, method, body: typeof init?.body === 'string' ? init.body : undefined });
+
+      if (urlStr === MCP_URL && method === 'GET') {
+        return new Response(null, { status: 405, statusText: 'Method Not Allowed', headers: { allow: 'POST, OPTIONS' } });
+      }
+      if (urlStr === MCP_URL && method === 'POST') {
+        const body = parseBody(init);
+        if (body?.method === 'initialize') {
+          // No auth provider on the transport -> SDK throws StreamableHTTPError
+          // with the response body in the message ("Unauthorized" -> auth-like).
+          return new Response('Unauthorized', {
+            status: 401,
+            headers: { 'content-type': 'text/plain' },
+          });
+        }
+        return new Response(null, { status: 202 });
+      }
+      return new Response(null, { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const client = new HttpMcpClient('swifteq-authlike', ssePackage('swifteq-authlike'));
+
+    let caught: unknown;
+    await client.connect().catch((e) => { caught = e; });
+
+    expect(caught, 'connect() threw the fallback error').toBeInstanceOf(Error);
+    const caughtErr = caught as Error;
+    expect(caughtErr.message, 'original auth-like error propagated unwrapped').not.toContain('Transport negotiation failed');
+    expect(caughtErr.message.toLowerCase(), 'original auth-like message preserved').toContain('unauthorized');
+    expect((caught as Error).name, 'error name preserved (not a generic wrap)').toBe(StreamableHTTPError.prototype.name || 'Error');
+
+    // The fallback-failure error log must NOT fire on the auth-like path; only debug.
+    const errorCallsText = mockLogger.error.mock.calls.map((c: unknown[]) => String(c[0] ?? '')).join('\n');
+    expect(errorCallsText, 'no "fallback also failed" error log on auth-like path').not.toContain('fallback also failed');
+    expect(mockLogger.error, 'no error-level log on the auth-like fallback path').not.toHaveBeenCalled();
+    expect(mockLogger.debug).toHaveBeenCalled();
+  });
+
+  it('R4: after a successful fallback a second connect() does not re-fallback or re-GET SSE', async () => {
+    // First connect: SSE 405 -> StreamableHTTP POST initialize 200 (fallback
+    // succeeds). Then simulate a reconnect (isConnected=false) and call
+    // connect() again: usedStreamableHttpFallback is true -> createTransport()
+    // returns StreamableHTTP (no SSE GET) and the SSE->StreamableHTTP fallback
+    // branch is guarded out. Assert exactly one SSE GET total and exactly one
+    // fallback warn across the whole sequence.
+    const calls: FetchCall[] = [];
+    globalThis.fetch = vi.fn(async (url: any, init?: RequestInit) => {
+      const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url;
+      const method = init?.method ?? 'GET';
+      calls.push({ url: urlStr, method, body: typeof init?.body === 'string' ? init.body : undefined });
+
+      if (urlStr === MCP_URL && method === 'GET') {
+        return new Response(null, { status: 405, statusText: 'Method Not Allowed', headers: { allow: 'POST, OPTIONS' } });
+      }
+      if (urlStr === MCP_URL && method === 'POST') {
+        const body = parseBody(init);
+        if (body?.method === 'initialize') {
+          return new Response(makeInitializeResult(body.id), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(null, { status: 202 });
+      }
+      return new Response(null, { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const client = new HttpMcpClient('swifteq-loopfree', ssePackage('swifteq-loopfree'));
+    await client.connect();
+    expect((client as any).usedStreamableHttpFallback).toBe(true);
+    expect(
+      (client as any).transport instanceof StreamableHTTPClientTransport,
+      'first connect used StreamableHTTP after fallback',
+    ).toBe(true);
+    const firstWarnCount = mockLogger.warn.mock.calls.length;
+    const firstFallbackWarns = warnCallsText().split('Streamable HTTP transport failed, falling back').length - 1;
+
+    // Simulate a reconnect: the host dropped the connection but the client
+    // instance (and its fallback flag) is reused. close() resets the SDK
+    // Client so a fresh connect() can attach a new transport.
+    await client.close();
+    await client.connect();
+
+    expect(client.isConnected).toBe(true);
+    // The reused client must NOT enter the SSE->StreamableHTTP fallback branch
+    // again (usedStreamableHttpFallback guard) and must NOT create an SSE
+    // transport (createTransport() returns StreamableHTTP while the flag is set).
+    const recreated = (client as any).transport;
+    expect(
+      recreated instanceof StreamableHTTPClientTransport,
+      'second connect reused StreamableHTTP (no SSE transport created)',
+    ).toBe(true);
+    expect(
+      !(recreated instanceof SSEClientTransport),
+      'second connect did not create an SSE transport',
+    ).toBe(true);
+    // No additional fallback warn on the second connect.
+    const secondFallbackWarns = warnCallsText().split('Streamable HTTP transport failed, falling back').length - 1;
+    expect(secondFallbackWarns, 'no second fallback warn').toBe(firstFallbackWarns);
+    expect(mockLogger.warn.mock.calls.length, 'no new warn calls on second connect').toBe(firstWarnCount);
+  });
 });
 
 const AS_METADATA = {
@@ -323,13 +436,124 @@ describe('HttpMcpClient SSE -> StreamableHTTP fallback with OAuth discovery', ()
     }) as unknown as typeof fetch;
 
     // connectWithOAuth: SSE 405 -> fallback to StreamableHTTP -> 401 -> auth flow -> redirect.
-    // The redirect path throws UnauthorizedError (wrapped in a combined transport-negotiation
-    // error from connect()), which connectWithOAuth treats as "redirect initiated" and
-    // returns without throwing.
+    // The redirect path throws UnauthorizedError; connect() surfaces it unwrapped on the
+    // auth-like fallback path (R1), and connectWithOAuth treats it as "redirect initiated"
+    // and returns without throwing.
     await expect(client.connectWithOAuth()).resolves.toBeUndefined();
 
     expect(provider.redirectCalled, 'redirectToAuthorization was invoked').toBe(true);
     expect((client as any).usedStreamableHttpFallback).toBe(true);
-    expect((client as any).oauthDiscoveryTrace.length, 'discovery trace preserved across fallback').toBeGreaterThan(0);
+    const trace: Array<{ kind: string; scope: string; statusClass: string }> = (client as any).oauthDiscoveryTrace;
+    expect(trace.length, 'discovery trace preserved across fallback').toBeGreaterThan(0);
+    // Pin the discovery sequence kinds, not just presence: a protected-resource
+    // 4xx from the PRM probe and an authorization-server 2xx from the AS-metadata
+    // fetch must both appear (the fallback leg ran discovery).
+    expect(
+      trace.some((e) => e.kind === 'protected-resource' && e.statusClass === '4xx'),
+      'PRM probe (protected-resource 4xx) recorded',
+    ).toBe(true);
+    expect(
+      trace.some((e) => e.kind === 'authorization-server' && e.statusClass === '2xx'),
+      'AS metadata fetch (authorization-server 2xx) recorded',
+    ).toBe(true);
+  });
+
+  it('R3: finishOAuth() recreates transport via StreamableHTTP after SSE->StreamableHTTP fallback', async () => {
+    // After a successful SSE->StreamableHTTP fallback that reaches the OAuth
+    // redirect, finishOAuth(code) must recreate the transport via StreamableHTTP
+    // (not SSE) — pinning the usedStreamableHttpFallback-through-finishOAuth
+    // persistence invariant. Mock finishAuth on the fallback transport so the
+    // token-exchange internals are short-circuited; assert the recreated
+    // transport is a StreamableHTTPClientTransport and that no second SSE GET
+    // to the MCP endpoint occurs during finishOAuth's reconnect.
+    const provider = new NoBrowserOAuthProvider('swifteq-finish', 5199);
+    await provider.initialize();
+
+    const config: PackageConfig = {
+      id: 'swifteq-finish',
+      name: 'swifteq-finish',
+      transport: 'http',
+      transportType: 'sse',
+      base_url: MCP_URL,
+      oauth: true,
+      visibility: 'default',
+    };
+    const client = new HttpMcpClient('swifteq-finish', config, { oauthProvider: provider });
+
+    const calls: FetchCall[] = [];
+    let postInitializeCount = 0;
+    globalThis.fetch = vi.fn(async (url: any, init?: RequestInit) => {
+      const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url;
+      const method = init?.method ?? 'GET';
+      calls.push({ url: urlStr, method, body: typeof init?.body === 'string' ? init.body : undefined });
+
+      if (urlStr === MCP_URL && method === 'GET') {
+        return new Response(null, { status: 405, statusText: 'Method Not Allowed', headers: { allow: 'POST, OPTIONS' } });
+      }
+      if (urlStr === MCP_URL && method === 'POST') {
+        const body = parseBody(init);
+        if (body?.method === 'initialize') {
+          postInitializeCount += 1;
+          // 1st POST initialize (during fallback leg) -> 401 triggers auth -> redirect.
+          // 2nd POST initialize (during finishOAuth reconnect) -> 200 success.
+          if (postInitializeCount === 1) {
+            return new Response('Unauthorized', {
+              status: 401,
+              headers: { 'www-authenticate': 'Bearer realm="https://auth.swifteq.com/"' },
+            });
+          }
+          return new Response(makeInitializeResult(body.id), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response(null, { status: 202 });
+      }
+      if (urlStr.includes('/.well-known/oauth-protected-resource')) {
+        return new Response(null, { status: 404 });
+      }
+      if (urlStr === 'https://mcp.swifteq.com/.well-known/oauth-authorization-server') {
+        return new Response(JSON.stringify(AS_METADATA), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      if (urlStr.includes('/.well-known/openid-configuration')) {
+        return new Response(null, { status: 404 });
+      }
+      if (urlStr === 'https://mcp.swifteq.com/api/mcp/register' && method === 'POST') {
+        return new Response(JSON.stringify(DCR_RESPONSE), { status: 201, headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(null, { status: 404 });
+    }) as unknown as typeof fetch;
+
+    // Reach the OAuth redirect via the SSE->StreamableHTTP fallback.
+    await expect(client.connectWithOAuth()).resolves.toBeUndefined();
+    expect((client as any).usedStreamableHttpFallback).toBe(true);
+    const sseGetsBeforeFinish = calls.filter((c) => c.method === 'GET' && c.url === MCP_URL).length;
+    expect(sseGetsBeforeFinish, 'exactly one SSE GET before finishOAuth').toBe(1);
+
+    // Mock finishAuth on the fallback transport so finishOAuth's token-exchange
+    // is short-circuited; the reconnect still runs createTransport() +
+    // connectWithTimeout() against the (mocked) fetch.
+    const fallbackTransport = (client as any).transport;
+    expect(fallbackTransport, 'fallback transport was set').toBeDefined();
+    vi.spyOn(fallbackTransport, 'finishAuth').mockResolvedValue(undefined);
+
+    await client.finishOAuth('test-auth-code');
+
+    expect(client.isConnected, 'finishOAuth reconnected').toBe(true);
+    // The recreated transport must be StreamableHTTP (not SSE).
+    const recreatedTransport = (client as any).transport;
+    expect(
+      recreatedTransport instanceof StreamableHTTPClientTransport,
+      'recreated transport is StreamableHTTPClientTransport',
+    ).toBe(true);
+    expect(
+      !(recreatedTransport instanceof SSEClientTransport),
+      'recreated transport is not SSEClientTransport',
+    ).toBe(true);
+    // No second SSE GET during finishOAuth's reconnect.
+    const sseGetsAfterFinish = calls.filter((c) => c.method === 'GET' && c.url === MCP_URL).length;
+    expect(sseGetsAfterFinish, 'no second SSE GET during finishOAuth').toBe(sseGetsBeforeFinish);
+    // A second POST initialize did happen (the reconnect via StreamableHTTP).
+    expect(postInitializeCount, 'finishOAuth reconnected via a StreamableHTTP POST initialize').toBe(2);
   });
 });

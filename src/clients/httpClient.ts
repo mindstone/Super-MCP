@@ -580,15 +580,31 @@ export class HttpMcpClient implements McpClient {
           });
           return;
         } catch (fallbackError) {
+          const fallbackErrorMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+          // Auth-like errors on the fallback leg are the EXPECTED OAuth-redirect
+          // outcome (the SDK threw UnauthorizedError / "redirect initiated" after
+          // redirectToAuthorization), not a fallback failure. Surface the original
+          // error unwrapped so downstream classification (error name + message
+          // substring in connectWithOAuth / registry / authenticate) survives SDK
+          // message churn. Only genuine negotiation failures get the error-log +
+          // "Transport negotiation failed" wrap.
+          if (this.isAuthLikeErrorMessage(fallbackErrorMessage)) {
+            logger.debug("SSE fallback reached OAuth redirect (expected)", {
+              package_id: this.packageId,
+              original_error: errorMessage,
+              fallback_error: fallbackErrorMessage,
+            });
+            throw fallbackError;
+          }
           logger.error("SSE fallback also failed", {
             package_id: this.packageId,
             original_error: errorMessage,
-            fallback_error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+            fallback_error: fallbackErrorMessage,
           });
           // Continue to throw the original error with fallback context
           throw new Error(
             `Transport negotiation failed. Original: ${errorMessage}. ` +
-            `SSE fallback: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`
+            `SSE fallback: ${fallbackErrorMessage}`
           );
         }
       }
@@ -639,14 +655,31 @@ export class HttpMcpClient implements McpClient {
           });
           return;
         } catch (fallbackError) {
+          const fallbackErrorMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+          // Auth-like errors on the fallback leg are the EXPECTED OAuth-redirect
+          // outcome (the SDK threw UnauthorizedError / "redirect initiated" after
+          // redirectToAuthorization), not a fallback failure. Surface the original
+          // error unwrapped so downstream classification (error name + message
+          // substring in connectWithOAuth / registry / authenticate) survives SDK
+          // message churn. Only genuine negotiation failures get the error-log +
+          // "Transport negotiation failed" wrap. Mirrors the SSE-fallback branch
+          // above.
+          if (this.isAuthLikeErrorMessage(fallbackErrorMessage)) {
+            logger.debug("Streamable HTTP fallback reached OAuth redirect (expected)", {
+              package_id: this.packageId,
+              original_error: errorMessage,
+              fallback_error: fallbackErrorMessage,
+            });
+            throw fallbackError;
+          }
           logger.error("Streamable HTTP fallback also failed", {
             package_id: this.packageId,
             original_error: errorMessage,
-            fallback_error: fallbackError instanceof Error ? fallbackError.message : String(fallbackError),
+            fallback_error: fallbackErrorMessage,
           });
           throw new Error(
             `Transport negotiation failed. Original: ${errorMessage}. ` +
-            `Streamable HTTP fallback: ${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`
+            `Streamable HTTP fallback: ${fallbackErrorMessage}`
           );
         }
       }
@@ -957,10 +990,23 @@ export class HttpMcpClient implements McpClient {
       }
 
       // Mirror: explicit-SSE configs that hit an auth-like error on the SSE leg
-      // (without having started a redirect) retry once via Streamable HTTP. This
-      // is the connectWithOAuth() counterpart to the connect() SSE->StreamableHTTP
+      // (without having started a redirect) retry once via Streamable HTTP. This is
+      // the connectWithOAuth() counterpart to the connect() SSE->StreamableHTTP
       // negotiation-error fallback. ONE retry only; no fallback if a redirect
       // already started or a prior fallback already fired.
+      //
+      // Defensive mirror of the pre-existing StreamableHTTP->SSE branch above
+      // (:945-957). In the common shapes this branch is effectively unreachable:
+      // for a negotiation-shaped SSE 404/405, connect()'s own SSE->StreamableHTTP
+      // fallback fires first and sets usedStreamableHttpFallback (so the
+      // `!usedStreamableHttpFallback` guard below is false); for an SSE 401, the
+      // SDK's _authThenStart runs auth() and either starts a redirect
+      // (hasStartedRedirect() true -> guard false) or throws a non-auth-like
+      // discovery/DCR error (first condition false). The one shape it would catch
+      // is an auth-like error on the SSE leg without a started redirect and
+      // without the negotiation fallback having fired — kept as a defensive
+      // counterpart to the symmetric pre-existing branch. No test: no confirmed
+      // real firing shape.
       if (this.isAuthLikeErrorMessage(authError.message) &&
           !this.simpleOAuthProvider?.hasStartedRedirect() &&
           this.config.transportType === "sse" &&
