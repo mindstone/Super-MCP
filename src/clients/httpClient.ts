@@ -305,8 +305,17 @@ export interface HttpMcpClientOptions {
 
 // Default timeout for connect() to prevent hanging on unresponsive OAuth
 // discovery endpoints or slow MCP servers. Covers the full transport
-// negotiation + OAuth token refresh cycle.
-const CONNECT_TIMEOUT_MS = 30_000;
+// negotiation + OAuth token refresh cycle. Exported so the OAuth budget
+// invariant test can assert the sum of inner legs stays inside the desktop
+// host's outer authenticate budget.
+export const CONNECT_TIMEOUT_MS = 30_000;
+
+// Bounds the OAuth token exchange (transport.finishAuth) so a hung token
+// endpoint fails fast instead of consuming the desktop host's whole outer
+// authenticate budget (AUTHENTICATE_TOOL_TIMEOUT_MS in the app repo's
+// src/main/services/mcpService.ts, which outer-bounds this leg plus the
+// callback wait, post-exchange reconnect, and health check).
+export const FINISH_AUTH_TIMEOUT_MS = 30_000;
 
 export class HttpMcpClient implements McpClient {
   private client: Client;
@@ -880,7 +889,28 @@ export class HttpMcpClient implements McpClient {
     });
 
     if ('finishAuth' in this.transport && typeof this.transport.finishAuth === 'function') {
-      await this.transport.finishAuth(authCode);
+      // finishAuth has no timeout of its own; unbounded, a hung token endpoint
+      // would eat the desktop host's outer authenticate budget and report the
+      // user's completed sign-in as a timeout.
+      const finishAuthPromise = Promise.resolve(this.transport.finishAuth(authCode));
+      let finishAuthTimer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          finishAuthPromise,
+          new Promise<never>((_, reject) => {
+            finishAuthTimer = setTimeout(
+              () => reject(new Error(`OAuth token exchange timed out after ${FINISH_AUTH_TIMEOUT_MS}ms`)),
+              FINISH_AUTH_TIMEOUT_MS
+            );
+          }),
+        ]);
+      } finally {
+        if (finishAuthTimer !== undefined) {
+          clearTimeout(finishAuthTimer);
+        }
+        // Suppress a late rejection from the losing promise after a timeout win
+        finishAuthPromise.catch(() => {});
+      }
       logger.info("OAuth token exchange completed", { package_id: this.packageId });
 
       // A completed browser re-auth means any prior dead-grant marker is now

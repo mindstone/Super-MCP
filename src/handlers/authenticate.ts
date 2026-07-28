@@ -10,6 +10,17 @@ import { getValidator } from "../validator.js";
 const logger = getLogger();
 const STDIO_AUTH_DELEGATION_TIMEOUT_MS = 60_000;
 
+// Budget legs of the wait_for_completion OAuth path. The desktop host bounds the
+// WHOLE handleAuthenticate call with AUTHENTICATE_TOOL_TIMEOUT_MS (app repo:
+// src/main/services/mcpService.ts) — if you change either constant here, or
+// FINISH_AUTH_TIMEOUT_MS / CONNECT_TIMEOUT_MS in ../clients/httpClient.ts, the
+// desktop constant and src/handlers/__tests__/oauthBudgetInvariant.test.ts must
+// move with it.
+// 5 minutes — OAuth flows can take time (login, 2FA, permissions review,
+// workspace selection).
+export const OAUTH_CALLBACK_TIMEOUT_MS = 300_000;
+export const HEALTH_CHECK_TIMEOUT_MS = 20_000;
+
 type AuthDelegationToolCandidate = {
   name?: unknown;
   inputSchema?: unknown;
@@ -440,9 +451,12 @@ export async function handleAuthenticate(
       logger.info("Waiting for OAuth callback", { package_id });
       
       try {
-        // Wait for callback with state validation for CSRF protection
-        // 5 minutes timeout - OAuth flows can take time (login, 2FA, permissions review, workspace selection)
-        const callbackPromise = callbackServer.waitForCallback(300000, oauthState);
+        // Wait for callback with state validation for CSRF protection.
+        // Outer bound: the desktop host budgets this whole call (callback wait +
+        // finishOAuth token exchange + reconnect + health check) with
+        // AUTHENTICATE_TOOL_TIMEOUT_MS in src/main/services/mcpService.ts —
+        // that constant must strictly exceed the sum of these inner legs.
+        const callbackPromise = callbackServer.waitForCallback(OAUTH_CALLBACK_TIMEOUT_MS, oauthState);
         
         // Create a promise that rejects early if connectWithOAuth fails with a fatal error.
         // Without this, a DCR failure or connect timeout would silently fail and the callback
@@ -488,8 +502,8 @@ export async function handleAuthenticate(
         let health: "ok" | "error" | "needs_auth" | "timeout" = "timeout";
         try {
           const healthPromise = httpClient.healthCheck ? httpClient.healthCheck() : Promise.resolve("ok" as const);
-          const timeoutPromise = new Promise<"timeout">((resolve) => 
-            setTimeout(() => resolve("timeout"), 20000)
+          const timeoutPromise = new Promise<"timeout">((resolve) =>
+            setTimeout(() => resolve("timeout"), HEALTH_CHECK_TIMEOUT_MS)
           );
           health = await Promise.race([healthPromise, timeoutPromise]);
         } catch (err) {
