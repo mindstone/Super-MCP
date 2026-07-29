@@ -317,6 +317,20 @@ export const CONNECT_TIMEOUT_MS = 30_000;
 // callback wait, post-exchange reconnect, and health check).
 export const FINISH_AUTH_TIMEOUT_MS = 30_000;
 
+// Machine code carried on the finishAuth timeout rejection so
+// handleAuthenticate can classify it as a fatal outcome WITHOUT matching on
+// message strings (audit F1, Stage 7 of the app repo's
+// docs/plans/260728_mcp-connector-setup-failures: the message-only rejection
+// was swallowed as non-fatal and reported as "auth_required").
+export const OAUTH_FINISH_AUTH_TIMEOUT_CODE = "OAUTH_FINISH_AUTH_TIMEOUT";
+
+// Default SDK request timeout for listTools (env override:
+// SUPER_MCP_LIST_TOOLS_TIMEOUT). Exported because healthCheck() delegates to
+// listTools(), making this the bound on BOTH health-check legs of the
+// authenticate pre-check path — a leg of the OAuth budget invariant
+// (src/handlers/__tests__/oauthBudgetInvariant.test.ts).
+export const LIST_TOOLS_TIMEOUT_MS = 10_000;
+
 export class HttpMcpClient implements McpClient {
   private client: Client;
   private transport?: SSEClientTransport | StreamableHTTPClientTransport;
@@ -686,7 +700,7 @@ export class HttpMcpClient implements McpClient {
       throw new Error(`Package '${this.packageId}' is not connected`);
     }
 
-    const timeout = parseInt(process.env.SUPER_MCP_LIST_TOOLS_TIMEOUT || '10000');
+    const timeout = parseInt(process.env.SUPER_MCP_LIST_TOOLS_TIMEOUT || String(LIST_TOOLS_TIMEOUT_MS));
 
     logger.info("Listing tools from HTTP MCP", {
       package_id: this.packageId,
@@ -898,10 +912,15 @@ export class HttpMcpClient implements McpClient {
         await Promise.race([
           finishAuthPromise,
           new Promise<never>((_, reject) => {
-            finishAuthTimer = setTimeout(
-              () => reject(new Error(`OAuth token exchange timed out after ${FINISH_AUTH_TIMEOUT_MS}ms`)),
-              FINISH_AUTH_TIMEOUT_MS
-            );
+            finishAuthTimer = setTimeout(() => {
+              const timeoutError = new Error(
+                `OAuth token exchange timed out after ${FINISH_AUTH_TIMEOUT_MS}ms`
+              );
+              // Machine-classifiable marker — handleAuthenticate keys its fatal
+              // classification off this code, never the message text.
+              (timeoutError as NodeJS.ErrnoException).code = OAUTH_FINISH_AUTH_TIMEOUT_CODE;
+              reject(timeoutError);
+            }, FINISH_AUTH_TIMEOUT_MS);
           }),
         ]);
       } finally {

@@ -16,6 +16,13 @@ const PERMANENT_CONNECT_MESSAGE_PATTERNS = [
 ];
 const MAX_ERROR_CAUSE_NODES = 8;
 
+// Connect attempts per getClient() miss: one initial connect + the single
+// retry in createAndConnectClientWithOneRetry. Exported so the OAuth budget
+// invariant (src/handlers/__tests__/oauthBudgetInvariant.test.ts) can sum the
+// real worst-case reconnect leg (REGISTRY_CONNECT_ATTEMPTS × CONNECT_TIMEOUT_MS).
+// If the retry structure changes, this constant must move with it.
+export const REGISTRY_CONNECT_ATTEMPTS = 2;
+
 function isPermanentConnectFailure(error: unknown): boolean {
   try {
     const pending: unknown[] = [error];

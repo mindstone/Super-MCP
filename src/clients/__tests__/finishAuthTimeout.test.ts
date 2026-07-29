@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { HttpMcpClient, FINISH_AUTH_TIMEOUT_MS } from "../httpClient.js";
+import { HttpMcpClient, FINISH_AUTH_TIMEOUT_MS, OAUTH_FINISH_AUTH_TIMEOUT_CODE } from "../httpClient.js";
 import type { PackageConfig } from "../../types.js";
 
 // Stage 4 of docs/plans/260728_mcp-connector-setup-failures (app repo):
@@ -47,9 +47,13 @@ describe("finishOAuth token-exchange timeout", () => {
     (client as any).transport = { finishAuth: () => new Promise(() => {}) };
 
     const finishPromise = client.finishOAuth("auth-code-hung");
-    const assertion = expect(finishPromise).rejects.toThrow(
-      `OAuth token exchange timed out after ${FINISH_AUTH_TIMEOUT_MS}ms`
-    );
+    // The rejection must carry the machine code — handleAuthenticate classifies
+    // the timeout by code, never by message text (audit F1). The handler-level
+    // half lives in src/handlers/__tests__/authenticateFinishAuthTimeout.test.ts.
+    const assertion = expect(finishPromise).rejects.toMatchObject({
+      message: `OAuth token exchange timed out after ${FINISH_AUTH_TIMEOUT_MS}ms`,
+      code: OAUTH_FINISH_AUTH_TIMEOUT_CODE,
+    });
 
     await vi.advanceTimersByTimeAsync(FINISH_AUTH_TIMEOUT_MS);
     await assertion;

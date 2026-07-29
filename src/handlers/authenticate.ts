@@ -3,6 +3,7 @@ import { Catalog } from "../catalog.js";
 import { getLogger } from "../logging.js";
 import { findAvailablePort, checkPortAvailable } from "../utils/portFinder.js";
 import { SimpleOAuthProvider } from "../auth/providers/simple.js";
+import { OAUTH_FINISH_AUTH_TIMEOUT_CODE } from "../clients/httpClient.js";
 import { formatError } from "../utils/formatError.js";
 import { coerceStringifiedBoolean } from "../utils/normalizeInput.js";
 import { getValidator } from "../validator.js";
@@ -12,14 +13,25 @@ const STDIO_AUTH_DELEGATION_TIMEOUT_MS = 60_000;
 
 // Budget legs of the wait_for_completion OAuth path. The desktop host bounds the
 // WHOLE handleAuthenticate call with AUTHENTICATE_TOOL_TIMEOUT_MS (app repo:
-// src/main/services/mcpService.ts) — if you change either constant here, or
-// FINISH_AUTH_TIMEOUT_MS / CONNECT_TIMEOUT_MS in ../clients/httpClient.ts, the
+// src/main/services/mcpService.ts) — if you change any constant here, or
+// FINISH_AUTH_TIMEOUT_MS / CONNECT_TIMEOUT_MS / LIST_TOOLS_TIMEOUT_MS in
+// ../clients/httpClient.ts, or REGISTRY_CONNECT_ATTEMPTS in ../registry.ts, the
 // desktop constant and src/handlers/__tests__/oauthBudgetInvariant.test.ts must
-// move with it.
+// move with it. The pre-check leg is branch-aware: registry.getClient() may
+// health-check a cached client (LIST_TOOLS_TIMEOUT_MS) and reconnect with one
+// retry (REGISTRY_CONNECT_ATTEMPTS × CONNECT_TIMEOUT_MS) BEFORE the handler's
+// own health check + listTools race below.
 // 5 minutes — OAuth flows can take time (login, 2FA, permissions review,
 // workspace selection).
 export const OAUTH_CALLBACK_TIMEOUT_MS = 300_000;
 export const HEALTH_CHECK_TIMEOUT_MS = 20_000;
+
+// Defaults for the pre-check listTools race (env override:
+// SUPER_MCP_LIST_TOOLS_TIMEOUT_MS). Windows needs a longer default because of
+// antivirus/firewall checks on cold-start; the Windows value is the worst case
+// the OAuth budget invariant sums.
+export const PRE_CHECK_LIST_TOOLS_TIMEOUT_WINDOWS_MS = 30_000;
+export const PRE_CHECK_LIST_TOOLS_TIMEOUT_DEFAULT_MS = 10_000;
 
 type AuthDelegationToolCandidate = {
   name?: unknown;
@@ -292,7 +304,9 @@ export async function handleAuthenticate(
         // Timeout to prevent hanging on slow/unresponsive MCP servers
         // Windows needs longer timeout due to antivirus/firewall checks on cold-start
         const isWindows = process.platform === 'win32';
-        const defaultTimeoutMs = isWindows ? 30000 : 10000;
+        const defaultTimeoutMs = isWindows
+          ? PRE_CHECK_LIST_TOOLS_TIMEOUT_WINDOWS_MS
+          : PRE_CHECK_LIST_TOOLS_TIMEOUT_DEFAULT_MS;
         const timeoutMs = Number(process.env.SUPER_MCP_LIST_TOOLS_TIMEOUT_MS) || defaultTimeoutMs;
         const toolsPromise = client.listTools();
         const timeoutPromise = new Promise<never>((_, reject) => 
@@ -564,13 +578,40 @@ export async function handleAuthenticate(
         }
       } catch (error) {
         const errMsg = formatError(error);
+        // finishAuth timeout: classified by machine code, NOT message text
+        // (audit F1 — the message-only rejection was swallowed as non-fatal and
+        // misreported as "auth_required").
+        const isFinishAuthTimeout =
+          (error as { code?: unknown } | null)?.code === OAUTH_FINISH_AUTH_TIMEOUT_CODE;
         const isFatalSetupError = typeof errMsg === 'string' && errMsg.startsWith('OAuth setup failed:');
         
         logger.error("OAuth failed", {
           package_id,
           error: errMsg,
           isFatalSetupError,
+          isFinishAuthTimeout,
         });
+        
+        // The user completed sign-in but the token exchange hung past its
+        // bound. This is a terminal outcome for this attempt — report it
+        // honestly instead of falling through to the pending
+        // "check browser for OAuth prompt" response the desktop can't act on.
+        if (isFinishAuthTimeout) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  package_id,
+                  status: "error",
+                  error: errMsg,
+                  message: "The sign-in took too long while finishing the token exchange, so we stopped waiting. Please try connecting again.",
+                }, null, 2),
+              },
+            ],
+            isError: false,
+          };
+        }
         
         // If this was a fatal setup error (DCR failure, connect timeout), return an
         // actionable error immediately instead of falling through to the generic

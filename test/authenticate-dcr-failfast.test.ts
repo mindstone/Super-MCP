@@ -72,7 +72,10 @@ const mockHttpClient = {
   close: vi.fn().mockResolvedValue(undefined),
 };
 
-vi.mock('../src/clients/httpClient.js', () => ({
+vi.mock('../src/clients/httpClient.js', async (importOriginal) => ({
+  // Keep the real exported constants (e.g. OAUTH_FINISH_AUTH_TIMEOUT_CODE,
+  // statically imported by authenticate.ts) — only the client class is faked.
+  ...(await importOriginal<typeof import('../src/clients/httpClient.js')>()),
   HttpMcpClient: function() { return mockHttpClient; },
 }));
 
