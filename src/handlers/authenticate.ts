@@ -597,6 +597,12 @@ export async function handleAuthenticate(
         // honestly instead of falling through to the pending
         // "check browser for OAuth prompt" response the desktop can't act on.
         if (isFinishAuthTimeout) {
+          // Desktop (mcpService.ts) displays `parsed.error` first and only
+          // falls back to `parsed.message`, so the friendly copy must live in
+          // `error` and the raw internal detail in `message`. Inverted from the
+          // sibling `isFatalSetupError` branch (audit F1 / Stage 7 review F1:
+          // the raw "OAuth token exchange timed out after 30000ms" is jargon the
+          // user would see instead of plain-language copy).
           return {
             content: [
               {
@@ -604,8 +610,8 @@ export async function handleAuthenticate(
                 text: JSON.stringify({
                   package_id,
                   status: "error",
-                  error: errMsg,
-                  message: "The sign-in took too long while finishing the token exchange, so we stopped waiting. Please try connecting again.",
+                  error: "The sign-in took too long, so we stopped waiting. Please try connecting again.",
+                  message: errMsg,
                 }, null, 2),
               },
             ],

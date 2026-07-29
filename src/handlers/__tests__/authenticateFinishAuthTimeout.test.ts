@@ -123,10 +123,20 @@ describe("handleAuthenticate finishAuth timeout classification", () => {
     );
 
     const parsed = JSON.parse(result.content[0].text);
+    // Coded classification unchanged: the branch is taken on the machine code
+    // (OAUTH_FINISH_AUTH_TIMEOUT_CODE), never falling through to the pending
+    // "check browser for OAuth prompt" (auth_required) response.
     expect(parsed.status).not.toBe("auth_required");
     expect(parsed.status).toBe("error");
-    expect(parsed.error).toContain("OAuth token exchange timed out");
-    // Honest outcome copy — not the "check browser for OAuth prompt" pending state.
+    expect(result.isError).toBe(false);
+
+    // The user-visible field (`error`) carries the friendly copy — the desktop
+    // (mcpService.ts) computes `errorMessage = errorDetails.message ||
+    // messageDetails.message || 'Authentication failed'`, so `parsed.error`
+    // wins. The raw internal detail is preserved in `message` for logs.
+    expect(parsed.error).toMatch(/took too long.*stopped waiting.*try connecting again/s);
+    expect(parsed.error).not.toContain("token exchange");
+    expect(parsed.message).toContain("OAuth token exchange timed out");
     expect(parsed.message).not.toContain("check browser");
 
     // The callback server must still be torn down (finally block).
