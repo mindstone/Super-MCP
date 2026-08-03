@@ -456,6 +456,19 @@ describe("authorize-probe rejection retry loop (REBEL-7F9 repro pin)", () => {
     // hazard — a futile retry must never invalidate WORKING static tokens).
     expect(providerInstances).toHaveLength(1);
     expect(providerInstances[0].invalidateCredentials).not.toHaveBeenCalled();
+
+    // Stage 5 (a) copy shape: the user-facing `error` field (the field the
+    // desktop displays first) must say — the provider's sign-in page rejected
+    // the connection; the problem is on THEIR side; here's what to do.
+    expect(parsed.error).toMatch(/sign-in page rejected the connection/);
+    expect(parsed.error).toMatch(/their side, not yours/);
+    expect(parsed.error).toMatch(/try again later/i);
+    expect(parsed.error).toMatch(/contact their support/i);
+    expect(parsed.error).toMatch(/bug report/i);
+    // Technical detail stays OUT of the user-facing field: no ports, no
+    // OAuth-internals jargon, no vendor names.
+    expect(parsed.error).not.toMatch(/redirect_?uri|DCR|Auth0|localhost|callback URL/i);
+    expect(parsed.error).not.toMatch(/\b\d{4,5}\b/);
   }, 10_000);
 
   it("kill-switch SUPER_MCP_OAUTH_PROBE_DISABLE=1: a coded-rejection stimulus on the wire is IGNORED — single attempt, no retry, no invalidation (k3 F5)", async () => {

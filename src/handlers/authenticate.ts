@@ -705,10 +705,15 @@ export async function handleAuthenticate(
         if (isFinishAuthTimeout) {
           // Desktop (mcpService.ts) displays `parsed.error` first and only
           // falls back to `parsed.message`, so the friendly copy must live in
-          // `error` and the raw internal detail in `message`. Inverted from the
-          // sibling `isFatalSetupError` branch (audit F1 / Stage 7 review F1:
-          // the raw "OAuth token exchange timed out after 30000ms" is jargon the
-          // user would see instead of plain-language copy).
+          // `error` and the raw internal detail in `message` (audit F1 /
+          // Stage 7 review F1: the raw "OAuth token exchange timed out after
+          // 30000ms" is jargon the user would see instead of plain-language
+          // copy). The sibling `isFatalSetupError` branch follows the same
+          // precedent as of REBEL-7F9 Stage 5 (c). The copy matches the
+          // desktop's OAUTH_AUTHENTICATE_TIMEOUT_USER_MESSAGE (Stage 5 (b)):
+          // the provider-side hint is deliberately conditional — a
+          // token-exchange-time rejection still lands here, so it must not
+          // promise every provider-side rejection is detected.
           return {
             kind: "response",
             response: {
@@ -718,7 +723,9 @@ export async function handleAuthenticate(
                   text: JSON.stringify({
                     package_id,
                     status: "error",
-                    error: "The sign-in took too long, so we stopped waiting. Please try connecting again.",
+                    error:
+                      "The sign-in took too long, so we stopped waiting. Please try connecting again. " +
+                      "If the provider's sign-in page showed an error, the problem is on their side — try again later, or let their support know.",
                     message: errMsg,
                   }, null, 2),
                 },
@@ -741,8 +748,8 @@ export async function handleAuthenticate(
                   text: JSON.stringify({
                     package_id,
                     status: "error",
-                    error: errMsg,
-                    message: "This connector's OAuth setup failed. It may require manual configuration (API key or pre-registered client credentials) instead of automatic sign-in.",
+                    error: "This connector's automatic sign-in setup failed. It may need manual configuration (an API key or pre-registered sign-in details) instead of one-click sign-in.",
+                    message: errMsg,
                   }, null, 2),
                 },
               ],
@@ -922,7 +929,9 @@ export async function handleAuthenticate(
                   package_id,
                   status: "error",
                   code: OAUTH_REDIRECT_URI_REJECTED_CODE,
-                  error: "This provider's sign-in page rejected the connection's registered callback address before the browser even opened. The provider's app registration doesn't allow this app's callback URL — this needs a fix on the provider's side.",
+                  error:
+                    "Sign-in couldn't start — this provider's sign-in page rejected the connection (it doesn't recognize this app's return address). " +
+                    "That's a problem on their side, not yours. Try again later, or contact their support — and send us a bug report so we can nudge them too.",
                   message: (outcome.verdict.matchedPhrase
                     ? `Pre-browser probe verdict: ${outcome.verdict.matchedPhrase}`
                     : "Pre-browser probe classified the provider's sign-in page as rejecting this connection's callback address.") + staticCredDiagnosticsSuffix,

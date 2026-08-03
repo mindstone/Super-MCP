@@ -159,11 +159,12 @@ describe('authenticate handler: DCR fail-fast (FOX-2926)', () => {
 
     const parsed = JSON.parse(result.content[0].text);
 
-    // After the fix, the error should mention the DCR issue or suggest manual setup.
-    // Currently returns generic "auth_required" with no mention of DCR.
-    expect(
-      parsed.error || parsed.message || ''
-    ).toMatch(/dynamic client registration|manual setup|client credentials|does not support/i);
+    // The DCR detail must still be surfaced (fail-fast actionable) — as of
+    // REBEL-7F9 Stage 5 (c) the fields follow the finishAuth-copy precedent:
+    // friendly plain-language copy in `error` (what the desktop displays
+    // first), raw technical detail in `message`.
+    expect(parsed.error).toMatch(/automatic sign-in setup failed|manual configuration/i);
+    expect(parsed.message).toMatch(/does not support dynamic client registration/i);
   });
 
   it('should surface a connection timeout error when connect times out', async () => {
@@ -178,9 +179,10 @@ describe('authenticate handler: DCR fail-fast (FOX-2926)', () => {
 
     const parsed = JSON.parse(result.content[0].text);
 
-    // After the fix, should surface the timeout error instead of waiting 5 more minutes
-    expect(
-      parsed.error || parsed.message || ''
-    ).toMatch(/timed?\s*out|timeout|connection failed|manual setup/i);
+    // The timeout detail must still be surfaced instead of waiting 5 more
+    // minutes — post-Stage 5 (c) it rides `message` (technical detail),
+    // while `error` carries the friendly copy (finishAuth-copy precedent).
+    expect(parsed.error).toMatch(/automatic sign-in setup failed|manual configuration/i);
+    expect(parsed.message).toMatch(/timed?\s*out|timeout/i);
   });
 });

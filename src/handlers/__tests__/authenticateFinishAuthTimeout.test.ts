@@ -13,7 +13,7 @@ import type { PackageRegistry } from "../../registry.js";
 // (OAUTH_FINISH_AUTH_TIMEOUT_CODE), not message prefix, and propagate as an
 // error outcome.
 
-const { mockLogger, callbackServerInstances } = vi.hoisted(() => ({
+const { mockLogger, callbackServerInstances, connectError, hangCallback } = vi.hoisted(() => ({
   mockLogger: {
     info: vi.fn(),
     warn: vi.fn(),
@@ -26,6 +26,13 @@ const { mockLogger, callbackServerInstances } = vi.hoisted(() => ({
     waitForCallback: ReturnType<typeof vi.fn>;
     stop: ReturnType<typeof vi.fn>;
   }>,
+  // When set, the mock's connectWithOAuth rejects with this error — the
+  // fatal-setup stimulus (DCR refusal / connect timeout) for Stage 5 (c).
+  connectError: { current: null as Error | null },
+  // When true, the mock's callback wait never settles — a fatal connect
+  // error then wins the race (in the default shape the immediate mock
+  // callback would resolve first and mask the fatal branch).
+  hangCallback: { current: false },
 }));
 
 vi.mock("../../logging.js", () => ({
@@ -57,8 +64,13 @@ vi.mock("../../auth/callbackServer.js", () => {
   class MockOAuthCallbackServer {
     setServiceId = vi.fn();
     start = vi.fn(async () => {});
-    // The user completes sign-in: the callback delivers an auth code.
-    waitForCallback = vi.fn(async () => "auth-code-123");
+    // The user completes sign-in: the callback delivers an auth code —
+    // unless the test hung the callback (fatal-connect race shape).
+    waitForCallback = vi.fn(() =>
+      hangCallback.current
+        ? new Promise<never>(() => {})
+        : Promise.resolve("auth-code-123"),
+    );
     stop = vi.fn(async () => {});
     constructor() {
       callbackServerInstances.push(this);
@@ -71,8 +83,13 @@ vi.mock("../../clients/httpClient.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../clients/httpClient.js")>();
   class MockHttpMcpClient {
     // Redirect initiated; the connect promise stays pending (expected shape while
-    // the browser flow is in flight).
-    connectWithOAuth = vi.fn(() => new Promise<never>(() => {}));
+    // the browser flow is in flight) — unless the test armed a fatal setup
+    // failure (DCR refusal / connect timeout).
+    connectWithOAuth = vi.fn(() =>
+      connectError.current
+        ? Promise.reject(connectError.current)
+        : new Promise<never>(() => {}),
+    );
     // The bounded finishOAuth rejecting with its timeout code — exactly what the
     // real race does when the transport's finishAuth hangs (that rejection shape,
     // including the code, is pinned by
@@ -118,6 +135,8 @@ describe("handleAuthenticate finishAuth timeout classification", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     callbackServerInstances.length = 0;
+    connectError.current = null;
+    hangCallback.current = false;
   });
 
   it("propagates a hung token exchange as an error outcome, never auth_required", async () => {
@@ -144,7 +163,47 @@ describe("handleAuthenticate finishAuth timeout classification", () => {
     expect(parsed.message).toContain("OAuth token exchange timed out");
     expect(parsed.message).not.toContain("check browser");
 
+    // Stage 5 (b): the calibrated provider-side hint rides the residual
+    // timeout copy — conditional phrasing only (a token-exchange-time
+    // rejection or a non-conformant AS still lands here, so the copy must
+    // not promise we detect every provider-side rejection).
+    expect(parsed.error).toMatch(/[Ii]f the provider's sign-in page showed an error/);
+    expect(parsed.error).toMatch(/their side/);
+    expect(parsed.error).not.toMatch(/redirect_?uri|DCR|Auth0/i);
+
     // The callback server must still be torn down (finally block).
+    expect(callbackServerInstances).toHaveLength(1);
+    expect(callbackServerInstances[0].stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("fatal setup failure: friendly copy in `error`, technical detail in `message` (REBEL-7F9 Stage 5 (c))", async () => {
+    // The finishAuth-copy precedent (audit F1 / Stage 7 review F1): the
+    // desktop displays parsed.error first and only falls back to
+    // parsed.message, so the friendly copy must live in `error` and the raw
+    // internal detail in `message`. The isFatalSetupError branch predates
+    // that precedent and was inverted (raw "OAuth setup failed: …" in
+    // `error`, friendly guidance in `message`).
+    hangCallback.current = true; // the fatal connect error must win the race
+    connectError.current = new Error("does not support dynamic client registration");
+
+    const result = await handleAuthenticate(
+      { package_id: PACKAGE_ID, wait_for_completion: true },
+      createRegistry(),
+      createCatalog(),
+    );
+
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.status).toBe("error");
+    // User-facing field: plain-language, actionable, jargon-free.
+    expect(parsed.error).toMatch(/automatic sign-in setup failed/);
+    expect(parsed.error).toMatch(/manual configuration/);
+    expect(parsed.error).not.toContain("OAuth setup failed");
+    expect(parsed.error).not.toContain("dynamic client registration");
+    expect(parsed.error).not.toMatch(/redirect_?uri|DCR|Auth0/i);
+    // Technical detail preserved for logs/diagnostics in `message`.
+    expect(parsed.message).toContain("OAuth setup failed");
+    expect(parsed.message).toContain("does not support dynamic client registration");
+
     expect(callbackServerInstances).toHaveLength(1);
     expect(callbackServerInstances[0].stop).toHaveBeenCalledTimes(1);
   });
