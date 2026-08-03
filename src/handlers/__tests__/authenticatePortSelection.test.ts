@@ -63,6 +63,9 @@ vi.mock("../../auth/providers/simple.js", () => {
     checkAndInvalidateOnPortMismatch = vi.fn(async () => false);
     state = vi.fn(async () => "csrf-state");
     invalidateCredentials = vi.fn(async () => {});
+    setSkipAuthorizeProbe = vi.fn();
+    consumeProbeVerdict = vi.fn(() => undefined);
+    static hasPersistedAccessToken = vi.fn(async () => false);
     constructor(packageId: string, oauthPort: number, staticCredentials?: unknown) {
       this.oauthPort = oauthPort;
       this.staticCredentials = staticCredentials;

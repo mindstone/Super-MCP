@@ -6,6 +6,7 @@ import PQueue from "p-queue";
 import { McpClient, PackageConfig, ReadResourceResult } from "../types.js";
 import { getLogger } from "../logging.js";
 import { SimpleOAuthProvider, RefreshOnlyOAuthProvider } from "../auth/providers/index.js";
+import { OAUTH_REDIRECT_URI_REJECTED_CODE } from "../auth/authorizeProbe.js";
 import type { OAuthErrorSummary, StaticOAuthCredentials } from "../auth/providers/simple.js";
 import { runRefreshTransaction } from "../auth/refreshTransaction.js";
 
@@ -324,12 +325,35 @@ export const FINISH_AUTH_TIMEOUT_MS = 30_000;
 // was swallowed as non-fatal and reported as "auth_required").
 export const OAUTH_FINISH_AUTH_TIMEOUT_CODE = "OAUTH_FINISH_AUTH_TIMEOUT";
 
+// Re-exported so handleAuthenticate can import both OAuth machine codes from
+// one place (the OAUTH_FINISH_AUTH_TIMEOUT_CODE precedent above). Defined in
+// auth/authorizeProbe.ts to avoid an import cycle: auth/providers/simple.ts
+// throws the coded error and is itself imported by this module.
+export { OAUTH_REDIRECT_URI_REJECTED_CODE } from "../auth/authorizeProbe.js";
+
 // Default SDK request timeout for listTools (env override:
 // SUPER_MCP_LIST_TOOLS_TIMEOUT). Exported because healthCheck() delegates to
 // listTools(), making this the bound on BOTH health-check legs of the
 // authenticate pre-check path — a leg of the OAuth budget invariant
 // (src/handlers/__tests__/oauthBudgetInvariant.test.ts).
 export const LIST_TOOLS_TIMEOUT_MS = 10_000;
+
+/**
+ * Pure form of the auth-like message vocabulary, exported so the authorize
+ * probe's rejection-message contract can be pinned by tests (recall#2 F2(c)):
+ * a message matching these tokens is treated as an EXPECTED auth outcome and
+ * swallowed (connectWithOAuth below), so the probe's coded rejection message
+ * must provably never contain any of them.
+ */
+export function isAuthLikeErrorMessageText(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return normalized.includes("redirect initiated") ||
+    normalized.includes("unauthorized") ||
+    normalized.includes("401") ||
+    normalized.includes("invalid_token") ||
+    normalized.includes("missing authorization") ||
+    normalized.includes("authentication required");
+}
 
 export class HttpMcpClient implements McpClient {
   private client: Client;
@@ -412,13 +436,7 @@ export class HttpMcpClient implements McpClient {
   }
 
   private isAuthLikeErrorMessage(message: string): boolean {
-    const normalized = message.toLowerCase();
-    return normalized.includes("redirect initiated") ||
-      normalized.includes("unauthorized") ||
-      normalized.includes("401") ||
-      normalized.includes("invalid_token") ||
-      normalized.includes("missing authorization") ||
-      normalized.includes("authentication required");
+    return isAuthLikeErrorMessageText(message);
   }
 
   private async recreateClientForSseFallback(reason: string): Promise<void> {
@@ -1043,6 +1061,19 @@ export class HttpMcpClient implements McpClient {
         } catch (httpError) {
           authError = httpError instanceof Error ? httpError : new Error(String(httpError));
         }
+      }
+
+      // Pre-browser probe rejection (REBEL-7F9 Stage 3): an EXPECTED outcome on
+      // strict allow-list authorization servers, classified by machine code —
+      // never by message text, and deliberately NOT auth-like vocabulary (the
+      // auth-like branch below would swallow it and hang the callback wait).
+      // Rethrown with the discovery trace so authenticate.ts can advance the
+      // port-retry loop; the .code survives on the same error object.
+      if ((authError as NodeJS.ErrnoException).code === OAUTH_REDIRECT_URI_REJECTED_CODE) {
+        logger.info("Authorize URL rejected by provider (pre-browser probe)", {
+          package_id: this.packageId,
+        });
+        throw this.attachOAuthDiscoveryTrace(authError);
       }
 
       if (this.isAuthLikeErrorMessage(authError.message)) {

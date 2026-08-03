@@ -3,7 +3,9 @@ import {
   OAUTH_CALLBACK_TIMEOUT_MS,
   HEALTH_CHECK_TIMEOUT_MS,
   PRE_CHECK_LIST_TOOLS_TIMEOUT_WINDOWS_MS,
+  MAX_PORT_ATTEMPTS,
 } from "../authenticate.js";
+import { AUTHORIZE_PROBE_TIMEOUT_MS } from "../../auth/authorizeProbe.js";
 import {
   CONNECT_TIMEOUT_MS,
   FINISH_AUTH_TIMEOUT_MS,
@@ -25,7 +27,7 @@ vi.mock("../../logging.js", () => ({
 // impractical — this literal + comment IS the coupling. If either side changes,
 // change both together (the desktop repo carries the mirror-image assertion in
 // src/main/services/__tests__/mcpService.oauthTimeout.test.ts).
-const DESKTOP_AUTHENTICATE_TOOL_TIMEOUT_MS = 500_000;
+const DESKTOP_AUTHENTICATE_TOOL_TIMEOUT_MS = 620_000;
 
 // Local, sub-second setup operations of handleAuthenticate's
 // wait_for_completion path that have no importable constant: saved-port
@@ -54,18 +56,53 @@ describe("OAuth budget invariant (desktop outer budget vs inner legs)", () => {
   //    negotiation errors (404/405/Missing sessionId — prompt HTTP responses),
   //    so a negotiation error arriving AT the 30s connect boundary is
   //    pathological. Worst case it adds CONNECT_TIMEOUT_MS per attempt.
-  it("branch-aware worst-case sum of inner legs stays strictly inside the desktop authenticate budget", () => {
-    const innerWorstCaseMs =
-      LIST_TOOLS_TIMEOUT_MS + // registry cached-client health check (registry.ts getClient → httpClient.ts healthCheck/listTools)
-      REGISTRY_CONNECT_ATTEMPTS * CONNECT_TIMEOUT_MS + // registry reconnect: initial + one retry (registry.ts createAndConnectClientWithOneRetry)
-      LIST_TOOLS_TIMEOUT_MS + // handler health check on the fresh client (authenticate.ts pre-check)
-      PRE_CHECK_LIST_TOOLS_TIMEOUT_WINDOWS_MS + // pre-check listTools race, Windows worst-case default (authenticate.ts)
-      SETUP_MARGIN_MS + // port find + provider init + callback-server start + settle (authenticate.ts)
-      OAUTH_CALLBACK_TIMEOUT_MS + // browser sign-in window (authenticate.ts)
-      FINISH_AUTH_TIMEOUT_MS + // token exchange (httpClient.ts finishOAuth)
-      CONNECT_TIMEOUT_MS + // post-exchange reconnect (httpClient.ts connectWithTimeout)
-      HEALTH_CHECK_TIMEOUT_MS; // post-auth verification (authenticate.ts)
+  // The pre-check legs + per-attempt setup run ONCE per authenticate call.
+  const PRE_CHECK_AND_SETUP_MS =
+    LIST_TOOLS_TIMEOUT_MS + // registry cached-client health check (registry.ts getClient → httpClient.ts healthCheck/listTools)
+    REGISTRY_CONNECT_ATTEMPTS * CONNECT_TIMEOUT_MS + // registry reconnect: initial + one retry (registry.ts createAndConnectClientWithOneRetry)
+    LIST_TOOLS_TIMEOUT_MS + // handler health check on the fresh client (authenticate.ts pre-check)
+    PRE_CHECK_LIST_TOOLS_TIMEOUT_WINDOWS_MS + // pre-check listTools race, Windows worst-case default (authenticate.ts)
+    SETUP_MARGIN_MS; // port find + provider init + callback-server start + settle (authenticate.ts)
 
+  // A classified-rejection attempt dies AT THE PROBE (recall#2 F4): per-attempt
+  // setup + probe + the connect/DCR leg that built the authorize URL. The 300s
+  // callback wait NEVER runs for a rejected attempt.
+  const FAST_REJECTED_ATTEMPT_MS =
+    SETUP_MARGIN_MS + AUTHORIZE_PROBE_TIMEOUT_MS + CONNECT_TIMEOUT_MS;
+
+  // The accepted (or browser-floor) attempt runs today's full success path.
+  const FULL_ATTEMPT_MS =
+    OAUTH_CALLBACK_TIMEOUT_MS + // browser sign-in window (authenticate.ts)
+    FINISH_AUTH_TIMEOUT_MS + // token exchange (httpClient.ts finishOAuth)
+    CONNECT_TIMEOUT_MS + // post-exchange reconnect (httpClient.ts connectWithTimeout)
+    HEALTH_CHECK_TIMEOUT_MS; // post-auth verification (authenticate.ts)
+
+  it("branch-aware worst-case sum of inner legs stays strictly inside the desktop authenticate budget", () => {
+    // n=1 (single attempt — the kill-switch / no-rejection path): identical to
+    // the pre-probe budget (confirm#F5: the disabled path is byte-identical to
+    // today, and the budget for it must not grow).
+    const innerWorstCaseMs =
+      PRE_CHECK_AND_SETUP_MS +
+      FULL_ATTEMPT_MS;
+
+    expect(innerWorstCaseMs).toBe(492_000);
     expect(innerWorstCaseMs).toBeLessThan(DESKTOP_AUTHENTICATE_TOOL_TIMEOUT_MS);
+  });
+
+  it("multi-attempt worst case (max classified rejections + one full attempt) stays inside the raised 620s desktop budget", () => {
+    // REBEL-7F9 Stage 3 (confirm#F1/F8): up to MAX_PORT_ATTEMPTS - 1 fast
+    // probe-rejected retry legs precede the one full attempt whose 300s
+    // callback wait applies exactly once.
+    //   112s pre-check+setup + 2 × 35s (setup 2s + probe 3s + connect/DCR 30s)
+    //   + 380s full attempt = 562s < 620s.
+    const multiAttemptWorstCaseMs =
+      PRE_CHECK_AND_SETUP_MS +
+      (MAX_PORT_ATTEMPTS - 1) * FAST_REJECTED_ATTEMPT_MS +
+      FULL_ATTEMPT_MS;
+
+    expect(MAX_PORT_ATTEMPTS).toBe(3);
+    expect(AUTHORIZE_PROBE_TIMEOUT_MS).toBe(3_000);
+    expect(multiAttemptWorstCaseMs).toBe(562_000);
+    expect(multiAttemptWorstCaseMs).toBeLessThan(DESKTOP_AUTHENTICATE_TOOL_TIMEOUT_MS);
   });
 });

@@ -42,10 +42,13 @@ vi.mock("../../utils/portFinder.js", () => ({
 vi.mock("../../auth/providers/simple.js", () => {
   class MockSimpleOAuthProvider {
     static getSavedClientPort = vi.fn(async () => null);
+    static hasPersistedAccessToken = vi.fn(async () => false);
     initialize = vi.fn(async () => {});
     checkAndInvalidateOnPortMismatch = vi.fn(async () => false);
     state = vi.fn(async () => "csrf-state");
     invalidateCredentials = vi.fn(async () => {});
+    setSkipAuthorizeProbe = vi.fn();
+    consumeProbeVerdict = vi.fn(() => undefined);
   }
   return { SimpleOAuthProvider: MockSimpleOAuthProvider };
 });

@@ -5,6 +5,12 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { homedir } from "os";
 import { randomBytes } from "crypto";
+import {
+  buildRedirectUriRejectedError,
+  isAuthorizeProbeDisabled,
+  probeAuthorizeUrl,
+  type AuthorizeProbeVerdict,
+} from "../authorizeProbe.js";
 
 const logger = getLogger();
 const OAUTH_TOKEN_DIR_ENV = "SUPER_MCP_OAUTH_TOKEN_DIR";
@@ -131,6 +137,23 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   private staticCredentials?: StaticOAuthCredentials;
   private redirectStarted: boolean = false;
   private lastOAuthError?: OAuthErrorSummary;
+  /**
+   * Out-of-band channel for the authorize pre-flight probe verdict (REBEL-7F9
+   * Stage 3, recall#2 F2(a)). DISTINCT from lastOAuthError: that slot is
+   * consume-once and gets drained by invalidateCredentials(), which the retry
+   * loop itself calls on a classified rejection — a verdict stored there would
+   * be consumed before classification and the flow would fall through to a
+   * generic auth_required. This channel survives invalidation.
+   */
+  private lastProbeVerdict?: AuthorizeProbeVerdict;
+  /**
+   * When true, redirectToAuthorization skips the pre-flight probe. Set by the
+   * authenticate handler on saved-port reuse WITH a prior successful token
+   * exchange (confirm#F6), and for the browser-open floor attempt (recall#2
+   * F1(b)) where the probe's uniform-rejection verdict is already known and
+   * the browser must open anyway.
+   */
+  private skipAuthorizeProbe: boolean = false;
   
   constructor(packageId: string, oauthPort: number = 5173, staticCredentials?: StaticOAuthCredentials) {
     this.packageId = packageId;
@@ -659,10 +682,43 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   }
   
   async redirectToAuthorization(authUrl: URL) {
+    // Authorize pre-flight probe (REBEL-7F9 Stage 3). Kill-switch active →
+    // skip the probe entirely: the flow is byte-identical to the pre-probe
+    // behavior (confirm#F5).
+    const probeDisabled = isAuthorizeProbeDisabled();
+    if (probeDisabled) {
+      logger.info("Authorize pre-flight probe disabled via SUPER_MCP_OAUTH_PROBE_DISABLE", {
+        package_id: this.packageId,
+      });
+    } else if (this.skipAuthorizeProbe) {
+      logger.debug("Authorize pre-flight probe skipped (saved-port reuse or browser floor)", {
+        package_id: this.packageId,
+      });
+    } else {
+      const verdict = await probeAuthorizeUrl(authUrl.toString());
+      this.lastProbeVerdict = verdict;
+      logger.info("Authorize pre-flight probe verdict", {
+        package_id: this.packageId,
+        outcome: verdict.outcome,
+        status: verdict.status,
+        matched_phrase: verdict.matchedPhrase,
+      });
+      if (verdict.outcome === "rejected") {
+        // redirectStarted is set only AFTER the probe verdict (recall#2
+        // F2(d)) — the SSE/StreamableHTTP fallback guards key off
+        // hasStartedRedirect(). The coded error propagates through SDK
+        // auth() unchanged (1.28.0 gate: transports rethrow the original
+        // error) and authenticate.ts advances the port-retry loop. The
+        // browser is NOT opened for a sign-in page we know will fail.
+        this.redirectStarted = true;
+        throw buildRedirectUriRejectedError(verdict);
+      }
+    }
+
     this.redirectStarted = true;
-    logger.info("Opening browser for OAuth", { 
+    logger.info("Opening browser for OAuth", {
       package_id: this.packageId,
-      url: authUrl.toString() 
+      url: authUrl.toString()
     });
     
     const clientId = authUrl.searchParams.get('client_id');
@@ -755,6 +811,37 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     const error = this.lastOAuthError;
     this.lastOAuthError = undefined;
     return error;
+  }
+
+  setSkipAuthorizeProbe(skip: boolean): void {
+    this.skipAuthorizeProbe = skip;
+  }
+
+  /**
+   * Consume the recorded probe verdict (consume-once, like
+   * consumeLastOAuthError but a SEPARATE slot — see field comment).
+   */
+  consumeProbeVerdict(): AuthorizeProbeVerdict | undefined {
+    const verdict = this.lastProbeVerdict;
+    this.lastProbeVerdict = undefined;
+    return verdict;
+  }
+
+  /**
+   * Probe-skip predicate (confirm#F6): a prior successful token exchange is
+   * mechanically "<packageId>_tokens.json present with a parseable
+   * access_token". Saved-port reuse WITH that file ⇒ the authenticate handler
+   * skips the probe; absent (the REBEL-7F9 reporter's saved 5173) ⇒ it runs.
+   */
+  static async hasPersistedAccessToken(packageId: string): Promise<boolean> {
+    try {
+      const tokenPath = path.join(getOAuthTokenStoragePath(), `${packageId}_tokens.json`);
+      const raw = await fs.readFile(tokenPath, "utf8");
+      const tokens = JSON.parse(raw);
+      return typeof tokens?.access_token === "string" && tokens.access_token.length > 0;
+    } catch {
+      return false;
+    }
   }
   
   /**

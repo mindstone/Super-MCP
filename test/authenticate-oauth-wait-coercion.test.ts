@@ -50,9 +50,12 @@ vi.mock('../src/auth/providers/simple.js', () => {
       checkAndInvalidateOnPortMismatch: vi.fn().mockResolvedValue(false),
       state: vi.fn().mockResolvedValue('test-state'),
       invalidateCredentials: vi.fn().mockResolvedValue(undefined),
+      setSkipAuthorizeProbe: vi.fn(),
+      consumeProbeVerdict: vi.fn().mockReturnValue(undefined),
     };
   }
   MockSimpleOAuthProvider.getSavedClientPort = vi.fn().mockResolvedValue(undefined);
+  MockSimpleOAuthProvider.hasPersistedAccessToken = vi.fn().mockResolvedValue(false);
   return { SimpleOAuthProvider: MockSimpleOAuthProvider };
 });
 
