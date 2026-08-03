@@ -3,6 +3,7 @@ import * as net from "net";
 
 import {
   getOAuthCallbackPortCandidates,
+  getOAuthCallbackRetryCandidates,
   findAvailablePortFromCandidates,
   OAUTH_CALLBACK_DEFAULT_PORT,
   OAUTH_CALLBACK_VENDOR_COMMON_PORT,
@@ -47,6 +48,28 @@ describe("getOAuthCallbackPortCandidates", () => {
     expect(candidates[0]).toBe(5173);
     expect(candidates).toEqual([5173, 5174, 5175, 5176, 5177, 5178, 5179, 5180, 5181, 5182]);
     expect(candidates).not.toContain(OAUTH_CALLBACK_VENDOR_COMMON_PORT);
+  });
+});
+
+describe("getOAuthCallbackRetryCandidates (REBEL-7F9 Stage 3)", () => {
+  it("orders [8080, 5173…5182] — vendor-common port first, then the linear scan", () => {
+    expect(getOAuthCallbackRetryCandidates([])).toEqual([
+      8080, 5173, 5174, 5175, 5176, 5177, 5178, 5179, 5180, 5181, 5182,
+    ]);
+  });
+
+  it("excludes already-failed ports while preserving order", () => {
+    expect(getOAuthCallbackRetryCandidates([5173])).toEqual([
+      8080, 5174, 5175, 5176, 5177, 5178, 5179, 5180, 5181, 5182,
+    ]);
+    expect(getOAuthCallbackRetryCandidates([5173, 8080])).toEqual([
+      5174, 5175, 5176, 5177, 5178, 5179, 5180, 5181, 5182,
+    ]);
+    expect(getOAuthCallbackRetryCandidates([5173, 8080, 5174])[0]).toBe(5175);
+  });
+
+  it("ignores failed ports outside the candidate set", () => {
+    expect(getOAuthCallbackRetryCandidates([12345])).toEqual(getOAuthCallbackRetryCandidates([]));
   });
 });
 

@@ -1,7 +1,7 @@
 import { PackageRegistry } from "../registry.js";
 import { Catalog } from "../catalog.js";
 import { getLogger } from "../logging.js";
-import { checkPortAvailable, findAvailablePortFromCandidates, getOAuthCallbackPortCandidates, OAUTH_CALLBACK_DEFAULT_PORT, OAUTH_CALLBACK_PORT_SCAN_END, OAUTH_CALLBACK_VENDOR_COMMON_PORT } from "../utils/portFinder.js";
+import { checkPortAvailable, findAvailablePortFromCandidates, getOAuthCallbackPortCandidates, getOAuthCallbackRetryCandidates } from "../utils/portFinder.js";
 import { SimpleOAuthProvider } from "../auth/providers/simple.js";
 import { OAUTH_FINISH_AUTH_TIMEOUT_CODE, OAUTH_REDIRECT_URI_REJECTED_CODE } from "../clients/httpClient.js";
 import { isAuthorizeProbeDisabled, type AuthorizeProbeVerdict } from "../auth/authorizeProbe.js";
@@ -807,19 +807,9 @@ export async function handleAuthenticate(
           }
         } else {
           // Retry candidates: [8080, 5173…5182] deduped minus already-failed
-          // ports, regardless of attempt-1's port (recall#2 F3).
-          const retryCandidates: number[] = [];
-          const seen = new Set<number>();
-          for (let p = OAUTH_CALLBACK_DEFAULT_PORT; p <= OAUTH_CALLBACK_PORT_SCAN_END; p++) {
-            seen.add(p);
-          }
-          seen.add(OAUTH_CALLBACK_VENDOR_COMMON_PORT);
-          const ordered = [OAUTH_CALLBACK_VENDOR_COMMON_PORT, ...[...seen].sort((a, b) => a - b).filter(p => p !== OAUTH_CALLBACK_VENDOR_COMMON_PORT)];
-          for (const candidate of ordered) {
-            if (!failedPorts.includes(candidate)) {
-              retryCandidates.push(candidate);
-            }
-          }
+          // ports, regardless of attempt-1's port (recall#2 F3). The ordering
+          // lives in portFinder.ts (DA F3 — single site, no two-site drift).
+          const retryCandidates = getOAuthCallbackRetryCandidates(failedPorts);
           try {
             attemptPort = await findAvailablePortFromCandidates(retryCandidates);
           } catch (portError) {

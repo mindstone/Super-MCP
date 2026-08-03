@@ -79,6 +79,27 @@ export function getOAuthCallbackPortCandidates(
 }
 
 /**
+ * Ordered RETRY candidates for the authorize-probe rejection loop
+ * (REBEL-7F9 Stage 3): [8080, 5173…5182] deduped minus already-failed ports,
+ * regardless of how attempt 1 chose its port (recall#2 F3 — the reported
+ * user's saved facade client sits at 5173; attempt 2 must be 8080). Single
+ * home for this ordering (DA F3) so a future scan-range or vendor-port change
+ * can't update one call site and miss the other.
+ */
+export function getOAuthCallbackRetryCandidates(failedPorts: readonly number[]): number[] {
+  const seen = new Set<number>();
+  for (let p = OAUTH_CALLBACK_DEFAULT_PORT; p <= OAUTH_CALLBACK_PORT_SCAN_END; p++) {
+    seen.add(p);
+  }
+  seen.add(OAUTH_CALLBACK_VENDOR_COMMON_PORT);
+  const ordered = [
+    OAUTH_CALLBACK_VENDOR_COMMON_PORT,
+    ...[...seen].sort((a, b) => a - b).filter((p) => p !== OAUTH_CALLBACK_VENDOR_COMMON_PORT),
+  ];
+  return ordered.filter((candidate) => !failedPorts.includes(candidate));
+}
+
+/**
  * Find the first available port from an ordered candidate list, filtered by
  * checkPortAvailable. Unlike findAvailablePort's linear scan, the caller owns
  * the ordering — this is what the OAuth retry loop advances across.
