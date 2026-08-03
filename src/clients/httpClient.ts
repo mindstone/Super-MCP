@@ -32,6 +32,40 @@ export interface OAuthDiscoveryTraceEntry {
   timestampMs: number;
 }
 
+/**
+ * One attempt's authorize pre-flight probe verdict in the diagnostics
+ * payload (REBEL-7F9 Stage 4). outcome/status/hint only — token/secret-free
+ * by construction: hint is the fixed label or the mismatch-specific phrase
+ * the classification matched (never the raw AS Location, which stays at
+ * info-level logs per the Stage 3 refinement).
+ */
+export interface OAuthProbeVerdictTraceEntry {
+  port: number;
+  outcome: "accepted" | "rejected" | "inconclusive";
+  status?: number;
+  hint?: string;
+}
+
+/**
+ * The full diagnostics payload serialized after
+ * OAUTH_DISCOVERY_TRACE_ERROR_MARKER (REBEL-7F9 Stage 4 — the pre-Stage-4
+ * payload was a bare OAuthDiscoveryTraceEntry[]; the desktop parser accepts
+ * both shapes). All fields are token/secret-free by construction: redirect
+ * URIs are loopback URLs (host+port+path, no query params read), and no
+ * state/PKCE/code value participates anywhere.
+ */
+export interface OAuthDiagnosticsPayload {
+  entries: OAuthDiscoveryTraceEntry[];
+  /** The loopback port this client's callback server bound (or would bind). */
+  callbackPort: number;
+  /** The redirect_uris sent at DCR (undefined for static-cred connectors — no DCR). */
+  dcrRedirectUris?: string[];
+  /** The exact redirect_uri on the authorize URL the browser/probe was sent to. */
+  authorizeRedirectUri?: string;
+  /** Per-attempt probe verdicts (earlier retry attempts first, own last). */
+  probeVerdicts: OAuthProbeVerdictTraceEntry[];
+}
+
 export const OAUTH_DISCOVERY_TRACE_ERROR_MARKER = "\n[super-mcp-oauth-discovery-trace:v1]";
 const OAUTH_DISCOVERY_TRACE_CAPACITY = 10;
 
@@ -410,17 +444,69 @@ export class HttpMcpClient implements McpClient {
     }
   }
 
-  private attachOAuthDiscoveryTrace<T extends Error>(
+  /**
+   * Build the token/secret-free OAuth diagnostics payload (REBEL-7F9 Stage
+   * 4): the discovery-trace entries PLUS the flow-level fields that make
+   * the "Callback URL mismatch" class self-diagnosing — chosen callback
+   * port, redirect_uris sent at DCR, the exact redirect_uri on the
+   * authorize URL, and per-attempt probe verdicts. `priorProbeVerdicts`
+   * lets authenticate.ts fold earlier retry attempts' verdicts into the
+   * final payload: each attempt's provider/client only ever sees its own
+   * verdict, so the retry loop aggregates them.
+   */
+  private buildOAuthDiagnosticsPayload(extras?: {
+    priorProbeVerdicts?: OAuthProbeVerdictTraceEntry[];
+  }): OAuthDiagnosticsPayload {
+    const probeVerdicts: OAuthProbeVerdictTraceEntry[] = [
+      ...(extras?.priorProbeVerdicts ?? []),
+    ];
+    const ownVerdict = this.simpleOAuthProvider?.getProbeVerdictForTrace();
+    if (ownVerdict) {
+      probeVerdicts.push({
+        port: this.oauthPort,
+        outcome: ownVerdict.outcome,
+        status: ownVerdict.status,
+        hint: ownVerdict.matchedPhrase,
+      });
+    }
+    return {
+      entries: this.getOAuthDiscoveryTrace(),
+      callbackPort: this.oauthPort,
+      dcrRedirectUris: this.simpleOAuthProvider?.getDcrRedirectUrisSent(),
+      authorizeRedirectUri: this.simpleOAuthProvider?.getAuthorizeRedirectUri(),
+      probeVerdicts,
+    };
+  }
+
+  /**
+   * Marker + serialized diagnostics payload for callers that must ride the
+   * diagnostics on a NON-error string — authenticate.ts's auth_required
+   * response message on the "redirect started, callback never arrived"
+   * path, where no thrown error exists to attach to (connectWithOAuth
+   * returned normally via the expected auth-like redirect swallow). The
+   * desktop extracts and strips the suffix via
+   * extractOAuthDiscoveryTraceFromError before display.
+   */
+  public getOAuthDiagnosticsSuffix(extras?: {
+    priorProbeVerdicts?: OAuthProbeVerdictTraceEntry[];
+  }): string {
+    return `${OAUTH_DISCOVERY_TRACE_ERROR_MARKER}${JSON.stringify(
+      this.buildOAuthDiagnosticsPayload(extras),
+    )}`;
+  }
+
+  public attachOAuthDiscoveryTrace<T extends Error>(
     error: T,
+    extras?: { priorProbeVerdicts?: OAuthProbeVerdictTraceEntry[] },
   ): T & { oauthDiscoveryTrace: OAuthDiscoveryTraceEntry[] } {
-    const oauthDiscoveryTrace = this.getOAuthDiscoveryTrace();
+    const payload = this.buildOAuthDiagnosticsPayload(extras);
     const markerIndex = error.message.lastIndexOf(OAUTH_DISCOVERY_TRACE_ERROR_MARKER);
     const baseMessage = markerIndex === -1 ? error.message : error.message.slice(0, markerIndex);
-    error.message = `${baseMessage}${OAUTH_DISCOVERY_TRACE_ERROR_MARKER}${JSON.stringify(oauthDiscoveryTrace)}`;
+    error.message = `${baseMessage}${OAUTH_DISCOVERY_TRACE_ERROR_MARKER}${JSON.stringify(payload)}`;
     Object.defineProperty(error, "oauthDiscoveryTrace", {
       configurable: true,
       enumerable: true,
-      value: oauthDiscoveryTrace,
+      value: payload.entries,
       writable: false,
     });
     return error as T & { oauthDiscoveryTrace: OAuthDiscoveryTraceEntry[] };

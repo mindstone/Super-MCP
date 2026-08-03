@@ -4,6 +4,7 @@ import { getLogger } from "../logging.js";
 import { checkPortAvailable, findAvailablePortFromCandidates, getOAuthCallbackPortCandidates, getOAuthCallbackRetryCandidates } from "../utils/portFinder.js";
 import { SimpleOAuthProvider } from "../auth/providers/simple.js";
 import { OAUTH_FINISH_AUTH_TIMEOUT_CODE, OAUTH_REDIRECT_URI_REJECTED_CODE } from "../clients/httpClient.js";
+import type { OAuthProbeVerdictTraceEntry } from "../clients/httpClient.js";
 import { isAuthorizeProbeDisabled, type AuthorizeProbeVerdict } from "../auth/authorizeProbe.js";
 import { formatError } from "../utils/formatError.js";
 import { coerceStringifiedBoolean } from "../utils/normalizeInput.js";
@@ -47,7 +48,7 @@ export const MAX_PORT_ATTEMPTS = 3;
 type AttemptOutcome =
   | { kind: "response"; response: any }
   | { kind: "rejected"; verdict: AuthorizeProbeVerdict; httpClient: any }
-  | { kind: "pending"; httpClient: any };
+  | { kind: "pending"; httpClient: any; diagnosticsSuffix?: string };
 
 // Defaults for the pre-check listTools race (env override:
 // SUPER_MCP_LIST_TOOLS_TIMEOUT_MS). Windows needs a longer default because of
@@ -399,8 +400,16 @@ export async function handleAuthenticate(
       : undefined;
 
     const failedPorts: number[] = [];
+    // Per-attempt probe verdicts for the diagnostics payload (REBEL-7F9
+    // Stage 4): each attempt's provider/client only records its OWN verdict,
+    // so the retry loop aggregates rejected attempts' verdicts here and
+    // folds them into the final outcome's trace — the payload reaching
+    // desktop/Sentry then shows EVERY attempted port's verdict, not just
+    // the last attempt's.
+    const attemptProbeVerdicts: OAuthProbeVerdictTraceEntry[] = [];
     let firstRejection: { port: number; verdict: AuthorizeProbeVerdict } | undefined;
     let httpClient: any;
+    let pendingDiagnosticsSuffix: string | undefined;
 
     // One retry-loop attempt. Per-attempt isolation contract (recall#1 F2 +
     // confirm#F2): (a) a rejected attempt invalidates its saved client
@@ -744,7 +753,24 @@ export async function handleAuthenticate(
 
         // Non-fatal (e.g. the 300s callback wait elapsed): today's fall-through
         // to the bottom health probe → auth_required.
-        return { kind: "pending", httpClient: attemptHttpClient };
+        //
+        // REBEL-7F9 Stage 4: THIS is the "redirect started, callback never
+        // arrived" path — connectWithOAuth returned normally (the expected
+        // auth-like redirect swallow), so the discovery trace could never
+        // fire from the client for precisely this bug class. Build the
+        // diagnostics suffix here and carry it on the pending outcome so the
+        // final auth_required response ships it to the desktop (which
+        // extracts + strips it from parsed.message via
+        // extractOAuthDiscoveryTraceFromError, then logs it into the
+        // bug-report/Sentry channel).
+        const diagnosticsSuffix = attemptHttpClient.getOAuthDiagnosticsSuffix({
+          priorProbeVerdicts: attemptProbeVerdicts,
+        });
+        logger.warn("OAuth attempt ended without a callback; diagnostics ride the auth_required response", {
+          package_id,
+          oauth_port: attemptPort,
+        });
+        return { kind: "pending", httpClient: attemptHttpClient, diagnosticsSuffix };
       } finally {
         // (b) stop+await the attempt's callback server — no leaked listeners
         try {
@@ -859,11 +885,18 @@ export async function handleAuthenticate(
         }
         if (outcome.kind === "pending") {
           httpClient = outcome.httpClient;
+          pendingDiagnosticsSuffix = outcome.diagnosticsSuffix;
           break;
         }
 
         // Classified rejection.
         failedPorts.push(attemptPort);
+        attemptProbeVerdicts.push({
+          port: attemptPort,
+          outcome: outcome.verdict.outcome,
+          status: outcome.verdict.status,
+          hint: outcome.verdict.matchedPhrase,
+        });
         if (!firstRejection) {
           firstRejection = { port: attemptPort, verdict: outcome.verdict };
         }
@@ -916,6 +949,9 @@ export async function handleAuthenticate(
         // A floor attempt skips the probe, so "rejected" is unreachable in
         // real code; defensively treat it as pending with its client.
         httpClient = floorOutcome.httpClient;
+        if (floorOutcome.kind === "pending") {
+          pendingDiagnosticsSuffix = floorOutcome.diagnosticsSuffix;
+        }
       }
     } else {
       // Non-wait path (non-OAuth HTTP connectors): unchanged fire-and-forget.
@@ -967,7 +1003,11 @@ export async function handleAuthenticate(
             text: JSON.stringify({
               package_id,
               status: "auth_required",
-              message: "Authentication required - check browser for OAuth prompt",
+              // The Stage 4 diagnostics suffix (present on the "redirect
+              // started, callback never arrived" path) is invisible to the
+              // user: the desktop strips it via
+              // extractOAuthDiscoveryTraceFromError before display.
+              message: `Authentication required - check browser for OAuth prompt${pendingDiagnosticsSuffix ?? ""}`,
             }, null, 2),
           },
         ],

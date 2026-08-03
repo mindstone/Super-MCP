@@ -147,6 +147,22 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
    */
   private lastProbeVerdict?: AuthorizeProbeVerdict;
   /**
+   * Non-consuming copy of the last probe verdict for the OAuth diagnostics
+   * trace (REBEL-7F9 Stage 4). lastProbeVerdict is consume-once — the retry
+   * loop's classification drains it — but the trace needs the verdict even
+   * afterwards (e.g. an ACCEPTED attempt whose callback never arrives: the
+   * catch consumed the verdict, then the diagnostics payload is built).
+   */
+  private probeVerdictForTrace?: AuthorizeProbeVerdict;
+  /**
+   * The exact redirect_uri on the last authorize URL this provider was asked
+   * to redirect to (REBEL-7F9 Stage 4 diagnostics). Recorded BEFORE the
+   * pre-flight probe so even a probe-rejected attempt carries it. Loopback
+   * host+port+path only — the state/client_id/PKCE query params are never
+   * read here.
+   */
+  private lastAuthorizeRedirectUri?: string;
+  /**
    * When true, redirectToAuthorization skips the pre-flight probe. Set by the
    * authenticate handler on saved-port reuse WITH a prior successful token
    * exchange (confirm#F6), and for the browser-open floor attempt (recall#2
@@ -682,6 +698,10 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   }
   
   async redirectToAuthorization(authUrl: URL) {
+    // Record the exact redirect_uri for the diagnostics trace BEFORE the
+    // probe so even a probe-rejected attempt carries it (REBEL-7F9 Stage 4).
+    this.lastAuthorizeRedirectUri = authUrl.searchParams.get("redirect_uri") ?? undefined;
+
     // Authorize pre-flight probe (REBEL-7F9 Stage 3). Kill-switch active →
     // skip the probe entirely: the flow is byte-identical to the pre-probe
     // behavior (confirm#F5).
@@ -697,6 +717,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     } else {
       const verdict = await probeAuthorizeUrl(authUrl.toString());
       this.lastProbeVerdict = verdict;
+      this.probeVerdictForTrace = verdict;
       logger.info("Authorize pre-flight probe verdict", {
         package_id: this.packageId,
         outcome: verdict.outcome,
@@ -832,6 +853,36 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     const verdict = this.lastProbeVerdict;
     this.lastProbeVerdict = undefined;
     return verdict;
+  }
+
+  /**
+   * Non-consuming probe-verdict view for the OAuth diagnostics trace
+   * (REBEL-7F9 Stage 4). Survives consumeProbeVerdict() — see
+   * probeVerdictForTrace above.
+   */
+  getProbeVerdictForTrace(): AuthorizeProbeVerdict | undefined {
+    return this.probeVerdictForTrace;
+  }
+
+  /**
+   * The exact redirect_uri on the last authorize URL (diagnostics trace,
+   * REBEL-7F9 Stage 4). Loopback URL only; no query params are ever read.
+   */
+  getAuthorizeRedirectUri(): string | undefined {
+    return this.lastAuthorizeRedirectUri;
+  }
+
+  /**
+   * The redirect_uris the SDK sends verbatim in the DCR request body —
+   * registerClient POSTs `...provider.clientMetadata` (SDK 1.28.0 auth.js),
+   * so clientMetadata.redirect_uris IS the sent list. Undefined for
+   * static-credential connectors, which skip DCR entirely.
+   */
+  getDcrRedirectUrisSent(): string[] | undefined {
+    if (this.staticCredentials) {
+      return undefined;
+    }
+    return [...this.clientMetadata.redirect_uris];
   }
 
   /**

@@ -138,6 +138,16 @@ vi.mock("../../clients/httpClient.js", async (importOriginal) => {
     });
     healthCheck = vi.fn(async () => (this.finishedAuth ? ("ok" as const) : ("needs_auth" as const)));
     close = vi.fn(async () => {});
+    // Stage 4a: the pending path ("redirect started, callback never
+    // arrived") asks the client for the diagnostics suffix that rides the
+    // auth_required response message.
+    getOAuthDiagnosticsSuffix = vi.fn(
+      (extras?: { priorProbeVerdicts?: Array<Record<string, unknown>> }) =>
+        `\n[super-mcp-oauth-discovery-trace:v1]${JSON.stringify({
+          callbackPort: this.oauthPort,
+          probeVerdicts: extras?.priorProbeVerdicts ?? [],
+        })}`,
+    );
     connectWithOAuth = vi.fn(async () => {
       const provider = this.oauthProvider;
       if (provider?.skipProbe) {
