@@ -82,3 +82,89 @@ describe("OAuthCallbackServer stop() waiter cancellation", () => {
     }
   }, 20_000);
 });
+
+// REBEL-7F9 Stage 4c (k3-r2 F1 + opus-r2 F2, convergent): the `?error=`
+// branch settled the waiter via rejectCallback WITHOUT state validation —
+// the last remaining late-redirect kill path. A stale
+// `?error=access_denied&state=<stale>` from a superseded/foreign flow
+// arriving at a port a newer attempt owns would reject the newer attempt's
+// wait. The branch now applies the same state-check-then-settle pattern the
+// Stage 3 refinement gave the `code` branch.
+describe("OAuthCallbackServer ?error= branch state validation (REBEL-7F9 Stage 4c)", () => {
+  it("a stale error-redirect (state mismatch) gets a 400 and does NOT settle the active wait", async () => {
+    const port = await freePort();
+    const server = new OAuthCallbackServer(port);
+    await server.start();
+    const waiter = server.waitForCallback(30_000, "state-new");
+    let settled: string | undefined;
+    waiter.then(
+      () => {
+        settled = "resolved";
+      },
+      (err: Error) => {
+        settled = `rejected:${err.message}`;
+      },
+    );
+    waiter.catch(() => {}); // mirrors authenticate.ts's losing-promise suppression
+
+    try {
+      // The LATE error-redirect: a superseded attempt's access_denied arrives
+      // at the port the newer attempt now owns, carrying the stale state.
+      const staleRes = await fetch(
+        `http://127.0.0.1:${port}/oauth/callback?error=access_denied&state=state-stale`,
+      );
+      expect(staleRes.status).toBe(400); // state mismatch — rejected, not settled
+
+      // Give any (incorrect) settlement a chance to propagate.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(settled).toBeUndefined();
+
+      // The matching-state error redirect still settles the wait — the guard
+      // must not swallow THIS attempt's genuine provider error.
+      const goodRes = await fetch(
+        `http://127.0.0.1:${port}/oauth/callback?error=access_denied&state=state-new`,
+      );
+      expect(goodRes.status).toBe(200);
+      await expect(waiter).rejects.toThrow("OAuth error: access_denied");
+    } finally {
+      await server.stop();
+    }
+  }, 20_000);
+
+  it("an error-redirect with NO state gets a 400 and does NOT settle the active wait", async () => {
+    const port = await freePort();
+    const server = new OAuthCallbackServer(port);
+    await server.start();
+    const waiter = server.waitForCallback(30_000, "state-new");
+    let settled: string | undefined;
+    waiter.then(
+      () => {
+        settled = "resolved";
+      },
+      (err: Error) => {
+        settled = `rejected:${err.message}`;
+      },
+    );
+    waiter.catch(() => {});
+
+    try {
+      const noStateRes = await fetch(
+        `http://127.0.0.1:${port}/oauth/callback?error=access_denied`,
+      );
+      expect(noStateRes.status).toBe(400);
+
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(settled).toBeUndefined();
+
+      // Control: a matching-state error redirect settles the wait
+      // (non-vacuous — the wait was genuinely still live).
+      const goodRes = await fetch(
+        `http://127.0.0.1:${port}/oauth/callback?error=server_error&state=state-new`,
+      );
+      expect(goodRes.status).toBe(200);
+      await expect(waiter).rejects.toThrow("OAuth error: server_error");
+    } finally {
+      await server.stop();
+    }
+  }, 20_000);
+});

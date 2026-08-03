@@ -303,6 +303,60 @@ export class OAuthCallbackServer {
     }
   }
 
+  /**
+   * State-check-then-settle guard shared by the `code` and `?error=` branches
+   * (REBEL-7F9 Stage 3 refinement for `code`; Stage 4c extended it to
+   * `?error=` per two convergent round-2 reviewers — the error branch was the
+   * last remaining late-redirect kill path). A callback without this
+   * attempt's state is NOT this attempt's callback — most often a LATE
+   * redirect from a superseded attempt arriving at the port a newer attempt
+   * now owns. Such a callback must never settle (resolve OR reject) the
+   * newer attempt's wait: the mismatch is deterministically observable (warn
+   * log + 400 page) but the current attempt's wait survives for the correct
+   * callback or its own timeout. In a genuine CSRF shape the legitimate
+   * callback can still arrive and settle the wait.
+   *
+   * "unverified" means no expected state is armed (state validation not in
+   * use for this wait) — the caller proceeds exactly as before.
+   */
+  private checkCallbackState(
+    receivedState: string | null,
+  ): "valid" | "missing" | "mismatch" | "unverified" {
+    if (!this.expectedState) {
+      return "unverified";
+    }
+    if (!receivedState) {
+      logger.warn("OAuth callback missing state parameter; not settling the callback wait", {
+        has_expected_state: true,
+      });
+      return "missing";
+    }
+    if (!this.safeCompare(receivedState, this.expectedState)) {
+      logger.warn("OAuth state mismatch; not settling the callback wait (stale or foreign callback)", {
+        // Don't log actual state values for security
+        received_length: receivedState.length,
+        expected_length: this.expectedState.length,
+      });
+      return "mismatch";
+    }
+    logger.debug("OAuth state validated successfully");
+    return "valid";
+  }
+
+  /** Shared 400 response for a state-invalid callback (never settles the waiter). */
+  private respondInvalidState(
+    res: http.ServerResponse,
+    check: "missing" | "mismatch",
+  ): void {
+    res.writeHead(400, SECURITY_HEADERS);
+    res.end(
+      generateErrorHtml(
+        "invalid_state",
+        check === "missing" ? "Missing state parameter" : "State parameter mismatch",
+      ),
+    );
+  }
+
   getPort(): number {
     return this.port;
   }
@@ -318,6 +372,18 @@ export class OAuthCallbackServer {
       const receivedState = url.searchParams.get("state");
 
       if (error) {
+        // State-check-then-settle (REBEL-7F9 Stage 4c): the error branch
+        // previously settled the waiter via rejectCallback WITHOUT state
+        // validation — a stale `?error=access_denied&state=<stale>` from a
+        // superseded/foreign flow arriving at a port a newer attempt owns
+        // would kill the new attempt's wait. Same guard as the code branch:
+        // mismatched/missing state → 400 + warn log, do NOT settle.
+        const stateCheck = this.checkCallbackState(receivedState);
+        if (stateCheck === "missing" || stateCheck === "mismatch") {
+          this.respondInvalidState(res, stateCheck);
+          return;
+        }
+
         res.writeHead(200, SECURITY_HEADERS);
         res.end(generateErrorHtml(error, errorDescription || undefined));
 
@@ -326,39 +392,16 @@ export class OAuthCallbackServer {
         }
       } else if (code) {
         // Validate state parameter if expected state is set (CSRF protection)
-        if (this.expectedState) {
-          if (!receivedState) {
-            logger.warn("OAuth callback missing state parameter; not settling the callback wait", {
-              has_expected_state: true,
-            });
-            res.writeHead(400, SECURITY_HEADERS);
-            res.end(generateErrorHtml("invalid_state", "Missing state parameter"));
-            // Do NOT settle the waiter: a callback without this attempt's
-            // state is not this attempt's callback — most often a LATE
-            // redirect from a superseded attempt arriving at the port a newer
-            // attempt now owns (REBEL-7F9 Stage 3 refinement: such a callback
-            // must not be able to kill the subsequent attempt's wait). The
-            // wait continues for the correct callback or its own timeout.
-            return;
-          }
-
-          if (!this.safeCompare(receivedState, this.expectedState)) {
-            logger.warn("OAuth state mismatch; not settling the callback wait (stale or foreign callback)", {
-              // Don't log actual state values for security
-              received_length: receivedState.length,
-              expected_length: this.expectedState.length,
-            });
-            res.writeHead(400, SECURITY_HEADERS);
-            res.end(generateErrorHtml("invalid_state", "State parameter mismatch"));
-            // Same rationale as the missing-state branch above: the mismatch
-            // is deterministically observable (warn log + 400 page) but the
-            // current attempt's wait survives a superseded attempt's late
-            // callback. In a genuine CSRF shape the legitimate callback can
-            // still arrive and settle the wait.
-            return;
-          }
-
-          logger.debug("OAuth state validated successfully");
+        const stateCheck = this.checkCallbackState(receivedState);
+        if (stateCheck === "missing" || stateCheck === "mismatch") {
+          this.respondInvalidState(res, stateCheck);
+          // Do NOT settle the waiter: a callback without this attempt's
+          // state is not this attempt's callback — most often a LATE
+          // redirect from a superseded attempt arriving at the port a newer
+          // attempt now owns (REBEL-7F9 Stage 3 refinement: such a callback
+          // must not be able to kill the subsequent attempt's wait). The
+          // wait continues for the correct callback or its own timeout.
+          return;
         }
 
         res.writeHead(200, SECURITY_HEADERS);
