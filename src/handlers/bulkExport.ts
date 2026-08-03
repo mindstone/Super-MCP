@@ -799,6 +799,9 @@ async function validatePackageAvailable(packageId: string, catalog: Catalog): Pr
   if (packageStatus === "auth_required") {
     return `Package '${packageId}' requires authentication. Run 'authenticate(package_id: "${packageId}")'.`;
   }
+  if (packageStatus === "setup_incomplete") {
+    return `Package '${packageId}' is not set up on this instance. Signing in again will not fix it.`;
+  }
   if (packageStatus === "error") {
     const reason = catalog.getPackageError(packageId) || "See logs for details";
     return `Package '${packageId}' is unavailable: ${reason}`;

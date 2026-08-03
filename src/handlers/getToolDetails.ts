@@ -63,7 +63,12 @@ export async function handleGetToolDetails(
   }
 
   // Resolve each tool into a map (keyed by tool_id) for input-order output
-  type ResultEntry = ToolInfo & { not_found?: boolean; error?: string };
+  type ResultEntry = ToolInfo & {
+    not_found?: boolean;
+    error?: string;
+    status?: "setup_incomplete";
+    reason?: string;
+  };
   const resultMap = new Map<string, ResultEntry>();
 
   for (const [packageId, toolRequests] of byPackage) {
@@ -71,18 +76,24 @@ export async function handleGetToolDetails(
       await catalog.ensurePackageLoaded(packageId);
       const packageStatus = catalog.getPackageStatus(packageId);
 
-      if (packageStatus === "auth_required" || packageStatus === "error") {
+      if (packageStatus === "auth_required" || packageStatus === "setup_incomplete" || packageStatus === "error") {
         for (const req of toolRequests) {
-          const reason = packageStatus === "auth_required"
+          const setupReason = catalog.getPackageError(packageId);
+          const description = packageStatus === "auth_required"
             ? `Package '${packageId}' requires authentication.`
-            : `Package '${packageId}' is unavailable: ${catalog.getPackageError(packageId) || 'unknown error'}`;
+            : packageStatus === "setup_incomplete"
+              ? `Package '${packageId}' is not set up on this instance (${setupReason || 'setup incomplete'}). Signing in again will not fix it.`
+              : `Package '${packageId}' is unavailable: ${setupReason || 'unknown error'}`;
           resultMap.set(req.toolId, {
             package_id: packageId,
             tool_id: req.toolId,
             name: req.toolId,
             schema_hash: "",
-            error: "package_unavailable",
-            description: reason,
+            error: packageStatus === "setup_incomplete" ? "setup_incomplete" : "package_unavailable",
+            description,
+            ...(packageStatus === "setup_incomplete"
+              ? { status: packageStatus, reason: setupReason }
+              : {}),
           });
         }
         continue;

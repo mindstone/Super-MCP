@@ -343,6 +343,7 @@ export class PackageRegistry {
           oauthClientId: extConfig.oauthClientId,
           oauthClientSecret: extConfig.oauthClientSecret,
           catalogId: extConfig.catalogId,
+          setupStatus: extConfig.setupStatus,
         };
         
         packages.push(pkg);
@@ -469,7 +470,8 @@ export class PackageRegistry {
             oauth: pkg.oauth,
             oauthClientId: pkg.oauthClientId,
             oauthClientSecret: pkg.oauthClientSecret,
-            auth: pkg.auth
+            auth: pkg.auth,
+            setupStatus: pkg.setupStatus,
           } as any;
         }
       }
@@ -914,6 +916,13 @@ export class PackageRegistry {
   }
 
   async getClient(packageId: string): Promise<McpClient> {
+    const configuredPackage = this.getPackage(packageId);
+    if (configuredPackage?.setupStatus?.state === "blocked") {
+      throw new Error(
+        `Package '${packageId}' setup is incomplete: ${configuredPackage.setupStatus.reason}`,
+      );
+    }
+
     // Check if we already have a connected client
     let client = this.clients.get(packageId);
     if (client) {
@@ -1352,6 +1361,7 @@ export class PackageRegistry {
       oauthClientId: extConfig.oauthClientId,
       oauthClientSecret: extConfig.oauthClientSecret,
       catalogId: extConfig.catalogId,
+      setupStatus: extConfig.setupStatus,
     };
   }
 

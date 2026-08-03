@@ -40,6 +40,14 @@ export async function handleListTools(
       data: { package_id, status: packageStatus },
     };
   }
+  if (packageStatus === "setup_incomplete") {
+    const reason = catalog.getPackageError(package_id) || "setup_incomplete";
+    throw {
+      code: ERROR_CODES.PACKAGE_UNAVAILABLE,
+      message: `Package '${package_id}' is not set up on this instance. Signing in again will not fix it.`,
+      data: { package_id, status: packageStatus, reason },
+    };
+  }
   if (packageStatus === "error") {
     const reason = catalog.getPackageError(package_id) || "See logs for details";
     throw {

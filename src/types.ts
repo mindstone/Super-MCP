@@ -3,6 +3,15 @@ export interface StandardMcpConfig {
   mcpServers: Record<string, StandardServerConfig>;
 }
 
+export type SetupIncompleteReason = "missing_managed_credentials";
+
+export interface PackageSetupStatus {
+  state: "blocked";
+  reason: SetupIncompleteReason;
+}
+
+export type CatalogStatus = "ready" | "auth_required" | "setup_incomplete" | "error";
+
 export interface StandardServerConfig {
   command?: string;
   args?: string[];
@@ -19,6 +28,8 @@ export interface StandardServerConfig {
   // The Rebel Core agent-turn watchdog is the real effective ceiling; this is the
   // last-resort upstream cap. Can be overridden by SUPER_MCP_TOOL_TIMEOUT environment variable.
   timeout?: number;
+  /** Cloud-owned setup state. A blocked package must never be spawned. */
+  setupStatus?: PackageSetupStatus;
 }
 
 // Extended super-mcp config format (backward compatibility)
@@ -85,6 +96,8 @@ export interface PackageConfig {
   // Catalog ID for connector identification (e.g., "bamboohr", "bundled-google")
   // Used for admin-disabled tool resolution
   catalogId?: string;
+  /** Cloud-owned setup state. A blocked package must never be spawned. */
+  setupStatus?: PackageSetupStatus;
 }
 
 /**
@@ -121,7 +134,7 @@ export interface PackageInfo {
   health?: "ok" | "error" | "unavailable";
   summary: string;
   visibility: "default" | "hidden";
-  catalog_status?: "ready" | "auth_required" | "error";
+  catalog_status?: CatalogStatus;
   catalog_error?: string;
 }
 

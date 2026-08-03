@@ -59,6 +59,20 @@ export async function handleReadResource(
     };
   }
 
+  await catalog.ensurePackageLoaded(packageId);
+  const packageStatus = catalog.getPackageStatus(packageId);
+  if (packageStatus === "setup_incomplete") {
+    throw {
+      code: ERROR_CODES.PACKAGE_UNAVAILABLE,
+      message: `Package '${packageId}' is not set up on this instance. Signing in again will not fix it.`,
+      data: {
+        package_id: packageId,
+        status: packageStatus,
+        reason: catalog.getPackageError(packageId) || "setup_incomplete",
+      },
+    };
+  }
+
   // Get client for package
   const client = await registry.getClient(packageId);
   if (!client) {
