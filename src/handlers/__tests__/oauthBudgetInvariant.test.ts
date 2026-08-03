@@ -70,6 +70,10 @@ describe("OAuth budget invariant (desktop outer budget vs inner legs)", () => {
   const FAST_REJECTED_ATTEMPT_MS =
     SETUP_MARGIN_MS + AUTHORIZE_PROBE_TIMEOUT_MS + CONNECT_TIMEOUT_MS;
 
+  // The browser-open floor attempt's own setup leg (skipProbe ⇒ no probe
+  // leg): the same local sub-second operations the SETUP_MARGIN_MS covers.
+  const FLOOR_ATTEMPT_SETUP_MS = SETUP_MARGIN_MS;
+
   // The accepted (or browser-floor) attempt runs today's full success path.
   const FULL_ATTEMPT_MS =
     OAUTH_CALLBACK_TIMEOUT_MS + // browser sign-in window (authenticate.ts)
@@ -87,22 +91,48 @@ describe("OAuth budget invariant (desktop outer budget vs inner legs)", () => {
 
     expect(innerWorstCaseMs).toBe(492_000);
     expect(innerWorstCaseMs).toBeLessThan(DESKTOP_AUTHENTICATE_TOOL_TIMEOUT_MS);
+    // The kill-switch path keeps the legacy sub-500s budget, pinned against
+    // the imported constants (testing F7), not only mirrored literals.
+    expect(innerWorstCaseMs).toBeLessThan(500_000);
   });
 
-  it("multi-attempt worst case (max classified rejections + one full attempt) stays inside the raised 620s desktop budget", () => {
+  it("accepted-attempt path (MAX_PORT_ATTEMPTS - 1 rejections + one full attempt) keeps the ~58s margin", () => {
     // REBEL-7F9 Stage 3 (confirm#F1/F8): up to MAX_PORT_ATTEMPTS - 1 fast
     // probe-rejected retry legs precede the one full attempt whose 300s
-    // callback wait applies exactly once.
+    // callback wait applies exactly once. This is the margin that protects a
+    // slow legitimate login on the final attempt.
     //   112s pre-check+setup + 2 × 35s (setup 2s + probe 3s + connect/DCR 30s)
-    //   + 380s full attempt = 562s < 620s.
-    const multiAttemptWorstCaseMs =
+    //   + 380s full attempt = 562s < 620s (~58s margin).
+    const acceptedPathWorstCaseMs =
       PRE_CHECK_AND_SETUP_MS +
       (MAX_PORT_ATTEMPTS - 1) * FAST_REJECTED_ATTEMPT_MS +
       FULL_ATTEMPT_MS;
 
     expect(MAX_PORT_ATTEMPTS).toBe(3);
     expect(AUTHORIZE_PROBE_TIMEOUT_MS).toBe(3_000);
-    expect(multiAttemptWorstCaseMs).toBe(562_000);
-    expect(multiAttemptWorstCaseMs).toBeLessThan(DESKTOP_AUTHENTICATE_TOOL_TIMEOUT_MS);
+    expect(acceptedPathWorstCaseMs).toBe(562_000);
+    expect(acceptedPathWorstCaseMs).toBeLessThan(DESKTOP_AUTHENTICATE_TOOL_TIMEOUT_MS);
+  });
+
+  it("uniform-rejection floor path (MAX_PORT_ATTEMPTS rejections + floor attempt) is the true worst case, ~21s margin", () => {
+    // Stage 3 review F1 (all five reviewers): the browser-open floor runs a
+    // FOURTH attempt (runAttempt(firstRejection.port, { skipProbe: true }))
+    // after all MAX_PORT_ATTEMPTS candidates classify-reject — the "bounded
+    // at MAX_PORT_ATTEMPTS probe attempts, then the browser-open floor" retry
+    // test pins 4 httpClient instances. The floor attempt's own setup leg
+    // (~2s) applies, but not its probe leg (skipProbe). This is the real
+    // no-progress worst case:
+    //   112s pre-check+setup + 3 × 35s fast-rejected legs + ~2s floor setup
+    //   + 380s full attempt = 599s < 620s (~21s margin, not 58s).
+    // A leg growth that keeps the accepted-path sum green can still breach
+    // THIS path — the guard exists to catch exactly that.
+    const floorPathWorstCaseMs =
+      PRE_CHECK_AND_SETUP_MS +
+      MAX_PORT_ATTEMPTS * FAST_REJECTED_ATTEMPT_MS +
+      FLOOR_ATTEMPT_SETUP_MS +
+      FULL_ATTEMPT_MS;
+
+    expect(floorPathWorstCaseMs).toBe(599_000);
+    expect(floorPathWorstCaseMs).toBeLessThan(DESKTOP_AUTHENTICATE_TOOL_TIMEOUT_MS);
   });
 });

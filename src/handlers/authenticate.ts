@@ -31,9 +31,12 @@ export const HEALTH_CHECK_TIMEOUT_MS = 20_000;
 // Stage 3). Rejected attempts die at the probe (≤ AUTHORIZE_PROBE_TIMEOUT_MS),
 // so the retry legs are cheap; the 300s callback wait applies exactly ONCE
 // (accepted attempt or browser-floor attempt — recall#2 F4). The grown budget
-// invariant (oauthBudgetInvariant.test.ts) sums (MAX_PORT_ATTEMPTS - 1) fast
-// retry legs + one full attempt against the desktop's
-// AUTHENTICATE_TOOL_TIMEOUT_MS.
+// invariant (oauthBudgetInvariant.test.ts) models BOTH paths against the
+// desktop's AUTHENTICATE_TOOL_TIMEOUT_MS: the accepted-attempt path
+// ((MAX_PORT_ATTEMPTS - 1) fast legs + one full attempt = 562s, ~58s margin —
+// the margin that protects slow legitimate logins) AND the uniform-rejection
+// floor path (MAX_PORT_ATTEMPTS fast legs + the floor attempt's setup + one
+// full attempt = 599s, ~21s margin — the true no-progress worst case).
 export const MAX_PORT_ATTEMPTS = 3;
 
 // Outcome of one retry-loop attempt. "response" is terminal (success or a
