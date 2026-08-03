@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleAuthenticate } from "../authenticate.js";
 import type { Catalog } from "../../catalog.js";
 import type { PackageRegistry } from "../../registry.js";
+import { checkPortAvailable, findAvailablePortFromCandidates } from "../../utils/portFinder.js";
+import { SimpleOAuthProvider } from "../../auth/providers/simple.js";
 import { OAUTH_REDIRECT_URI_REJECTED_CODE, type AuthorizeProbeVerdict } from "../../auth/authorizeProbe.js";
 
 // REBEL-7F9 Stage 3 repro pin + isolation contract (bug_mode red-first).
@@ -20,6 +22,8 @@ const {
   httpClientInstances,
   rejectPorts,
   hangPorts,
+  uncodedRejectionPorts,
+  omitVerdictPorts,
   finishAuthError,
 } = vi.hoisted(() => ({
   mockLogger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -33,6 +37,13 @@ const {
   // Kept separate from rejectPorts: a classified rejection kills the attempt
   // at the probe, so the callback wait never gets a chance to hang.
   hangPorts: new Set<number>(),
+  // Rejected ports where the mock records the verdict but throws an UNcoded
+  // generic Error — simulating an SDK re-wrap that drops .code (testing F2:
+  // pins the verdict disjunct of the handler's OR-classifier on its own).
+  uncodedRejectionPorts: new Set<number>(),
+  // Rejected ports where the mock throws the coded error but records NO
+  // verdict (pins the code disjunct on its own).
+  omitVerdictPorts: new Set<number>(),
   // When set, the mock's finishOAuth rejects with this error (coded finishAuth
   // timeout shape) instead of resolving.
   finishAuthError: { current: null as Error | null },
@@ -87,12 +98,17 @@ vi.mock("../../auth/callbackServer.js", () => {
     start = vi.fn(async () => {});
     stop = vi.fn(async () => {});
     // Genuinely async: the ACCEPTED attempt's callback arrives (a tick later,
-    // like a real browser redirect); a rejected/hung port's callback NEVER
-    // arrives — exactly the pre-fix hang shape.
+    // like a real browser redirect). A hang port's callback NEVER arrives and
+    // the wait times out — a 25ms scaled stand-in for the real
+    // OAUTH_CALLBACK_TIMEOUT_MS so the suite stays fast; it also makes losing
+    // callback promises genuinely REJECT after the race settles, exercising
+    // isolation clause (d)'s suppression for real.
     waitForCallback = vi.fn((timeoutMs: number, state?: string) => {
       const port = this.port;
-      return new Promise<string>((resolve) => {
-        if (!hangPorts.has(port)) {
+      return new Promise<string>((resolve, reject) => {
+        if (hangPorts.has(port)) {
+          setTimeout(() => reject(new Error("OAuth callback timeout")), 25);
+        } else {
           setTimeout(() => resolve("auth-code-123"), 0);
         }
       });
@@ -110,12 +126,17 @@ vi.mock("../../clients/httpClient.js", async (importOriginal) => {
   class MockHttpMcpClient {
     oauthPort: number;
     oauthProvider: any;
+    // Tracks a completed token exchange so healthCheck can distinguish a
+    // completed flow from a pending/timed-out one (the real client answers
+    // needs_auth without tokens).
+    finishedAuth = false;
     finishOAuth = vi.fn(async () => {
       if (finishAuthError.current) {
         throw finishAuthError.current;
       }
+      this.finishedAuth = true;
     });
-    healthCheck = vi.fn(async () => "ok" as const);
+    healthCheck = vi.fn(async () => (this.finishedAuth ? ("ok" as const) : ("needs_auth" as const)));
     close = vi.fn(async () => {});
     connectWithOAuth = vi.fn(async () => {
       const provider = this.oauthProvider;
@@ -124,14 +145,30 @@ vi.mock("../../clients/httpClient.js", async (importOriginal) => {
         // pending while the flow is in flight (today's shape).
         return new Promise<never>(() => {});
       }
-      if (rejectPorts.has(this.oauthPort) && process.env.SUPER_MCP_OAUTH_PROBE_DISABLE !== "1") {
+      // k3 F5: NO env-var gate here — the mock ALWAYS emits the classified-
+      // rejection stimulus for rejectPorts. The handler's own kill-switch
+      // gates (maxAttempts = 1, !probeDisabled in the classifier) must be what
+      // ignores it on the disabled path; a mock that internalized the gate
+      // could not detect their removal.
+      if (rejectPorts.has(this.oauthPort)) {
         // What the real provider + SDK 1.28.0 do on a classified rejection:
         // record the verdict out-of-band, then throw the coded error.
-        provider.probeVerdict = {
-          outcome: "rejected",
-          status: 403,
-          matchedPhrase: "Callback URL mismatch",
-        };
+        if (!omitVerdictPorts.has(this.oauthPort)) {
+          provider.probeVerdict = {
+            outcome: "rejected",
+            status: 403,
+            matchedPhrase: "Callback URL mismatch",
+          };
+        }
+        if (uncodedRejectionPorts.has(this.oauthPort)) {
+          // SDK re-wrap simulation: the verdict channel carries the signal;
+          // the thrown error lost its .code. The message is deliberately
+          // neither auth-like NOR fatal-classified (no timeout/DCR tokens) —
+          // the real probe message is too — so the race settles via the
+          // (scaled) callback timeout, and the handler classifies on the
+          // verdict channel alone.
+          throw new Error("SDK re-wrapped transport error during authorization redirect");
+        }
         const error = new Error(
           "The provider's sign-in page rejected this connection's registered callback address before the browser was opened (callback URL mismatch).",
         );
@@ -182,12 +219,24 @@ async function run(pkgOverrides: Record<string, unknown> = {}) {
 }
 
 beforeEach(() => {
-  vi.clearAllMocks();
+  // testing F3: resetAllMocks (not clearAllMocks) — clearAllMocks leaves mock
+  // IMPLEMENTATIONS in place, leaking resolved values across tests (the
+  // kill-switch test's skip-predicate inputs were order-dependent). Re-
+  // establish the static/module defaults explicitly below.
+  vi.resetAllMocks();
+  (checkPortAvailable as any).mockResolvedValue(true);
+  (findAvailablePortFromCandidates as any).mockImplementation(
+    async (candidates: number[]) => candidates[0],
+  );
+  (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(undefined);
+  (SimpleOAuthProvider.hasPersistedAccessToken as any).mockResolvedValue(false);
   callbackServerInstances.length = 0;
   providerInstances.length = 0;
   httpClientInstances.length = 0;
   rejectPorts.clear();
   hangPorts.clear();
+  uncodedRejectionPorts.clear();
+  omitVerdictPorts.clear();
   finishAuthError.current = null;
   delete process.env.SUPER_MCP_OAUTH_PROBE_DISABLE;
 });
@@ -198,12 +247,11 @@ afterEach(() => {
 
 describe("authorize-probe rejection retry loop (REBEL-7F9 repro pin)", () => {
   it("saved port 5173 rejected → attempt 2 at 8080 succeeds (the reported user's exact state)", async () => {
-    const { SimpleOAuthProvider } = await import("../../auth/providers/simple.js");
     (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(5173);
     (SimpleOAuthProvider.hasPersistedAccessToken as any).mockResolvedValue(false);
     rejectPorts.add(5173);
 
-    const { parsed } = await run();
+    const { registry, parsed } = await run();
 
     expect(parsed.status).toBe("authenticated");
 
@@ -233,12 +281,18 @@ describe("authorize-probe rejection retry loop (REBEL-7F9 repro pin)", () => {
     expect(state2).toBeTruthy();
     expect(state1).not.toBe(state2);
 
+    // (e) the clients registry holds exactly the ACCEPTED attempt's client —
+    // the rejected attempt's clients.delete/set left no residue. (clients is
+    // private on PackageRegistry; reach the test double's map via a cast.)
+    const clientsMap = (registry as unknown as { clients: Map<string, unknown> }).clients;
+    expect(clientsMap.size).toBe(1);
+    expect(clientsMap.get(PACKAGE_ID)).toBe(httpClientInstances[1]);
+
     // The saved-5173 user has no prior tokens → the probe still runs (no skip).
     expect(providerInstances[0].setSkipAuthorizeProbe).toHaveBeenCalledWith(false);
   }, 10_000);
 
   it("probe skipped on saved-port reuse WITH a prior successful token exchange", async () => {
-    const { SimpleOAuthProvider } = await import("../../auth/providers/simple.js");
     (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(5173);
     (SimpleOAuthProvider.hasPersistedAccessToken as any).mockResolvedValue(true);
     // No rejections — the flow is today's happy path.
@@ -251,7 +305,6 @@ describe("authorize-probe rejection retry loop (REBEL-7F9 repro pin)", () => {
     // Fresh registration (no saved port): attempt 1 = 5173 (candidate order),
     // rejected → attempt 2 must be 8080 even though attempt 1 was NOT a saved
     // port.
-    const { SimpleOAuthProvider } = await import("../../auth/providers/simple.js");
     (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(undefined);
     rejectPorts.add(5173);
 
@@ -261,9 +314,43 @@ describe("authorize-probe rejection retry loop (REBEL-7F9 repro pin)", () => {
     expect(httpClientInstances.map((c) => c.oauthPort)).toEqual([5173, 8080]);
   }, 10_000);
 
+  it("verdict channel alone classifies the rejection: SDK re-wrap strips .code, loop still advances the port (testing F2)", async () => {
+    // The mock records the verdict but throws an UNcoded generic Error. The
+    // handler's fatal-connect classifier sees neither the code nor a fatal
+    // message, so the race settles via the (scaled) callback timeout — and
+    // the catch classifies on the VERDICT disjunct alone. Deleting
+    // `probeVerdict?.outcome === "rejected"` from authenticate.ts turns this
+    // into a pending fall-through (auth_required), so the pin is non-vacuous.
+    (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(5173);
+    rejectPorts.add(5173);
+    uncodedRejectionPorts.add(5173);
+    hangPorts.add(5173); // browser never opened → the callback never arrives
+
+    const { parsed } = await run();
+
+    expect(parsed.status).toBe("authenticated");
+    expect(httpClientInstances.map((c) => c.oauthPort)).toEqual([5173, 8080]);
+    expect(providerInstances[0].invalidateCredentials).toHaveBeenCalledWith("client");
+  }, 10_000);
+
+  it("error code alone classifies the rejection: verdict channel absent, coded error survives (testing F2)", async () => {
+    // The mock throws the coded error but records NO verdict. Deleting the
+    // `.code === OAUTH_REDIRECT_URI_REJECTED_CODE` disjunct from the
+    // authenticate.ts catch turns this into a pending fall-through
+    // (auth_required), so the pin is non-vacuous.
+    (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(5173);
+    rejectPorts.add(5173);
+    omitVerdictPorts.add(5173);
+
+    const { parsed } = await run();
+
+    expect(parsed.status).toBe("authenticated");
+    expect(httpClientInstances.map((c) => c.oauthPort)).toEqual([5173, 8080]);
+    expect(providerInstances[0].invalidateCredentials).toHaveBeenCalledWith("client");
+  }, 10_000);
+
   it("bounded at MAX_PORT_ATTEMPTS probe attempts, then the browser-open floor runs today's wait (recall#2 F1(b))", async () => {
     // Uniform rejection: EVERY candidate is classified-rejected.
-    const { SimpleOAuthProvider } = await import("../../auth/providers/simple.js");
     (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(undefined);
     rejectPorts.add(5173);
     rejectPorts.add(8080);
@@ -295,8 +382,59 @@ describe("authorize-probe rejection retry loop (REBEL-7F9 repro pin)", () => {
     }
   }, 15_000);
 
+  it("floor hang variant (k3 F3): floor browser opens but the callback never arrives → auth_required after the bounded wait", async () => {
+    // Uniform rejection, and the floor's port never delivers a callback — the
+    // exact degrade-to-today shape (today's silent 300s hang → honest
+    // auth_required, never a pre-browser terminal failure).
+    (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(undefined);
+    rejectPorts.add(5173);
+    rejectPorts.add(8080);
+    rejectPorts.add(5174);
+    hangPorts.add(5173); // the floor re-opens the FIRST rejected candidate
+
+    const { parsed } = await run();
+
+    expect(parsed.status).toBe("auth_required");
+    // 3 probe attempts + 1 floor attempt (skip-probe ⇒ browser opened).
+    expect(httpClientInstances).toHaveLength(4);
+    expect(providerInstances[3].setSkipAuthorizeProbe).toHaveBeenCalledWith(true);
+    expect(callbackServerInstances[3].port).toBe(5173);
+    // The floor attempt never invalidates and its client stays pending.
+    expect(providerInstances[3].invalidateCredentials).not.toHaveBeenCalled();
+  }, 15_000);
+
+  it("isolation (d): a losing callback promise that rejects AFTER the race settled cannot affect subsequent attempts", async () => {
+    // Attempt-1's callback wait rejects at 25ms — AFTER the probe rejection
+    // already settled its race. The late rejection must not corrupt attempt
+    // 2's flow or outcome.
+    //
+    // Mutation note (recorded from an actual mutation run): deleting the
+    // catch-site `callbackPromise?.catch(() => {})` suppression in
+    // authenticate.ts does NOT fail this test — Promise.race's internal
+    // reactions already count the loser as handled, so an
+    // unhandledRejection detector can never fire for these promises. The
+    // detector below is kept as a canary for OTHER stray rejections in the
+    // flow; the real pin here is outcome isolation.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(5173);
+      rejectPorts.add(5173);
+      hangPorts.add(5173);
+      const { parsed } = await run();
+      expect(parsed.status).toBe("authenticated");
+      expect(httpClientInstances.map((c) => c.oauthPort)).toEqual([5173, 8080]);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
+  }, 10_000);
+
   it("static-cred connector: classified rejection → fast coded error, NO port advance, NO invalidation", async () => {
-    const { SimpleOAuthProvider } = await import("../../auth/providers/simple.js");
     (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(undefined);
     rejectPorts.add(5173);
 
@@ -310,25 +448,29 @@ describe("authorize-probe rejection retry loop (REBEL-7F9 repro pin)", () => {
     expect(providerInstances[0].invalidateCredentials).not.toHaveBeenCalled();
   }, 10_000);
 
-  it("kill-switch SUPER_MCP_OAUTH_PROBE_DISABLE=1: single attempt, no invalidation, today's flow", async () => {
+  it("kill-switch SUPER_MCP_OAUTH_PROBE_DISABLE=1: a coded-rejection stimulus on the wire is IGNORED — single attempt, no retry, no invalidation (k3 F5)", async () => {
     process.env.SUPER_MCP_OAUTH_PROBE_DISABLE = "1";
-    const { SimpleOAuthProvider } = await import("../../auth/providers/simple.js");
     (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(5173);
-    // Even with a rejection-shaped verdict on the wire, the disabled path must
-    // not retry or invalidate — it is byte-identical to today.
+    // Hostile stimulus: the mock emits the classified-rejection verdict +
+    // coded error UNCONDITIONALLY (no env gate in the mock). Only the
+    // handler's own gates (maxAttempts = 1; !probeDisabled in the classifier)
+    // can keep the disabled path byte-identical to today.
     rejectPorts.add(5173);
 
     const { parsed } = await run();
 
-    // No probe ⇒ no classified rejection acted on: single attempt, browser
-    // flow runs today's course (the mock's 5173 callback resolves → success).
+    // No retry, no invalidation: the disabled path must not act on the
+    // stimulus even though it arrived.
     expect(providerInstances).toHaveLength(1);
+    expect(httpClientInstances).toHaveLength(1);
     expect(providerInstances[0].invalidateCredentials).not.toHaveBeenCalled();
-    expect(parsed.status).toBe("authenticated");
+    // The single attempt degrades to today's non-completing outcome (the
+    // browser flow never completes in this stimulus shape) instead of
+    // advancing the port.
+    expect(parsed.status).toBe("auth_required");
   }, 10_000);
 
   it("finishAuth timeout on an accepted attempt still classifies by its own code (no interference)", async () => {
-    const { SimpleOAuthProvider } = await import("../../auth/providers/simple.js");
     (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(undefined);
     const { FINISH_AUTH_TIMEOUT_MS, OAUTH_FINISH_AUTH_TIMEOUT_CODE } = await import(
       "../../clients/httpClient.js"
