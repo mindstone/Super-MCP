@@ -392,10 +392,13 @@ describe("authorize-probe rejection retry loop (REBEL-7F9 repro pin)", () => {
     }
   }, 15_000);
 
-  it("floor hang variant (k3 F3): floor browser opens but the callback never arrives → auth_required after the bounded wait", async () => {
-    // Uniform rejection, and the floor's port never delivers a callback — the
-    // exact degrade-to-today shape (today's silent 300s hang → honest
-    // auth_required, never a pre-browser terminal failure).
+  it("floor hang variant (k3 F3 + Stage 5 refinement F2): floor browser opens but the callback never arrives → DISTINCT auth_floor_exhausted after the bounded wait", async () => {
+    // Uniform rejection, and the floor's port never delivers a callback.
+    // Stage 5 refinement (F2): this post-callback-wait-elapsed FLOOR outcome
+    // must NOT exit through the live-pending auth_required string ("check
+    // browser for OAuth prompt" — says "OAuth", points at a browser page that
+    // already failed, no provider-side hint; and auth_required is also the
+    // legitimate still-waiting surface — researcher F9's conflation hazard).
     (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(undefined);
     rejectPorts.add(5173);
     rejectPorts.add(8080);
@@ -404,7 +407,14 @@ describe("authorize-probe rejection retry loop (REBEL-7F9 repro pin)", () => {
 
     const { parsed } = await run();
 
-    expect(parsed.status).toBe("auth_required");
+    expect(parsed.status).toBe("auth_floor_exhausted");
+    // Distinct, honest, jargon-free message — never the stale pending string.
+    const messageBase = parsed.message.split("\n[super-mcp-oauth-discovery-trace:v1]")[0];
+    expect(messageBase).not.toContain("check browser");
+    expect(messageBase).not.toMatch(/OAuth|redirect_?uri|DCR|Auth0|localhost/i);
+    expect(messageBase).toMatch(/their side/i);
+    // The Stage 4 diagnostics suffix still rides the message for the desktop.
+    expect(parsed.message).toContain("[super-mcp-oauth-discovery-trace:v1]");
     // 3 probe attempts + 1 floor attempt (skip-probe ⇒ browser opened).
     expect(httpClientInstances).toHaveLength(4);
     expect(providerInstances[3].setSkipAuthorizeProbe).toHaveBeenCalledWith(true);
@@ -457,14 +467,17 @@ describe("authorize-probe rejection retry loop (REBEL-7F9 repro pin)", () => {
     expect(providerInstances).toHaveLength(1);
     expect(providerInstances[0].invalidateCredentials).not.toHaveBeenCalled();
 
-    // Stage 5 (a) copy shape: the user-facing `error` field (the field the
-    // desktop displays first) must say — the provider's sign-in page rejected
-    // the connection; the problem is on THEIR side; here's what to do.
+    // Stage 5 (a) + refinement (F3) copy shape: the user-facing `error`
+    // field (the field the desktop displays first) must say — the provider's
+    // sign-in page rejected the connection; the problem is on THEIR side;
+    // here's what to do. F3: ONE primary action — the in-app bug report —
+    // leads; the remaining asks are demoted to a trailing "you can also".
     expect(parsed.error).toMatch(/sign-in page rejected the connection/);
     expect(parsed.error).toMatch(/their side, not yours/);
-    expect(parsed.error).toMatch(/try again later/i);
-    expect(parsed.error).toMatch(/contact their support/i);
     expect(parsed.error).toMatch(/bug report/i);
+    expect(parsed.error.indexOf("bug report")).toBeLessThan(parsed.error.search(/try again later/i));
+    expect(parsed.error).toMatch(/try again later/i);
+    expect(parsed.error).toMatch(/their support/i);
     // Technical detail stays OUT of the user-facing field: no ports, no
     // OAuth-internals jargon, no vendor names.
     expect(parsed.error).not.toMatch(/redirect_?uri|DCR|Auth0|localhost|callback URL/i);

@@ -195,8 +195,13 @@ describe("handleAuthenticate finishAuth timeout classification", () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.status).toBe("error");
     // User-facing field: plain-language, actionable, jargon-free.
-    expect(parsed.error).toMatch(/automatic sign-in setup failed/);
-    expect(parsed.error).toMatch(/manual configuration/);
+    // Stage 5 refinement (F4): says what to DO next (the connector's help
+    // page / its support), with "manual configuration" and "pre-registered
+    // sign-in details" de-jargoned.
+    expect(parsed.error).toMatch(/couldn't set up automatic sign-in/);
+    expect(parsed.error).toMatch(/API key/i);
+    expect(parsed.error).toMatch(/help page|support/i);
+    expect(parsed.error).not.toMatch(/manual configuration|pre-registered/i);
     expect(parsed.error).not.toContain("OAuth setup failed");
     expect(parsed.error).not.toContain("dynamic client registration");
     expect(parsed.error).not.toMatch(/redirect_?uri|DCR|Auth0/i);

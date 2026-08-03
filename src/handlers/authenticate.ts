@@ -410,6 +410,11 @@ export async function handleAuthenticate(
     let firstRejection: { port: number; verdict: AuthorizeProbeVerdict } | undefined;
     let httpClient: any;
     let pendingDiagnosticsSuffix: string | undefined;
+    // Stage 5 refinement (F2): true only when the BROWSER-FLOOR attempt ran
+    // and its callback wait elapsed with no callback — the post-wait floor
+    // outcome is NOT the live-pending "still waiting" surface (researcher
+    // F9's conflation hazard) and must exit with a distinct status/message.
+    let floorWaitExhausted = false;
 
     // One retry-loop attempt. Per-attempt isolation contract (recall#1 F2 +
     // confirm#F2): (a) a rejected attempt invalidates its saved client
@@ -748,7 +753,11 @@ export async function handleAuthenticate(
                   text: JSON.stringify({
                     package_id,
                     status: "error",
-                    error: "This connector's automatic sign-in setup failed. It may need manual configuration (an API key or pre-registered sign-in details) instead of one-click sign-in.",
+                    // Stage 5 refinement (F4): say what to DO next (the
+                    // connector's help page / its support), with "manual
+                    // configuration" / "pre-registered sign-in details"
+                    // de-jargoned for a non-technical reader.
+                    error: "This connector couldn't set up automatic sign-in. It may need an API key or other sign-in details from the provider instead. Check the connector's help page or contact its support to get those details, then try connecting again.",
                     message: errMsg,
                   }, null, 2),
                 },
@@ -929,9 +938,13 @@ export async function handleAuthenticate(
                   package_id,
                   status: "error",
                   code: OAUTH_REDIRECT_URI_REJECTED_CODE,
+                  // Stage 5 refinement (F3): ONE primary action (the in-app
+                  // bug report) leads; the rest are demoted to a trailing
+                  // "you can also" — three asks in one sentence buried the
+                  // action we actually want.
                   error:
                     "Sign-in couldn't start — this provider's sign-in page rejected the connection (it doesn't recognize this app's return address). " +
-                    "That's a problem on their side, not yours. Try again later, or contact their support — and send us a bug report so we can nudge them too.",
+                    "That's a problem on their side, not yours. Send us a bug report and we'll raise it with them — you can also try again later or let their support know.",
                   message: (outcome.verdict.matchedPhrase
                     ? `Pre-browser probe verdict: ${outcome.verdict.matchedPhrase}`
                     : "Pre-browser probe classified the provider's sign-in page as rejecting this connection's callback address.") + staticCredDiagnosticsSuffix,
@@ -974,6 +987,9 @@ export async function handleAuthenticate(
         httpClient = floorOutcome.httpClient;
         if (floorOutcome.kind === "pending") {
           pendingDiagnosticsSuffix = floorOutcome.diagnosticsSuffix;
+          // The floor attempt's 300s callback wait elapsed with no callback
+          // (Stage 5 refinement F2) — the bottom branch exits distinctly.
+          floorWaitExhausted = true;
         }
       }
     } else {
@@ -1025,12 +1041,23 @@ export async function handleAuthenticate(
             type: "text",
             text: JSON.stringify({
               package_id,
-              status: "auth_required",
+              // Stage 5 refinement (F2): the floor-exhausted outcome (every
+              // candidate classified-rejected, floor browser opened, 300s
+              // callback wait elapsed) gets a DISTINCT status + honest
+              // provider-side message — never the stale live-pending string
+              // (says "OAuth", points at a browser page that already failed).
+              // The desktop maps the status to its own user-facing copy
+              // (mcpService OAUTH_FLOOR_EXHAUSTED_USER_MESSAGE). The plain
+              // auth_required string below stays byte-identical for the
+              // legitimate pending/"still waiting" surface.
+              status: floorWaitExhausted ? "auth_floor_exhausted" : "auth_required",
               // The Stage 4 diagnostics suffix (present on the "redirect
               // started, callback never arrived" path) is invisible to the
               // user: the desktop strips it via
               // extractOAuthDiscoveryTraceFromError before display.
-              message: `Authentication required - check browser for OAuth prompt${pendingDiagnosticsSuffix ?? ""}`,
+              message: (floorWaitExhausted
+                ? "Sign-in didn't finish — the provider's sign-in page may have shown an error (a problem on their side, not yours)"
+                : "Authentication required - check browser for OAuth prompt") + (pendingDiagnosticsSuffix ?? ""),
             }, null, 2),
           },
         ],

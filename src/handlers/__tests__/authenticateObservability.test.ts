@@ -258,7 +258,7 @@ describe("diagnostics fire on 'redirect started, callback never arrived' (REBEL-
     ]);
   });
 
-  it("uniform rejection floor: the floor attempt's auth_required message carries every attempt's verdict", async () => {
+  it("uniform rejection floor: the floor attempt's auth_floor_exhausted message carries every attempt's verdict", async () => {
     rejectPorts.add(5173);
     rejectPorts.add(8080);
     rejectPorts.add(5174);
@@ -266,7 +266,9 @@ describe("diagnostics fire on 'redirect started, callback never arrived' (REBEL-
 
     const parsed = await run();
 
-    expect(parsed.status).toBe("auth_required");
+    // Stage 5 refinement (F2): the floor-exhausted outcome is DISTINCT from
+    // the live-pending auth_required surface (researcher F9 hazard).
+    expect(parsed.status).toBe("auth_floor_exhausted");
     // 3 probe attempts + 1 floor attempt at the first rejected port.
     expect(httpClientInstances.map((c) => c.oauthPort)).toEqual([5173, 8080, 5174, 5173]);
     const { payload } = extractSuffix(parsed.message);
