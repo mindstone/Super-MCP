@@ -702,6 +702,13 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
         outcome: verdict.outcome,
         status: verdict.status,
         matched_phrase: verdict.matchedPhrase,
+        // Raw AS Location (3xx shapes) + network-failure detail (inconclusive
+        // fail-open) at info level: the message never carries the Location
+        // (k3 F1), so this log is the observability channel for both the
+        // accepted/rejected Location shapes and why a probe failed open
+        // (runtime-safety F7).
+        location: verdict.location,
+        error: verdict.error,
       });
       if (verdict.outcome === "rejected") {
         // redirectStarted is set only AFTER the probe verdict (recall#2
@@ -839,7 +846,16 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       const raw = await fs.readFile(tokenPath, "utf8");
       const tokens = JSON.parse(raw);
       return typeof tokens?.access_token === "string" && tokens.access_token.length > 0;
-    } catch {
+    } catch (error) {
+      // Fail-safe direction (false ⇒ the probe runs), but never SILENTLY: a
+      // persistent cause (EACCES on the token dir, corrupt JSON) would
+      // otherwise invisibly disable the probe-skip optimization on every
+      // authenticate forever (runtime-safety F4). Common cause is ENOENT (no
+      // prior token exchange) — debug level is the right volume for that.
+      logger.debug("hasPersistedAccessToken: token file unreadable; the probe will run", {
+        package_id: packageId,
+        error: error instanceof Error ? error.message : String(error),
+      });
       return false;
     }
   }

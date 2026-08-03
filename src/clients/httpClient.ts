@@ -7,6 +7,7 @@ import { McpClient, PackageConfig, ReadResourceResult } from "../types.js";
 import { getLogger } from "../logging.js";
 import { SimpleOAuthProvider, RefreshOnlyOAuthProvider } from "../auth/providers/index.js";
 import { OAUTH_REDIRECT_URI_REJECTED_CODE } from "../auth/authorizeProbe.js";
+import { isAuthLikeErrorMessageText } from "../auth/authLikeVocabulary.js";
 import type { OAuthErrorSummary, StaticOAuthCredentials } from "../auth/providers/simple.js";
 import { runRefreshTransaction } from "../auth/refreshTransaction.js";
 
@@ -338,22 +339,12 @@ export { OAUTH_REDIRECT_URI_REJECTED_CODE } from "../auth/authorizeProbe.js";
 // (src/handlers/__tests__/oauthBudgetInvariant.test.ts).
 export const LIST_TOOLS_TIMEOUT_MS = 10_000;
 
-/**
- * Pure form of the auth-like message vocabulary, exported so the authorize
- * probe's rejection-message contract can be pinned by tests (recall#2 F2(c)):
- * a message matching these tokens is treated as an EXPECTED auth outcome and
- * swallowed (connectWithOAuth below), so the probe's coded rejection message
- * must provably never contain any of them.
- */
-export function isAuthLikeErrorMessageText(message: string): boolean {
-  const normalized = message.toLowerCase();
-  return normalized.includes("redirect initiated") ||
-    normalized.includes("unauthorized") ||
-    normalized.includes("401") ||
-    normalized.includes("invalid_token") ||
-    normalized.includes("missing authorization") ||
-    normalized.includes("authentication required");
-}
+// The auth-like message vocabulary lives in the auth/authLikeVocabulary.ts
+// LEAF module so auth/authorizeProbe.ts can enforce the rejection-message
+// contract at throw time without closing an authorizeProbe ↔ httpClient
+// import cycle (runtime-safety F6). Re-exported here for existing consumers
+// (tests pin the contract against this module's surface).
+export { isAuthLikeErrorMessageText };
 
 export class HttpMcpClient implements McpClient {
   private client: Client;

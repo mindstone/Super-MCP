@@ -1,4 +1,5 @@
 import { getLogger } from "../logging.js";
+import { isAuthLikeErrorMessageText } from "./authLikeVocabulary.js";
 
 const logger = getLogger();
 
@@ -112,12 +113,20 @@ export function classifyProbeResponse(input: {
   }
 
   if (status >= 300 && status < 400) {
-    if (location && ERROR_LOCATION_HINT.test(location)) {
+    const hint = location ? location.match(ERROR_LOCATION_HINT) : null;
+    if (location && hint) {
+      // Fixed label + the matched HINT TOKEN only — never the raw Location
+      // (k3 F1 / runtime-safety F2): the Location is AS-controlled, and an
+      // RFC 6749 error redirect carrying error=unauthorized_client or
+      // invalid_token would smuggle auth-like vocabulary into the coded
+      // error's message, breaking propagation contract (c)'s "provably never
+      // auth-like". The raw Location stays on the verdict and is logged at
+      // info level by the provider (simple.ts verdict log) for observability.
       return {
         outcome: "rejected",
         status,
         location,
-        matchedPhrase: `Location header: ${location}`,
+        matchedPhrase: `Location header hints an error redirect (matched "${hint[0]}")`,
       };
     }
     return { outcome: "accepted", status, location: location ?? undefined };
@@ -138,7 +147,22 @@ export function classifyProbeResponse(input: {
 /** Build the coded rejection error thrown out of redirectToAuthorization. */
 export function buildRedirectUriRejectedError(verdict: AuthorizeProbeVerdict): Error {
   const detail = verdict.matchedPhrase ? ` (matched: "${verdict.matchedPhrase}")` : "";
-  const error = new Error(`${REDIRECT_URI_MISMATCH_MESSAGE_BASE}${detail}.`);
+  let message = `${REDIRECT_URI_MISMATCH_MESSAGE_BASE}${detail}.`;
+  // Self-enforcing vocabulary guard (runtime-safety F6): the matchedPhrase
+  // detail is built from AS-controlled data, so no fixture set can PROVE the
+  // final message never matches the auth-like swallow vocabulary — check the
+  // constructed message here, at the single construction site, and on any
+  // match drop the detail to the fixed base message (logging the full detail
+  // instead). This makes the swallow class unrepresentable regardless of
+  // what an AS puts in a Location header or response body.
+  if (isAuthLikeErrorMessageText(message)) {
+    logger.warn(
+      "Probe rejection detail contained auth-like vocabulary; dropping it from the coded error message",
+      { matched_phrase: verdict.matchedPhrase },
+    );
+    message = `${REDIRECT_URI_MISMATCH_MESSAGE_BASE}.`;
+  }
+  const error = new Error(message);
   (error as NodeJS.ErrnoException).code = OAUTH_REDIRECT_URI_REJECTED_CODE;
   return error;
 }

@@ -166,6 +166,40 @@ describe("rejection error vocabulary carve-out (recall#2 F2(c))", () => {
       REDIRECT_URI_MISMATCH_MESSAGE_BASE,
     );
   });
+
+  it("a hostile 3xx Location carrying RFC 6749 error vocabulary never leaks into the coded message", () => {
+    // error=unauthorized_client + invalid_token in the description are both
+    // legal RFC 6749 and both auth-like tokens — an AS error-redirect must not
+    // smuggle them into the rejection message (propagation contract (c)).
+    const verdict = classifyProbeResponse({
+      status: 302,
+      location:
+        "https://auth.example.com/oauth/authorize?error=unauthorized_client&error_description=invalid_token%20for%20this%20client&state=abc",
+    });
+    expect(verdict.outcome).toBe("rejected");
+    // The matchedPhrase is a fixed label + the matched HINT TOKEN, never the URL.
+    expect(verdict.matchedPhrase).toBe('Location header hints an error redirect (matched "error=")');
+    expect(verdict.matchedPhrase).not.toContain("unauthorized_client");
+    const error = buildRedirectUriRejectedError(verdict);
+    expect(error.message).not.toContain("unauthorized_client");
+    expect(error.message).not.toContain("invalid_token");
+    expect(isAuthLikeErrorMessageText(error.message)).toBe(false);
+  });
+
+  it("self-enforcing at throw time: a hostile matchedPhrase is dropped to the fixed base message", () => {
+    // Defense-in-depth (runtime-safety F6): even if a future classification
+    // change puts auth-like vocabulary into matchedPhrase, the construction
+    // site drops the detail rather than building a swallowable message.
+    const error = buildRedirectUriRejectedError({
+      outcome: "rejected",
+      status: 302,
+      matchedPhrase: "Location header: https://x.example/?error=unauthorized_client",
+    });
+    expect(error.message).not.toContain("unauthorized_client");
+    expect(isAuthLikeErrorMessageText(error.message)).toBe(false);
+    expect(error.message).toContain(REDIRECT_URI_MISMATCH_MESSAGE_BASE);
+    expect((error as NodeJS.ErrnoException).code).toBe(OAUTH_REDIRECT_URI_REJECTED_CODE);
+  });
 });
 
 describe("probeAuthorizeUrl", () => {
