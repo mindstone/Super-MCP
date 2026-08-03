@@ -249,6 +249,18 @@ function generateErrorHtml(error: string, errorDescription?: string): string {
 </html>`;
 }
 
+/**
+ * Distinct rejection message for a waitForCallback waiter cancelled by stop()
+ * (REBEL-7F9 Stage 3 refinement, runtime-safety F3): a probe-rejected
+ * attempt's race has already settled when its callback server is torn down,
+ * so the waiter must not linger until its own 300s timer fires. The distinct
+ * message gives the callback-during-teardown race a deterministic, observable
+ * outcome instead of silence. Callers that lost the race attach rejection
+ * suppression, so this rejection is expected to be handled.
+ */
+export const OAUTH_CALLBACK_SERVER_STOPPED_MESSAGE =
+  "OAuth callback server stopped before a callback arrived";
+
 /** Security headers for OAuth callback responses */
 const SECURITY_HEADERS = {
   "Content-Type": "text/html; charset=utf-8",
@@ -264,6 +276,7 @@ export class OAuthCallbackServer {
   private port: number;
   private resolveCallback?: (code: string) => void;
   private rejectCallback?: (error: Error) => void;
+  private callbackTimer?: NodeJS.Timeout;
   private expectedState?: string;
   private serviceId?: string;
 
@@ -315,30 +328,33 @@ export class OAuthCallbackServer {
         // Validate state parameter if expected state is set (CSRF protection)
         if (this.expectedState) {
           if (!receivedState) {
-            logger.error("OAuth callback missing state parameter (potential CSRF)", {
+            logger.warn("OAuth callback missing state parameter; not settling the callback wait", {
               has_expected_state: true,
             });
             res.writeHead(400, SECURITY_HEADERS);
             res.end(generateErrorHtml("invalid_state", "Missing state parameter"));
-
-            if (this.rejectCallback) {
-              this.rejectCallback(new Error("OAuth callback missing state parameter (potential CSRF attack)"));
-            }
+            // Do NOT settle the waiter: a callback without this attempt's
+            // state is not this attempt's callback — most often a LATE
+            // redirect from a superseded attempt arriving at the port a newer
+            // attempt now owns (REBEL-7F9 Stage 3 refinement: such a callback
+            // must not be able to kill the subsequent attempt's wait). The
+            // wait continues for the correct callback or its own timeout.
             return;
           }
 
           if (!this.safeCompare(receivedState, this.expectedState)) {
-            logger.error("OAuth state mismatch (potential CSRF)", {
+            logger.warn("OAuth state mismatch; not settling the callback wait (stale or foreign callback)", {
               // Don't log actual state values for security
               received_length: receivedState.length,
               expected_length: this.expectedState.length,
             });
             res.writeHead(400, SECURITY_HEADERS);
             res.end(generateErrorHtml("invalid_state", "State parameter mismatch"));
-
-            if (this.rejectCallback) {
-              this.rejectCallback(new Error("OAuth state mismatch (potential CSRF attack)"));
-            }
+            // Same rationale as the missing-state branch above: the mismatch
+            // is deterministically observable (warn log + 400 page) but the
+            // current attempt's wait survives a superseded attempt's late
+            // callback. In a genuine CSRF shape the legitimate callback can
+            // still arrive and settle the wait.
             return;
           }
 
@@ -464,22 +480,49 @@ export class OAuthCallbackServer {
     
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
+        this.callbackTimer = undefined;
         reject(new Error("OAuth callback timeout"));
       }, timeout);
+      this.callbackTimer = timer;
 
       // Wrap both resolve and reject to clear the timer
       this.resolveCallback = (code) => {
         clearTimeout(timer);
+        this.callbackTimer = undefined;
         resolve(code);
       };
       this.rejectCallback = (error) => {
         clearTimeout(timer);
+        this.callbackTimer = undefined;
         reject(error);
       };
     });
   }
 
+  /**
+   * Settle a pending waitForCallback waiter with the distinct "server
+   * stopped" rejection and clear its timeout. Idempotent; a no-op when no
+   * waiter is armed or the waiter already settled.
+   */
+  private cancelPendingWaiter(): void {
+    if (this.callbackTimer) {
+      clearTimeout(this.callbackTimer);
+      this.callbackTimer = undefined;
+    }
+    if (this.rejectCallback) {
+      this.rejectCallback(new Error(OAUTH_CALLBACK_SERVER_STOPPED_MESSAGE));
+      this.resolveCallback = undefined;
+      this.rejectCallback = undefined;
+    }
+  }
+
   async stop(): Promise<void> {
+    // Cancel any pending waiter FIRST (before the no-servers early return and
+    // before the shutdown grace): a probe-rejected attempt's race already
+    // settled, so its waiter would otherwise leak a live 300s timer + closure
+    // past teardown (runtime-safety F3).
+    this.cancelPendingWaiter();
+
     const servers = [this.serverV4, this.serverV6].filter(
       (s): s is http.Server => s !== undefined
     );
