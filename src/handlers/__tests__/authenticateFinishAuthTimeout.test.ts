@@ -35,6 +35,8 @@ vi.mock("../../logging.js", () => ({
 vi.mock("../../utils/portFinder.js", () => ({
   findAvailablePort: vi.fn(async () => 5173),
   checkPortAvailable: vi.fn(async () => true),
+  findAvailablePortFromCandidates: vi.fn(async () => 5173),
+  getOAuthCallbackPortCandidates: vi.fn(() => [5173, 8080, 5174]),
 }));
 
 vi.mock("../../auth/providers/simple.js", () => {

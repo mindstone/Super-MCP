@@ -1,7 +1,7 @@
 import { PackageRegistry } from "../registry.js";
 import { Catalog } from "../catalog.js";
 import { getLogger } from "../logging.js";
-import { findAvailablePort, checkPortAvailable } from "../utils/portFinder.js";
+import { checkPortAvailable, findAvailablePortFromCandidates, getOAuthCallbackPortCandidates } from "../utils/portFinder.js";
 import { SimpleOAuthProvider } from "../auth/providers/simple.js";
 import { OAUTH_FINISH_AUTH_TIMEOUT_CODE } from "../clients/httpClient.js";
 import { formatError } from "../utils/formatError.js";
@@ -348,7 +348,15 @@ export async function handleAuthenticate(
     let oauthPort = 5173;
     let oauthProvider: SimpleOAuthProvider | undefined;
     let oauthState: string | undefined;
-    
+
+    // Static credentials from config (for servers without DCR like Asana V2).
+    // Computed BEFORE port selection: static-cred connectors keep the linear
+    // 5173-first candidate order (their redirect_uri is pinned in a vendor
+    // dashboard, so probing alternate ports is futile).
+    const staticCreds = pkg.oauthClientId
+      ? { clientId: pkg.oauthClientId, clientSecret: pkg.oauthClientSecret }
+      : undefined;
+
     if (wait_for_completion) {
       try {
         // Part A: Try to reuse saved OAuth port if available
@@ -364,10 +372,18 @@ export async function handleAuthenticate(
               saved_port: savedPort,
               message: "Client registration will be invalidated if mismatch"
             });
-            oauthPort = await findAvailablePort(5173, 10);
+            oauthPort = await findAvailablePortFromCandidates(
+              getOAuthCallbackPortCandidates({ staticCredentials: !!staticCreds })
+            );
           }
         } else {
-          oauthPort = await findAvailablePort(5173, 10);
+          // Fresh registration: ordered candidate sequence — [5173, 8080,
+          // 5174, …5182] for non-static-cred connectors (attempt 1 identical
+          // to the historical scan; strict allow-list vendors self-correct on
+          // attempt 2, REBEL-7F9 Stage 2b).
+          oauthPort = await findAvailablePortFromCandidates(
+            getOAuthCallbackPortCandidates({ staticCredentials: !!staticCreds })
+          );
           logger.info("Found available OAuth port", { package_id, oauth_port: oauthPort });
         }
       } catch (portError) {
@@ -396,10 +412,6 @@ export async function handleAuthenticate(
       callbackServer.setServiceId(package_id);
       
       // Create OAuth provider early and generate state for CSRF protection
-      // Pass static credentials from config if available (for servers without DCR like Asana V2)
-      const staticCreds = pkg.oauthClientId
-        ? { clientId: pkg.oauthClientId, clientSecret: pkg.oauthClientSecret }
-        : undefined;
       oauthProvider = new SimpleOAuthProvider(package_id, oauthPort, staticCreds);
       await oauthProvider.initialize();
       

@@ -38,6 +38,75 @@ export const OAUTH_CALLBACK_HOST = OAUTH_CALLBACK_HOST_V4;
 const IPV6_UNSUPPORTED_CODES = new Set(["EADDRNOTAVAIL", "EAFNOSUPPORT", "EINVAL"]);
 
 /**
+ * Default OAuth callback port — attempt 1 for fresh registrations stays on this
+ * port so the happy path is byte-identical to the historical linear scan
+ * (REBEL-7F9 Stage 2b, recall#1 F1).
+ */
+export const OAUTH_CALLBACK_DEFAULT_PORT = 5173;
+
+/** End of the historical linear scan range (5173..5182, 10 ports). */
+export const OAUTH_CALLBACK_PORT_SCAN_END = 5182;
+
+/**
+ * Port some strict allow-list authorization servers (e.g. an Auth0 app whose
+ * Allowed Callback URLs were pinned at a vendor dashboard) accept for loopback
+ * redirects. Inserted at candidate position 2 — NOT first — so attempt 1 is
+ * unchanged fleet-wide and such vendors self-correct on attempt 2, then stick
+ * via saved-port reuse.
+ */
+export const OAUTH_CALLBACK_VENDOR_COMMON_PORT = 8080;
+
+/**
+ * Ordered OAuth callback port candidates (REBEL-7F9 Stage 2b).
+ *
+ * Fresh, non-static-credential order: [5173, 8080, 5174, …5182] — 8080 at
+ * position 2 (see OAUTH_CALLBACK_VENDOR_COMMON_PORT). Static-credential
+ * connectors keep the plain linear 5173-first order: their redirect_uri is
+ * pinned out-of-band in a vendor dashboard, so probing alternate ports is
+ * futile and must not change their behavior.
+ */
+export function getOAuthCallbackPortCandidates(
+  options: { staticCredentials?: boolean } = {}
+): number[] {
+  const linear: number[] = [];
+  for (let p = OAUTH_CALLBACK_DEFAULT_PORT; p <= OAUTH_CALLBACK_PORT_SCAN_END; p++) {
+    linear.push(p);
+  }
+  if (options.staticCredentials) {
+    return linear;
+  }
+  return [OAUTH_CALLBACK_DEFAULT_PORT, OAUTH_CALLBACK_VENDOR_COMMON_PORT, ...linear.slice(1)];
+}
+
+/**
+ * Find the first available port from an ordered candidate list, filtered by
+ * checkPortAvailable. Unlike findAvailablePort's linear scan, the caller owns
+ * the ordering — this is what the OAuth retry loop advances across.
+ */
+export async function findAvailablePortFromCandidates(
+  candidates: readonly number[]
+): Promise<number> {
+  for (let index = 0; index < candidates.length; index++) {
+    const port = candidates[index];
+    const isAvailable = await checkPortAvailable(port);
+    if (isAvailable) {
+      if (index > 0) {
+        logger.info("Found available port after skipping busy candidates", {
+          requested_port: candidates[0],
+          actual_port: port,
+          attempts: index + 1,
+        });
+      }
+      return port;
+    }
+    logger.debug("Port in use, trying next candidate", { port, attempt: index + 1 });
+  }
+  throw new Error(
+    `No available port found among candidates ${candidates.join(", ")}`
+  );
+}
+
+/**
  * Find an available port starting from a given port number.
  * Tries consecutive ports until one is available on BOTH IPv4 and IPv6
  * (or IPv6 is unsupported), or max attempts reached.

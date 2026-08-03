@@ -18,6 +18,8 @@ vi.mock('../src/logging.js', () => ({
 vi.mock('../src/utils/portFinder.js', () => ({
   findAvailablePort: vi.fn().mockResolvedValue(5173),
   checkPortAvailable: vi.fn().mockResolvedValue(true),
+  findAvailablePortFromCandidates: vi.fn().mockResolvedValue(5173),
+  getOAuthCallbackPortCandidates: vi.fn(() => [5173, 8080, 5174]),
 }));
 
 vi.mock('../src/utils/formatError.js', () => ({

@@ -56,6 +56,38 @@ export function stripObtainedAtStamp(tokens: any): any {
 const MAX_AUTHORITATIVE_ECHOES = 8;
 
 /**
+ * Loopback host spellings treated as equivalent for OAuth redirect URIs
+ * (RFC 8252 §7.3): a vendor echoing `127.0.0.1` where we sent `localhost`
+ * must not look like a different registration. Node's URL keeps the brackets
+ * on IPv6 literals (`[::1]`).
+ */
+const LOOPBACK_HOSTNAMES = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+function isLoopbackHostname(hostname: string): boolean {
+  return LOOPBACK_HOSTNAMES.has(hostname.toLowerCase());
+}
+
+/**
+ * Normalize a redirect URI for staleness comparison: loopback host spellings
+ * (localhost ≡ 127.0.0.1 ≡ [::1]) fold to a single token so spelling variants
+ * don't per-launch-invalidate a healthy registration. Returns undefined when
+ * the URI is unparseable.
+ */
+function normalizeRedirectUriForCompare(uri: string): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(uri);
+  } catch {
+    return undefined;
+  }
+  const host = isLoopbackHostname(url.hostname) ? "loopback" : url.hostname.toLowerCase();
+  const port =
+    url.port ||
+    (url.protocol === "https:" ? "443" : url.protocol === "http:" ? "80" : "");
+  return `${url.protocol}//${host}:${port}${url.pathname}${url.search}${url.hash}`;
+}
+
+/**
  * Simple OAuth provider that opens browser for authorization
  */
 export interface StaticOAuthCredentials {
@@ -122,7 +154,10 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   
   /**
    * Get the OAuth callback port from a saved client registration.
-   * Returns undefined if no registration exists or redirect_uri is malformed.
+   * Scans redirect_uris for the FIRST LOOPBACK URI rather than trusting [0] —
+   * RFC 7591 doesn't guarantee echo order, and non-loopback entries can't host
+   * our callback server. Returns undefined if no registration exists, no
+   * loopback URI is present, or every candidate is malformed.
    */
   static async getSavedClientPort(packageId: string): Promise<number | undefined> {
     try {
@@ -130,13 +165,22 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       const clientPath = path.join(tokenStoragePath, `${packageId}_client.json`);
       const clientData = await fs.readFile(clientPath, "utf8");
       const clientInfo = JSON.parse(clientData);
-      
-      const redirectUri = clientInfo?.redirect_uris?.[0];
-      if (!redirectUri) return undefined;
-      
-      const url = new URL(redirectUri);
-      const port = parseInt(url.port, 10);
-      return isNaN(port) ? undefined : port;
+
+      const redirectUris = clientInfo?.redirect_uris;
+      if (!Array.isArray(redirectUris)) return undefined;
+
+      for (const uri of redirectUris) {
+        if (typeof uri !== "string") continue;
+        try {
+          const url = new URL(uri);
+          if (!isLoopbackHostname(url.hostname)) continue;
+          const port = parseInt(url.port, 10);
+          if (!isNaN(port)) return port;
+        } catch {
+          continue; // Malformed entry — keep scanning
+        }
+      }
+      return undefined;
     } catch {
       return undefined; // No saved client or parse error
     }
@@ -881,50 +925,83 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   }
   
   /**
-   * Check if the saved client registration has a different port than current.
-   * If mismatch detected, invalidates ALL credentials (client + tokens).
-   * 
-   * @returns true if credentials were invalidated due to mismatch
+   * Check whether the DISK-PERSISTED DCR client registration is stale relative
+   * to the current redirectUrl and, if so, invalidate ALL credentials
+   * (client + tokens) so the flow re-registers with the right redirect_uris.
+   *
+   * Stale when (REBEL-7F9 Stage 2a):
+   *   - the normalized redirect_uris list does NOT include the current
+   *     redirectUrl (full-URI `.includes()` compare, NOT `[0] ===` — RFC 7591
+   *     doesn't guarantee echo order; loopback spellings
+   *     localhost ≡ 127.0.0.1 ≡ [::1] are normalized so spelling variants
+   *     don't per-launch-invalidate), or
+   *   - a client file EXISTS on disk but its redirect_uris is missing or
+   *     unparseable.
+   *
+   * NOT stale when the client file is ABSENT (fresh registration — and
+   * static-credential providers, which deliberately skip the disk client load
+   * in loadPersistedData and synthesize redirect_uris in memory from the
+   * current port; classifying them stale would invalidate WORKING tokens).
+   *
+   * Reads ONLY the disk-persisted client file — never the in-memory
+   * savedClientInfo, which redirectToAuthorization may have synthesized
+   * WITHOUT redirect_uris.
+   *
+   * @returns true if credentials were invalidated due to staleness
    */
   async checkAndInvalidateOnPortMismatch(): Promise<boolean> {
-    if (!this.savedClientInfo?.redirect_uris?.[0]) {
-      return false; // No saved client, nothing to mismatch
+    // Static-credential providers are never stale on redirect-URI grounds:
+    // their redirect_uris are synthesized in memory from the current port and
+    // their pre-registered tokens WORK — invalidating them would break a
+    // healthy connector. (Behavior-identical to the old code, whose static
+    // branch was unreachable: the synthesized redirect_uris always matched
+    // the current port.)
+    if (this.staticCredentials) {
+      return false;
     }
-    
+
+    const clientPath = path.join(this.tokenStoragePath, `${this.packageId}_client.json`);
+    let raw: string;
     try {
-      const savedUri = this.savedClientInfo.redirect_uris[0];
-      const savedUrl = new URL(savedUri);
-      const savedPort = parseInt(savedUrl.port, 10);
-      
-      if (isNaN(savedPort) || savedPort === this.oauthPort) {
-        return false; // No mismatch
-      }
-      
-      // For static credentials, just update the redirect URI (don't invalidate the client)
-      if (this.staticCredentials) {
-        this.savedClientInfo.redirect_uris = [`http://localhost:${this.oauthPort}/oauth/callback`];
-        logger.info("Updated static OAuth redirect_uri for new port", {
-          package_id: this.packageId,
-          old_port: savedPort,
-          new_port: this.oauthPort,
-        });
-        // Still invalidate tokens (they may be bound to the old redirect_uri)
-        await this.invalidateCredentials('tokens');
-        return true;
-      }
-      
-      logger.warn("OAuth port mismatch detected, invalidating stale credentials", {
+      raw = await fs.readFile(clientPath, "utf8");
+    } catch {
+      return false; // No client file on disk (fresh registration) → not stale
+    }
+
+    let redirectUris: unknown;
+    try {
+      redirectUris = JSON.parse(raw)?.redirect_uris;
+    } catch {
+      redirectUris = undefined; // File present but unparseable → stale
+    }
+
+    const normalizedCurrent = normalizeRedirectUriForCompare(this.redirectUrl);
+    const isStale =
+      !Array.isArray(redirectUris) ||
+      redirectUris.length === 0 ||
+      !redirectUris.some(
+        (uri) =>
+          typeof uri === "string" &&
+          normalizeRedirectUriForCompare(uri) === normalizedCurrent
+      );
+
+    if (!isStale) {
+      return false;
+    }
+
+    try {
+      logger.warn("OAuth client registration is stale, invalidating credentials", {
         package_id: this.packageId,
-        saved_port: savedPort,
-        current_port: this.oauthPort,
-        message: "Will re-register client with new redirect_uri"
+        current_redirect_url: this.redirectUrl,
+        saved_redirect_uris: Array.isArray(redirectUris) ? redirectUris : undefined,
+        message: "Will re-register client with the current redirect_uri",
       });
-      
+
       // Must invalidate BOTH - tokens are bound to client_id
       await this.invalidateCredentials('all');
       return true;
     } catch (error) {
-      logger.debug("Error checking port mismatch", {
+      logger.debug("Error invalidating stale OAuth credentials", {
         package_id: this.packageId,
         error: error instanceof Error ? error.message : String(error)
       });

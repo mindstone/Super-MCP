@@ -3,6 +3,7 @@ import * as path from "path";
 import { SuperMcpConfig, PackageConfig, McpClient, StandardServerConfig, ExtendedServerConfig, SkippedPackage, ValidationResult } from "./types.js";
 import { StdioMcpClient } from "./clients/stdioClient.js";
 import { HttpMcpClient } from "./clients/httpClient.js";
+import { SimpleOAuthProvider } from "./auth/providers/simple.js";
 import { getLogger } from "./logging.js";
 import { SecurityPolicy, SecurityConfig, setSecurityPolicy } from "./security.js";
 
@@ -1285,7 +1286,17 @@ export class PackageRegistry {
     if (config.transport === "stdio") {
       client = new StdioMcpClient(packageId, config);
     } else {
-      client = new HttpMcpClient(packageId, config);
+      // Ambient-port coherence (REBEL-7F9 Stage 2c, recall#1 F9): pass the
+      // persisted DCR client's callback port through instead of defaulting
+      // blind to 5173. Inert today (ambient clients run refresh-only OAuth,
+      // which carries no redirect_uri), but the non-5173 saved-registration
+      // population grows with the candidate-sequence port ordering, so the
+      // ambient default must not diverge from what was actually registered.
+      let oauthPort: number | undefined;
+      if (config.oauth) {
+        oauthPort = await SimpleOAuthProvider.getSavedClientPort(packageId);
+      }
+      client = new HttpMcpClient(packageId, config, oauthPort ? { oauthPort } : undefined);
     }
     onClientCreated?.(client);
 
