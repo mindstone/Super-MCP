@@ -68,6 +68,13 @@ vi.mock("../../auth/providers/simple.js", () => {
       this.probeVerdict = undefined;
       return verdict;
     });
+    // Stage 4: the NON-consuming trace slot — the retry loop's classification
+    // drains the consume-once slot above, so the diagnostics payload reads
+    // this mirror instead (mirrors simple.ts probeVerdictForTrace).
+    probeVerdictTrace?: AuthorizeProbeVerdict;
+    getProbeVerdictForTrace = vi.fn(function (this: any) {
+      return this.probeVerdictTrace;
+    });
     state = vi.fn(async () => `state-${providerInstances.length}-${Math.random()}`);
 
     constructor(_packageId: string, oauthPort: number) {
@@ -116,14 +123,23 @@ vi.mock("../../clients/httpClient.js", async (importOriginal) => {
     });
     healthCheck = vi.fn(async () => (this.finishedAuth ? ("ok" as const) : ("needs_auth" as const)));
     close = vi.fn(async () => {});
-    // Faithful-enough stand-in for the real method: marker + JSON carrying
-    // this attempt's port and whatever prior verdicts the handler folded in.
+    // Faithful stand-in for the real method (buildOAuthDiagnosticsPayload):
+    // marker + JSON carrying this attempt's port, the prior verdicts the
+    // handler folded in, PLUS this attempt's own verdict from the provider's
+    // non-consuming trace slot.
     getOAuthDiagnosticsSuffix = vi.fn(
-      (extras?: { priorProbeVerdicts?: Array<Record<string, unknown>> }) =>
-        `${TRACE_MARKER}${JSON.stringify({
+      (extras?: { priorProbeVerdicts?: Array<Record<string, unknown>> }) => {
+        const own = this.oauthProvider?.getProbeVerdictForTrace?.();
+        return `${TRACE_MARKER}${JSON.stringify({
           callbackPort: this.oauthPort,
-          probeVerdicts: extras?.priorProbeVerdicts ?? [],
-        })}`,
+          probeVerdicts: [
+            ...(extras?.priorProbeVerdicts ?? []),
+            ...(own
+              ? [{ port: this.oauthPort, outcome: own.outcome, status: own.status, hint: own.matchedPhrase }]
+              : []),
+          ],
+        })}`;
+      },
     );
     connectWithOAuth = vi.fn(async () => {
       const provider = this.oauthProvider;
@@ -136,6 +152,7 @@ vi.mock("../../clients/httpClient.js", async (importOriginal) => {
           status: 403,
           matchedPhrase: "Callback URL mismatch",
         };
+        provider.probeVerdictTrace = provider.probeVerdict;
         const error = new Error(
           "The provider's sign-in page rejected this connection's registered callback address before the browser was opened (callback URL mismatch).",
         );
@@ -155,7 +172,7 @@ vi.mock("../../clients/httpClient.js", async (importOriginal) => {
 
 const PACKAGE_ID = "swifteq-zendesk";
 
-function createRegistry(): PackageRegistry {
+function createRegistry(pkgOverrides: Record<string, unknown> = {}): PackageRegistry {
   const registry = {
     getPackage: vi.fn().mockReturnValue({
       id: PACKAGE_ID,
@@ -163,6 +180,7 @@ function createRegistry(): PackageRegistry {
       transport: "http",
       base_url: "https://mcp.swifteq.com/api/mcp/sse",
       oauth: true,
+      ...pkgOverrides,
     }),
     getClient: vi.fn().mockRejectedValue(new Error("not connected")),
     clients: new Map<string, unknown>(),
@@ -174,10 +192,10 @@ function createCatalog(): Catalog {
   return { clearPackage: vi.fn() } as unknown as Catalog;
 }
 
-async function run() {
+async function run(pkgOverrides: Record<string, unknown> = {}) {
   const result = await handleAuthenticate(
     { package_id: PACKAGE_ID, wait_for_completion: true },
-    createRegistry(),
+    createRegistry(pkgOverrides),
     createCatalog(),
   );
   return JSON.parse(result.content[0].text);
@@ -258,6 +276,27 @@ describe("diagnostics fire on 'redirect started, callback never arrived' (REBEL-
       { port: 5174, outcome: "rejected", status: 403, hint: "Callback URL mismatch" },
     ]);
   });
+
+  it("static-cred classified rejection: the fast coded error's message rides the diagnostics envelope (k3 F2)", async () => {
+    // The static-cred branch returns a fast coded error whose message already
+    // includes the matched phrase — but without the envelope suffix that
+    // phrase never reaches the desktop's durable channels (Sentry /
+    // bug-report logs). The envelope must ride this response's message too,
+    // same contract as the pending path.
+    rejectPorts.add(5173);
+
+    const parsed = await run({ oauthClientId: "static-client-id", oauthClientSecret: "secret" });
+
+    expect(parsed.status).toBe("error");
+    expect(parsed.code).toBe(OAUTH_REDIRECT_URI_REJECTED_CODE);
+    const { base, payload } = extractSuffix(parsed.message);
+    // User-facing text unchanged — the desktop strips the suffix.
+    expect(base).toBe("Pre-browser probe verdict: Callback URL mismatch");
+    expect(payload.callbackPort).toBe(5173);
+    expect(payload.probeVerdicts).toEqual([
+      { port: 5173, outcome: "rejected", status: 403, hint: "Callback URL mismatch" },
+    ]);
+  }, 10_000);
 
   it("success path: no diagnostics suffix rides the authenticated response (negative pin)", async () => {
     rejectPorts.add(5173); // 8080 accepts and the callback arrives

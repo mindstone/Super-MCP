@@ -890,26 +890,29 @@ export async function handleAuthenticate(
         }
 
         // Classified rejection.
-        failedPorts.push(attemptPort);
-        attemptProbeVerdicts.push({
-          port: attemptPort,
-          outcome: outcome.verdict.outcome,
-          status: outcome.verdict.status,
-          hint: outcome.verdict.matchedPhrase,
-        });
-        if (!firstRejection) {
-          firstRejection = { port: attemptPort, verdict: outcome.verdict };
-        }
-
+        //
+        // Static-cred rule (recall F4): fast coded error, NO port advance,
+        // NO token invalidation — their redirect_uri is pinned out-of-band
+        // in a vendor dashboard, so retrying other ports is futile and
+        // invalidating would delete WORKING tokens. This branch sits BEFORE
+        // the retry bookkeeping pushes (it returns immediately; the loop
+        // state is never read), so `attemptProbeVerdicts` below holds only
+        // PRIOR attempts' verdicts — the current attempt's verdict is folded
+        // from the client's own non-consuming trace slot, matching the
+        // pending-path suffix contract exactly.
         if (staticCreds) {
-          // Static-cred rule (recall F4): fast coded error, NO port advance,
-          // NO token invalidation — their redirect_uri is pinned out-of-band
-          // in a vendor dashboard, so retrying other ports is futile and
-          // invalidating would delete WORKING tokens.
           logger.error("Static-credential connector rejected by provider's sign-in page", {
             package_id,
             oauth_port: attemptPort,
             matched_phrase: outcome.verdict.matchedPhrase,
+          });
+          // k3 F2 (Stage 4 refinement): the diagnostics envelope rides this
+          // response's message too, so the verdict + matched phrase reach the
+          // desktop's durable channels (Sentry / bug-report logs) instead of
+          // dying with the response. The desktop strips the suffix via
+          // extractOAuthDiscoveryTraceFromError before display.
+          const staticCredDiagnosticsSuffix = outcome.httpClient.getOAuthDiagnosticsSuffix({
+            priorProbeVerdicts: attemptProbeVerdicts,
           });
           return {
             content: [
@@ -920,14 +923,25 @@ export async function handleAuthenticate(
                   status: "error",
                   code: OAUTH_REDIRECT_URI_REJECTED_CODE,
                   error: "This provider's sign-in page rejected the connection's registered callback address before the browser even opened. The provider's app registration doesn't allow this app's callback URL — this needs a fix on the provider's side.",
-                  message: outcome.verdict.matchedPhrase
+                  message: (outcome.verdict.matchedPhrase
                     ? `Pre-browser probe verdict: ${outcome.verdict.matchedPhrase}`
-                    : "Pre-browser probe classified the provider's sign-in page as rejecting this connection's callback address.",
+                    : "Pre-browser probe classified the provider's sign-in page as rejecting this connection's callback address.") + staticCredDiagnosticsSuffix,
                 }, null, 2),
               },
             ],
             isError: false,
           };
+        }
+
+        failedPorts.push(attemptPort);
+        attemptProbeVerdicts.push({
+          port: attemptPort,
+          outcome: outcome.verdict.outcome,
+          status: outcome.verdict.status,
+          hint: outcome.verdict.matchedPhrase,
+        });
+        if (!firstRejection) {
+          firstRejection = { port: attemptPort, verdict: outcome.verdict };
         }
       }
 
