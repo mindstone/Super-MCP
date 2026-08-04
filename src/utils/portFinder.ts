@@ -131,6 +131,11 @@ export async function findAvailablePortFromCandidates(
  * Find an available port starting from a given port number.
  * Tries consecutive ports until one is available on BOTH IPv4 and IPv6
  * (or IPv6 is unsupported), or max attempts reached.
+ *
+ * NOTE: retained intentionally for API compatibility and as a test seam —
+ * no production callers remain. Production code (e.g. the OAuth callback
+ * retry loop) must use findAvailablePortFromCandidates, where the caller
+ * owns the candidate ordering. Do not remove without a deliberate API break.
  */
 export async function findAvailablePort(
   startPort: number = 5173,
