@@ -3,6 +3,18 @@ export interface StandardMcpConfig {
   mcpServers: Record<string, StandardServerConfig>;
 }
 
+// Wire contract mirrored by Rebel's src/shared/types/mcp.ts (MCP_SETUP_INCOMPLETE_REASONS).
+// Keep both reason lists in sync; Rebel's mcpSetupStatusContract.test.ts enforces parity.
+export const SETUP_INCOMPLETE_REASONS = ['missing_managed_credentials', 'cloud_reprovision_required'] as const;
+export type SetupIncompleteReason = (typeof SETUP_INCOMPLETE_REASONS)[number];
+
+export interface PackageSetupStatus {
+  state: 'blocked';
+  reason: SetupIncompleteReason;
+}
+
+export type CatalogStatus = 'ready' | 'auth_required' | 'setup_incomplete' | 'error';
+
 export interface StandardServerConfig {
   command?: string;
   args?: string[];
@@ -12,13 +24,15 @@ export interface StandardServerConfig {
   // - "stdio": Local command execution
   // - "sse": HTTP+SSE transport (deprecated in MCP spec 2025-03-26)
   // - "http": Streamable HTTP transport (recommended)
-  type?: "stdio" | "sse" | "http";
+  type?: 'stdio' | 'sse' | 'http';
   url?: string;
   headers?: Record<string, string>;
   // Tool execution timeout in milliseconds (default: 14400000ms = 4 hours sentinel)
   // The Rebel Core agent-turn watchdog is the real effective ceiling; this is the
   // last-resort upstream cap. Can be overridden by SUPER_MCP_TOOL_TIMEOUT environment variable.
   timeout?: number;
+  /** Cloud-owned setup state. A blocked package must never be spawned. */
+  setupStatus?: PackageSetupStatus;
 }
 
 // Extended super-mcp config format (backward compatibility)
@@ -27,10 +41,10 @@ export interface SuperMcpConfig {
   packages?: PackageConfig[]; // Legacy format support
   configPaths?: string[]; // Reference other config files to merge
   security?: {
-    blockedTools?: string[];      // Exact names or regex patterns like "/.*delete.*/i"
-    blockedPackages?: string[];   // Package IDs to completely block
-    allowedTools?: string[];      // If set, only these tools are allowed (allowlist mode)
-    allowedPackages?: string[];   // If set, only these packages are allowed
+    blockedTools?: string[]; // Exact names or regex patterns like "/.*delete.*/i"
+    blockedPackages?: string[]; // Package IDs to completely block
+    allowedTools?: string[]; // If set, only these tools are allowed (allowlist mode)
+    allowedPackages?: string[]; // If set, only these packages are allowed
     logBlockedAttempts?: boolean; // Log when tools are blocked (default: true)
   };
   // User-disabled tools per server (scoped by server ID to avoid name collisions)
@@ -52,7 +66,7 @@ export interface ExtendedServerConfig extends StandardServerConfig {
   // Extended properties for super-mcp
   name?: string;
   description?: string;
-  visibility?: "default" | "hidden";
+  visibility?: 'default' | 'hidden';
   auth?: AuthConfig;
   oauth?: boolean; // Enable OAuth for this server
   // Pre-registered OAuth client credentials (for servers that don't support DCR)
@@ -67,8 +81,8 @@ export interface PackageConfig {
   id: string;
   name: string;
   description?: string;
-  transport: "stdio" | "http";
-  transportType?: "sse" | "http"; // For HTTP transport: HTTP+SSE (deprecated) or Streamable HTTP
+  transport: 'stdio' | 'http';
+  transportType?: 'sse' | 'http'; // For HTTP transport: HTTP+SSE (deprecated) or Streamable HTTP
   command?: string;
   args?: string[];
   env?: Record<string, string>;
@@ -76,7 +90,7 @@ export interface PackageConfig {
   base_url?: string;
   auth?: AuthConfig;
   extra_headers?: Record<string, string>;
-  visibility: "default" | "hidden";
+  visibility: 'default' | 'hidden';
   oauth?: boolean; // Enable OAuth for this server
   // Pre-registered OAuth client credentials (for servers that don't support DCR)
   oauthClientId?: string;
@@ -85,6 +99,8 @@ export interface PackageConfig {
   // Catalog ID for connector identification (e.g., "bamboohr", "bundled-google")
   // Used for admin-disabled tool resolution
   catalogId?: string;
+  /** Cloud-owned setup state. A blocked package must never be spawned. */
+  setupStatus?: PackageSetupStatus;
 }
 
 /**
@@ -105,8 +121,8 @@ export interface ValidationResult {
 }
 
 export interface AuthConfig {
-  mode: "oauth2";
-  method: "device_code" | "authorization_code_pkce";
+  mode: 'oauth2';
+  method: 'device_code' | 'authorization_code_pkce';
   scopes: string[];
   client_id: string;
 }
@@ -115,13 +131,13 @@ export interface PackageInfo {
   package_id: string;
   name: string;
   description?: string;
-  transport: "stdio" | "http";
-  auth_mode: "env" | "oauth2" | "none";
+  transport: 'stdio' | 'http';
+  auth_mode: 'env' | 'oauth2' | 'none';
   tool_count: number;
-  health?: "ok" | "error" | "unavailable";
+  health?: 'ok' | 'error' | 'unavailable';
   summary: string;
-  visibility: "default" | "hidden";
-  catalog_status?: "ready" | "auth_required" | "error";
+  visibility: 'default' | 'hidden';
+  catalog_status?: CatalogStatus;
   catalog_error?: string;
 }
 
@@ -164,7 +180,7 @@ export interface ListToolPackagesOutput {
 
 export interface ListToolsInput {
   package_id: string;
-  detail?: "lite" | "full";
+  detail?: 'lite' | 'full';
   page_size?: number;
   page_token?: string | null;
 }
@@ -196,7 +212,7 @@ export interface UseToolOutput {
   result: any;
   telemetry: {
     duration_ms: number;
-    status: "ok" | "error";
+    status: 'ok' | 'error';
     output_chars?: number;
     output_truncated?: boolean;
     original_output_chars?: number;
@@ -220,7 +236,7 @@ export interface BulkExportInput {
   output_file: string;
   items_path?: string;
   max_pages?: number;
-  if_exists?: "error" | "overwrite";
+  if_exists?: 'error' | 'overwrite';
   pagination?: {
     token_field: string;
     input_param: string;
@@ -228,7 +244,7 @@ export interface BulkExportInput {
 }
 
 export interface BulkExportOutput {
-  status: "complete" | "partial" | "failed";
+  status: 'complete' | 'partial' | 'failed';
   pages: number;
   lines: number;
   bytes: number;
@@ -241,7 +257,7 @@ export interface BeginAuthInput {
 }
 
 export interface BeginAuthOutput {
-  method: "device_code";
+  method: 'device_code';
   user_code: string;
   verification_uri: string;
   expires_in: number;
@@ -253,7 +269,7 @@ export interface AuthStatusInput {
 }
 
 export interface AuthStatusOutput {
-  state: "pending" | "authorized" | "error";
+  state: 'pending' | 'authorized' | 'error';
   scopes?: string[];
   expires_at?: string;
 }
@@ -272,7 +288,7 @@ export interface McpClient {
   listTools(): Promise<any[]>;
   callTool(name: string, args: any): Promise<any>;
   close(): Promise<void>;
-  healthCheck?(): Promise<"ok" | "error" | "needs_auth">;
+  healthCheck?(): Promise<'ok' | 'error' | 'needs_auth'>;
   requiresAuth?(): Promise<boolean>;
   isAuthenticated?(): Promise<boolean>;
   readResource?(uri: string): Promise<ReadResourceResult>;
@@ -297,7 +313,7 @@ export interface AuthManager {
  * `src/main/ipc/mcpAppsHandlers.ts` (`TOOL_BLOCKED_REASONS`); both copies are
  * pinned by their own contract tests, so keep them in sync when adding a reason.
  */
-export type ToolBlockedReason = "user-disabled" | "admin-disabled" | "security-policy";
+export type ToolBlockedReason = 'user-disabled' | 'admin-disabled' | 'security-policy';
 
 export const ERROR_CODES = {
   INVALID_PARAMS: -32602,

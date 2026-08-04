@@ -1,12 +1,11 @@
 import crypto from "node:crypto";
-import { ToolInfo, PackageConfig } from "./types.js";
+import { ToolInfo, PackageConfig, CatalogStatus } from "./types.js";
 import { PackageRegistry } from "./registry.js";
 import { argsSkeleton, summarizePackage, createSchemaHash } from "./summarize.js";
 import { getLogger } from "./logging.js";
 
 const logger = getLogger();
 const ERROR_RETRY_INTERVAL_MS = 60_000;
-type CatalogStatus = "ready" | "auth_required" | "error";
 
 /** Detect ECONNREFUSED errors, including Node.js fetch wrappers (.cause) and registry wrappers (.originalError). */
 function isConnectionRefusedError(error: unknown): boolean {
@@ -71,6 +70,25 @@ export class Catalog {
 
   async refreshPackage(packageId: string): Promise<void> {
     logger.debug("Refreshing package catalog", { package_id: packageId });
+
+    const setupStatus = this.registry.getPackage(packageId)?.setupStatus;
+    if (setupStatus?.state === "blocked") {
+      this.clearResourceUrisForPackage(packageId);
+      this.cache.set(packageId, {
+        packageId,
+        tools: [],
+        lastUpdated: Date.now(),
+        etag: `setup-incomplete-${Date.now()}`,
+        status: "setup_incomplete",
+        lastError: setupStatus.reason,
+      });
+      this.updateGlobalEtag();
+      logger.info("Package setup is incomplete, refusing to load tools", {
+        package_id: packageId,
+        reason: setupStatus.reason,
+      });
+      return;
+    }
 
     try {
       const client = await this.registry.getClient(packageId);
@@ -283,6 +301,9 @@ export class Catalog {
         const cached = this.cache.get(packageConfig.id);
         if (cached?.status === "auth_required") {
           return `${packageConfig.transport} MCP package (authentication required)`;
+        }
+        if (cached?.status === "setup_incomplete") {
+          return `${packageConfig.transport} MCP package (setup incomplete)`;
         }
         if (cached?.status === "error") {
           const reason = cached.lastError ? `: ${cached.lastError}` : "";
