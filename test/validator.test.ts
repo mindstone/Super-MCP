@@ -1,6 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
 import { Validator, ValidationError } from "../src/validator.js";
-import { handleUseTool } from "../src/handlers/useTool.js";
+import {
+  handleUseTool,
+  schemaStripsUnknownArgs,
+  STOP_RETRYING_THRESHOLD,
+} from "../src/handlers/useTool.js";
 import { ERROR_CODES } from "../src/types.js";
 import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { getLogger } from "../src/logging.js";
@@ -58,6 +62,12 @@ async function runValidationFailure(options: {
   args: any;
   packageId?: string;
   toolId?: string;
+  /**
+   * Extra TOP-LEVEL use_tool params merged into the envelope. Needed by the
+   * misplaced-meta-param ticket tests to exercise the "already present at top
+   * level" branch (and to override the default `dry_run: true`).
+   */
+  extraInput?: Record<string, unknown>;
 }) {
   const packageId = options.packageId ?? nextId("pkg");
   const toolId = options.toolId ?? nextId("tool");
@@ -70,6 +80,7 @@ async function runValidationFailure(options: {
         tool_id: toolId,
         args: options.args,
         dry_run: true,
+        ...(options.extraInput ?? {}),
       },
       registry as any,
       catalog as any,
@@ -561,7 +572,15 @@ describe("use_tool repair tickets", () => {
     const thirdTicket = expectRepairTicket(third);
     expect(thirdTicket.attempt).toBe(3);
     expect(thirdTicket.schema_fragments).toHaveProperty("__full_schema");
-    expect(third.message).toContain("Arguments may require user clarification");
+    // REBEL-7JD: the shared STOP_RETRYING_MESSAGE no longer tells the model to
+    // "ask the user for specifics" — that misroutes a self-fixable call-shape
+    // mistake to a non-technical user. A live superproject classifier
+    // (src/renderer/features/inbox/hooks/usePendingApprovals.ts
+    // isArgValidationExhausted) substring-matches this text to route the
+    // terminal inbox affordance, so the two repos move together.
+    expect(third.message).toContain("These arguments have failed validation several times");
+    expect(third.message).toContain("Stop re-sending the same call shape");
+    expect(third.message).not.toContain("ask the user for specifics");
   });
 
   it("caps schema_fragments to 5 entries for surgical tickets", async () => {
@@ -1168,4 +1187,367 @@ describe("FOX-2865: zero-param tool hallucination guidance", () => {
     expect(error.message).toContain("Valid arguments: query");
     expect(error.message).not.toContain("This tool takes no arguments");
   });
+});
+
+describe("REBEL-7JD: misplaced use_tool meta-params in the repair ticket", () => {
+  // Vacuous-green guard: the three HARD-reject meta-params (max_output_chars,
+  // output_offset, schema_hash) can no longer reach the validator — the Stage-1
+  // envelope guard (handlers/useToolInput.ts rejectMisplacedMetaParams) throws
+  // first. So these tests drive the ticket path with the two SOFT meta-params
+  // (`dry_run`, `result_id`), which are deliberately excluded from the guard and
+  // are therefore the only params that can arrive here nested inside `args`.
+  // See types.ts USE_TOOL_SOFT_META_PARAMS for why each is excluded.
+
+  it("names a nested dry_run as a misplaced top-level use_tool parameter (no-arg tool)", async () => {
+    const schema = {
+      type: "object",
+      properties: {},
+    };
+
+    const error = await runValidationFailure({
+      schema,
+      // `dry_run` nested inside args, with NO top-level twin — the guard stands
+      // down (soft param) and the validator strips it as an unknown field.
+      args: { dry_run: true },
+      extraInput: { dry_run: undefined },
+    });
+
+    const repairTicket = expectRepairTicket(error);
+    expect(repairTicket.misplaced_params).toEqual(["dry_run"]);
+    expect(error.message).toContain("Misplaced use_tool parameters: dry_run.");
+    expect(error.message).toContain("These are top-level use_tool parameters, not tool arguments");
+    expect(error.message).toContain('move it outside "args"');
+
+    // No contradictory double-report: the param must NOT also be listed as an
+    // unknown field (which would tell the model to just drop it), and the
+    // no-arg guidance must not fire on a call whose only "argument" was the
+    // misplaced meta-param.
+    expect(repairTicket.unknown_fields).not.toContain("dry_run");
+    expect(repairTicket.unknown_fields).toEqual([]);
+    expect(error.message).not.toContain("Unknown fields");
+    expect(error.message).not.toContain("This tool takes no arguments");
+  });
+
+  it("leads with the misplacement section, before Unknown fields", async () => {
+    const schema = {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+      },
+    };
+
+    const error = await runValidationFailure({
+      schema,
+      args: { query: "hello", dry_run: true, emial: "user@example.com" },
+      extraInput: { dry_run: undefined },
+    });
+
+    const repairTicket = expectRepairTicket(error);
+    expect(repairTicket.misplaced_params).toEqual(["dry_run"]);
+    expect(repairTicket.unknown_fields).toEqual(["emial"]);
+
+    const misplacedIndex = error.message.indexOf("Misplaced use_tool parameters:");
+    const unknownIndex = error.message.indexOf("Unknown fields:");
+    expect(misplacedIndex).toBeGreaterThan(-1);
+    expect(unknownIndex).toBeGreaterThan(-1);
+    expect(misplacedIndex).toBeLessThan(unknownIndex);
+  });
+
+  it("tells the model to REMOVE (not move) a param that is already present top-level", async () => {
+    const schema = {
+      type: "object",
+      properties: {},
+    };
+
+    const error = await runValidationFailure({
+      schema,
+      args: { dry_run: true },
+      // Top-level twin present: the top-level value is the one honoured, so
+      // "move it outside args" would be wrong advice (reviewer-kimi F4).
+      extraInput: { dry_run: true },
+    });
+
+    const repairTicket = expectRepairTicket(error);
+    expect(repairTicket.misplaced_params).toEqual(["dry_run"]);
+    expect(error.message).toContain("remove it from \"args\"");
+    expect(error.message).toContain("the top-level value is the one used");
+    expect(error.message).not.toContain('move it outside "args"');
+  });
+
+  it("warns that a nested result_id turns the retry into a continuation call", async () => {
+    const schema = {
+      type: "object",
+      properties: {},
+    };
+
+    const error = await runValidationFailure({
+      schema,
+      // No top-level result_id: this is a NORMAL call, so it reaches the
+      // validator rather than the continuation branch (arbitrator-recall F1).
+      args: { result_id: "abc123" },
+    });
+
+    const repairTicket = expectRepairTicket(error);
+    expect(repairTicket.misplaced_params).toEqual(["result_id"]);
+    expect(error.message).toContain("Misplaced use_tool parameters: result_id.");
+    expect(error.message).toContain(
+      "passing result_id at the top level makes this a continuation call — the tool will not run",
+    );
+  });
+
+  it("emits misplacement-specific terminal guidance instead of the shared stop message", async () => {
+    const packageId = nextId("pkg");
+    const toolId = nextId("tool");
+    const schema = {
+      type: "object",
+      properties: {},
+    };
+
+    let error: any;
+    for (let attempt = 0; attempt < STOP_RETRYING_THRESHOLD; attempt += 1) {
+      error = await runValidationFailure({
+        schema,
+        args: { dry_run: true },
+        packageId,
+        toolId,
+        extraInput: { dry_run: undefined },
+      });
+    }
+
+    const repairTicket = expectRepairTicket(error);
+    expect(repairTicket.attempt).toBe(STOP_RETRYING_THRESHOLD);
+    expect(error.message).toContain("Stop re-sending this call shape");
+    expect(error.message).toContain("belongs at the top level of use_tool");
+    // Never routes a self-fixable misplacement to the user.
+    expect(error.message).not.toContain("ask the user");
+    expect(error.message).not.toContain("These arguments have failed validation several times");
+  });
+
+  it("keeps the shared stop message for non-misplacement validation failures", async () => {
+    const packageId = nextId("pkg");
+    const toolId = nextId("tool");
+    const schema = {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    };
+
+    let error: any;
+    for (let attempt = 0; attempt < STOP_RETRYING_THRESHOLD; attempt += 1) {
+      error = await runValidationFailure({ schema, args: {}, packageId, toolId });
+    }
+
+    expect(error.message).toContain("These arguments have failed validation several times");
+    expect(error.message).not.toContain("stop re-sending this call shape");
+  });
+});
+
+describe("REBEL-7JD: meta-param observability warns at the validation seam", () => {
+  function findWarn(warnSpy: any, message: string) {
+    return warnSpy.mock.calls.find((call: unknown[]) => call[0] === message);
+  }
+
+  it("warns when a meta-param name collides with a legitimate schema property", async () => {
+    const warnSpy = vi.spyOn(getLogger(), "warn");
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const toolId = nextId("tool");
+    const packageId = nextId("pkg");
+    // The tool legitimately declares `dry_run` as one of its own arguments.
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: {
+          dry_run: { type: "boolean" },
+        },
+      },
+      { callTool },
+    );
+
+    try {
+      const result = await handleUseTool(
+        {
+          package_id: packageId,
+          tool_id: toolId,
+          args: { dry_run: true },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+
+      expect(result.isError).toBe(false);
+      const warn = findWarn(
+        warnSpy,
+        "use_tool meta-param name collides with legitimate schema property",
+      );
+      expect(warn).toBeDefined();
+      expect(warn?.[1]).toMatchObject({ package_id: packageId, tool_id: toolId, param: "dry_run" });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("warns when a meta-param passes through a non-stripping schema", async () => {
+    const warnSpy = vi.spyOn(getLogger(), "warn");
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const toolId = nextId("tool");
+    const packageId = nextId("pkg");
+    // additionalProperties: true → the validator injects nothing and strips
+    // nothing, so a nested meta-param reaches the downstream tool untouched.
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+        },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    try {
+      const result = await handleUseTool(
+        {
+          package_id: packageId,
+          tool_id: toolId,
+          args: { query: "hello", dry_run: true },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+
+      expect(result.isError).toBe(false);
+      const warn = findWarn(
+        warnSpy,
+        "use_tool meta-param nested in args passed through non-stripping schema",
+      );
+      expect(warn).toBeDefined();
+      expect(warn?.[1]).toMatchObject({ package_id: packageId, tool_id: toolId, param: "dry_run" });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("does not warn when args carry no meta-param names", async () => {
+    const warnSpy = vi.spyOn(getLogger(), "warn");
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: {
+          query: { type: "string" },
+        },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    try {
+      await handleUseTool(
+        {
+          package_id: nextId("pkg"),
+          tool_id: nextId("tool"),
+          args: { query: "hello" },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+
+      expect(
+        findWarn(warnSpy, "use_tool meta-param name collides with legitimate schema property"),
+      ).toBeUndefined();
+      expect(
+        findWarn(warnSpy, "use_tool meta-param nested in args passed through non-stripping schema"),
+      ).toBeUndefined();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+});
+
+describe("REBEL-7JD: non-stripping-schema drift pin", () => {
+  /**
+   * The observability warn (ii) in handlers/useTool.ts duplicates the
+   * Validator's additionalProperties-injection condition (validator.ts:58-74)
+   * rather than plumbing a new field through ValidationResult
+   * (reviewer-kimi F5). Duplication needs a tripwire: this test asserts the
+   * duplicated predicate agrees with the validator's OBSERVED stripping
+   * behaviour across the condition's decision boundary, so if the validator's
+   * condition changes, this test goes red and the duplicate gets updated.
+   */
+  const cases: Array<{ name: string; schema: any; expectStripping: boolean }> = [
+    {
+      name: "properties present, additionalProperties omitted → injects (strips)",
+      schema: { type: "object", properties: { query: { type: "string" } } },
+      expectStripping: true,
+    },
+    {
+      name: "additionalProperties: true → no injection (passes through)",
+      schema: { type: "object", properties: { query: { type: "string" } }, additionalProperties: true },
+      expectStripping: false,
+    },
+    {
+      name: "additionalProperties: false → already strict (strips)",
+      schema: { type: "object", properties: { query: { type: "string" } }, additionalProperties: false },
+      expectStripping: true,
+    },
+    {
+      name: "no properties → no injection (passes through)",
+      schema: { type: "object" },
+      expectStripping: false,
+    },
+    {
+      name: "anyOf present → no injection (passes through)",
+      schema: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        anyOf: [{ required: ["query"] }],
+      },
+      expectStripping: false,
+    },
+    {
+      name: "oneOf present → no injection (passes through)",
+      schema: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        oneOf: [{ required: ["query"] }],
+      },
+      expectStripping: false,
+    },
+    {
+      name: "allOf present → no injection (passes through)",
+      schema: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        allOf: [{ type: "object" }],
+      },
+      expectStripping: false,
+    },
+    {
+      name: "patternProperties present → no injection (passes through)",
+      schema: {
+        type: "object",
+        properties: { query: { type: "string" } },
+        patternProperties: { "^x-": { type: "string" } },
+      },
+      expectStripping: false,
+    },
+  ];
+
+  for (const testCase of cases) {
+    it(`agrees with the validator: ${testCase.name}`, () => {
+      const validator = new Validator();
+      const data: Record<string, unknown> = { query: "hello", surprise_field: 1 };
+      const result = validator.validate(testCase.schema, data);
+      const observedStripping = result.strippedArgs.includes("surprise_field");
+
+      expect(observedStripping).toBe(testCase.expectStripping);
+      expect(schemaStripsUnknownArgs(testCase.schema)).toBe(testCase.expectStripping);
+    });
+  }
 });

@@ -1,5 +1,11 @@
 import { randomUUID } from "crypto";
-import { UseToolInput, UseToolOutput, ERROR_CODES, type ToolBlockedReason } from "../types.js";
+import {
+  UseToolInput,
+  UseToolOutput,
+  ERROR_CODES,
+  USE_TOOL_META_PARAMS,
+  type ToolBlockedReason,
+} from "../types.js";
 import { PackageRegistry } from "../registry.js";
 import { Catalog } from "../catalog.js";
 import type { ValidationResult } from "../validator.js";
@@ -142,8 +148,38 @@ const SERIALIZED_OUTPUT_SAFETY_NET_FLOOR = 200_000;
 const MAX_SCHEMA_FRAGMENTS = 5;
 const FULL_SCHEMA_FRAGMENT_KEY = "__full_schema";
 const FULL_SCHEMA_THRESHOLD = 2;
-const STOP_RETRYING_THRESHOLD = 3;
-const STOP_RETRYING_MESSAGE = "Arguments may require user clarification. Please ask the user for specifics.";
+export const STOP_RETRYING_THRESHOLD = 3;
+/**
+ * Terminal guidance appended once `STOP_RETRYING_THRESHOLD` failed attempts are
+ * reached on a call the handler cannot classify further.
+ *
+ * REBEL-7JD reworded this: it used to say "Arguments may require user
+ * clarification. Please ask the user for specifics." — which routed a
+ * self-fixable call-shape mistake to a non-technical user. The message now tells
+ * the model to change the call or report what failed.
+ *
+ * CROSS-REPO: the host app substring-matches this text to route the terminal
+ * inbox affordance (`isArgValidationExhausted` in the superproject's
+ * src/renderer/features/inbox/hooks/usePendingApprovals.ts). Rewording it again
+ * requires updating that classifier in the same change, or the terminal state
+ * silently becomes unreachable.
+ */
+const STOP_RETRYING_MESSAGE =
+  "These arguments have failed validation several times. Stop re-sending the same call shape — change the call or report what failed.";
+
+/**
+ * Terminal guidance for the MISPLACED-meta-param case, which the shared message
+ * above fits badly: the model can fix this itself in one move, so telling it to
+ * "report what failed" would strand a recoverable call (REBEL-7JD).
+ */
+function buildMisplacedStopRetryingMessage(misplacedParams: string[]): string {
+  const names = misplacedParams.join(", ");
+  const subject = misplacedParams.length === 1 ? `${names} belongs` : `${names} belong`;
+  return (
+    `Stop re-sending this call shape; ${subject} at the top level of use_tool, ` +
+    `outside \`args\` — re-issue once with it moved, or drop it and proceed.`
+  );
+}
 const MAX_ATTEMPT_MAP_SIZE = 500;
 const validationAttemptMap = new Map<string, number>();
 
@@ -156,6 +192,17 @@ interface RepairTicket {
   pattern_errors?: Array<{ field: string; pattern: string; got: unknown }>;
   length_errors?: Array<{ field: string; constraint: string; limit: number; got: unknown }>;
   unknown_fields: string[];
+  /**
+   * `use_tool` meta-params (types.ts USE_TOOL_META_PARAMS) the model nested inside
+   * `args` instead of passing at the top level (REBEL-7JD). Subtracted from
+   * `unknown_fields` so the ticket never tells the model to drop a param it
+   * should move. OPTIONAL and additive-only: the inline downstream-InvalidParams
+   * ticket literal below omits it, and host-side consumers must not require it.
+   *
+   * Secondary carrier only — the prose in `message` is the truncation-safe one
+   * (the host caps the JOINED error string at 2000 chars, tail-first).
+   */
+  misplaced_params?: string[];
   did_you_mean: Record<string, string>;
   schema_fragments: Record<string, unknown>;
   valid_fields: string[];
@@ -165,6 +212,38 @@ interface RepairTicket {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Whether the Validator will strip unknown top-level keys from `args` under this
+ * schema (REBEL-7JD observability warn (ii)).
+ *
+ * DUPLICATED from Validator.validate (src/validator.ts): it injects
+ * `additionalProperties: false` only when `properties` is present, the keyword is
+ * absent, and there is no oneOf/allOf/anyOf/patternProperties — and it strips only
+ * when the effective schema ends up `additionalProperties: false`. Duplicating the
+ * predicate was chosen over widening `ValidationResult` (reviewer-kimi F5), so it
+ * needs a tripwire: test/validator.test.ts "non-stripping-schema drift pin" asserts
+ * this function agrees with the validator's OBSERVED behaviour across the
+ * condition's decision boundary. If the validator's condition changes, that test
+ * goes red.
+ */
+export function schemaStripsUnknownArgs(schema: unknown): boolean {
+  if (!isRecord(schema) || !isRecord(schema.properties)) {
+    return false;
+  }
+  if (schema.additionalProperties === false) {
+    return true;
+  }
+  if ("additionalProperties" in schema) {
+    return false;
+  }
+  return (
+    schema.oneOf === undefined &&
+    schema.allOf === undefined &&
+    schema.anyOf === undefined &&
+    schema.patternProperties === undefined
+  );
 }
 
 type ConnectDiagnosticErrorClass =
@@ -692,13 +771,103 @@ function buildSchemaFragments(
   return fragments;
 }
 
+/**
+ * How a misplaced meta-param must be corrected, mirroring the envelope guard's
+ * top-level-absence condition (`rejectMisplacedMetaParams` in useToolInput.ts).
+ *
+ * `move`   — absent at top level: the model must lift it out of `args`.
+ * `remove` — ALREADY present at top level: the top-level value is the one being
+ *            honoured, so "move it" would be wrong advice; the nested copy is
+ *            simply surplus and must be deleted (reviewer-kimi F4).
+ */
+type MisplacedParamFix = "move" | "remove";
+
+/** Names of the `use_tool` meta-params found nested in `args`, with their fix. */
+type MisplacedParamMap = Record<string, MisplacedParamFix>;
+
+/**
+ * Classify `args` keys that are actually top-level `use_tool` meta-params
+ * (REBEL-7JD). Keyed off the FULL `USE_TOOL_META_PARAMS` set, not the hard-reject
+ * subset: this is the only path that teaches `dry_run` and `result_id`, which the
+ * envelope guard deliberately lets through (see types.ts USE_TOOL_SOFT_META_PARAMS).
+ *
+ * Reads `strippedArgs` (the validator's pre-strip key names) — NOT the post-strip
+ * `provided_args` — because the validator deletes unknown keys in place.
+ */
+/**
+ * Which `use_tool` meta-params the caller actually supplied at the TOP level.
+ * Mirrors the envelope guard's absence condition (`input[param] !== undefined` in
+ * useToolInput.ts rejectMisplacedMetaParams) so the ticket and the guard agree on
+ * what "already present" means.
+ */
+function getTopLevelMetaParamPresence(input: unknown): Record<string, boolean> {
+  const presence: Record<string, boolean> = {};
+  if (!isRecord(input)) {
+    return presence;
+  }
+  for (const param of USE_TOOL_META_PARAMS) {
+    presence[param] = input[param] !== undefined;
+  }
+  return presence;
+}
+
+function classifyMisplacedMetaParams(
+  strippedArgs: string[],
+  topLevelPresence: Record<string, boolean> | undefined,
+): MisplacedParamMap {
+  const misplaced: MisplacedParamMap = {};
+  for (const key of strippedArgs) {
+    if (!(USE_TOOL_META_PARAMS as readonly string[]).includes(key)) continue;
+    misplaced[key] = topLevelPresence?.[key] ? "remove" : "move";
+  }
+  return misplaced;
+}
+
+function summarizeMisplacedParams(misplaced: MisplacedParamMap): string[] {
+  const names = Object.keys(misplaced);
+  if (names.length === 0) {
+    return [];
+  }
+
+  const sections: string[] = [
+    `Misplaced use_tool parameters: ${names.join(", ")}.`,
+    `These are top-level use_tool parameters, not tool arguments — ` +
+      `move them outside "args": ` +
+      `use_tool({ package_id: "...", tool_id: "...", args: {...}, <name>: <value> }).`,
+  ];
+
+  for (const name of names) {
+    const instruction =
+      misplaced[name] === "remove"
+        ? `${name}: remove it from "args"; the top-level value is the one used.`
+        : `${name}: move it outside "args".`;
+    sections.push(instruction);
+    if (name === "result_id") {
+      // Warn the model off the trap: result_id at the top level is a CONTINUATION
+      // call, which returns cached output without invoking the tool at all
+      // (useTool.ts continuation branch). arbitrator-recall F7.
+      sections.push(
+        "Note: passing result_id at the top level makes this a continuation call — the tool will not run.",
+      );
+    }
+  }
+
+  return sections;
+}
+
 function summarizeRepairTicket(
   packageId: string,
   toolId: string,
   ticket: RepairTicket,
   includeStopRetryingGuidance: boolean,
+  misplaced: MisplacedParamMap = {},
 ): string {
   const sections: string[] = [];
+
+  // REBEL-7JD: the misplacement teaching LEADS the substantive sections so the
+  // model reads it first (salience). Truncation safety comes from being in
+  // `message` at all, not from the ordering — the host caps the joined string.
+  sections.push(...summarizeMisplacedParams(misplaced));
 
   if (ticket.missing_required.length > 0) {
     sections.push(`Missing required: ${ticket.missing_required.join(", ")}.`);
@@ -770,7 +939,15 @@ function summarizeRepairTicket(
     message += ` ${sections.join(" ")}`;
   }
   if (includeStopRetryingGuidance) {
-    message += ` ${STOP_RETRYING_MESSAGE}`;
+    const misplacedNames = Object.keys(misplaced);
+    // A misplacement is self-fixable in one move, so the shared "report what
+    // failed" guidance fits badly — emit the misplacement-specific terminal line
+    // instead (REBEL-7JD). The downstream-InvalidParams site cannot classify and
+    // keeps the shared constant.
+    message +=
+      misplacedNames.length > 0
+        ? ` ${buildMisplacedStopRetryingMessage(misplacedNames)}`
+        : ` ${STOP_RETRYING_MESSAGE}`;
   }
   return message;
 }
@@ -780,6 +957,13 @@ function buildRepairTicket(
   validationErrors: any[],
   strippedArgs: string[],
   attempt: number,
+  /**
+   * `use_tool` meta-params found nested in `args`, with the fix each needs
+   * (REBEL-7JD). Computed once by the caller via `classifyMisplacedMetaParams`
+   * and shared with `summarizeRepairTicket` so ticket and prose cannot disagree.
+   * Omitted → no misplacement (keeps existing call shapes valid).
+   */
+  misplacedParams: MisplacedParamMap = {},
 ): RepairTicket {
   const missingRequired: string[] = [];
   const typeErrors: Array<{ field: string; expected: string; got: string; value?: unknown }> = [];
@@ -886,7 +1070,15 @@ function buildRepairTicket(
     }
   }
 
-  for (const unknownField of strippedArgs) {
+  // REBEL-7JD: a stripped key that is really a top-level use_tool meta-param is
+  // MISPLACED, not unknown. Subtract it from unknown_fields so the ticket never
+  // carries the contradictory pair "move it outside args" + "drop this unknown
+  // field" (and so a no-arg tool doesn't also claim "takes no arguments" about a
+  // call whose only surplus key was the meta-param).
+  const misplacedNames = Object.keys(misplacedParams);
+  const unknownFields = strippedArgs.filter((field) => misplacedParams[field] === undefined);
+
+  for (const unknownField of unknownFields) {
     const suggestion = findBestMatch(unknownField, validFields);
     if (suggestion) {
       didYouMean[unknownField] = suggestion;
@@ -901,7 +1093,8 @@ function buildRepairTicket(
     type_errors: typeErrors,
     enum_violations: enumViolations,
     format_errors: formatErrors,
-    unknown_fields: strippedArgs,
+    unknown_fields: unknownFields,
+    ...(misplacedNames.length > 0 ? { misplaced_params: misplacedNames } : {}),
     did_you_mean: didYouMean,
     schema_fragments: buildSchemaFragments(schema, failingFields, includeFullSchema),
     valid_fields: validFields,
@@ -1241,6 +1434,44 @@ export async function handleUseTool(
   let strippedArgs = validationResult.strippedArgs;
   let isValid = validationResult.valid;
 
+  // REBEL-7JD observability. Reads `preValidationSnapshot`, because
+  // `validator.validate` strips unknown keys from `args` IN PLACE. Both warns are
+  // the wake-up signals the deferred residue items are conditioned on (PLAN.md
+  // § Explicitly out of scope).
+  //
+  // NOTE super-mcp's logger is MESSAGE-FIRST — `warn(msg, data)` (src/logging.ts).
+  // This is NOT the superproject's pino `({ data }, msg)` convention.
+  if (preValidationSnapshot) {
+    const declaredProperties =
+      isRecord(schema) && isRecord(schema.properties) ? schema.properties : undefined;
+    const stripsUnknownArgs = schemaStripsUnknownArgs(schema);
+    for (const param of USE_TOOL_META_PARAMS) {
+      if (!(param in preValidationSnapshot)) continue;
+      if (declaredProperties && param in declaredProperties) {
+        // (i) Collision detector: the tool legitimately declares a property whose
+        // name equals a use_tool meta-param, so the misplacement teaching would be
+        // WRONG for this tool. If this fires for a hard-rejected param, that param
+        // must leave USE_TOOL_HARD_REJECT_META_PARAMS.
+        logger.warn("use_tool meta-param name collides with legitimate schema property", {
+          handler: "use_tool",
+          package_id,
+          tool_id,
+          param,
+        });
+      } else if (!stripsUnknownArgs) {
+        // (ii) Passthrough detector: a non-stripping schema means the nested
+        // meta-param reaches the downstream tool untouched — for `dry_run` that can
+        // mean a real mutation executes silently (top residue-ledger item).
+        logger.warn("use_tool meta-param nested in args passed through non-stripping schema", {
+          handler: "use_tool",
+          package_id,
+          tool_id,
+          param,
+        });
+      }
+    }
+  }
+
   // Stage 0 — deterministic, schema-driven validate-before-send auto-repair.
   // Triggered ONLY when validation fails because of (a) camelCase↔snake_case
   // key casing or (b) stringified scalars. We repair a snapshot, re-validate,
@@ -1278,12 +1509,33 @@ export async function handleUseTool(
   if (!isValid || strippedArgs.length > 0) {
     resetValidationAttempt(downstreamValidationAttemptKey);
     const attempt = incrementValidationAttempt(validationAttemptKey);
-    const repairTicket = buildRepairTicket(schema, validationResult.errors, strippedArgs, attempt);
+    // REBEL-7JD: classify misplaced meta-params ONCE and share the result between
+    // the ticket object and the prose, so the two can't disagree. Top-level
+    // presence is read from `input` (the parsed envelope) rather than the
+    // destructured locals, because `dry_run` is destructured with a `= false`
+    // default that would misreport an omitted param as present.
+    const misplacedParams = classifyMisplacedMetaParams(
+      strippedArgs,
+      getTopLevelMetaParamPresence(input),
+    );
+    const repairTicket = buildRepairTicket(
+      schema,
+      validationResult.errors,
+      strippedArgs,
+      attempt,
+      misplacedParams,
+    );
     const shouldStopRetrying = attempt >= STOP_RETRYING_THRESHOLD;
 
     throw {
       code: ERROR_CODES.ARG_VALIDATION_FAILED,
-      message: summarizeRepairTicket(package_id, tool_id, repairTicket, shouldStopRetrying),
+      message: summarizeRepairTicket(
+        package_id,
+        tool_id,
+        repairTicket,
+        shouldStopRetrying,
+        misplacedParams,
+      ),
       data: {
         package_id,
         tool_id,
