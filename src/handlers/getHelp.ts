@@ -167,6 +167,7 @@ list_tools(package_id: "github", detail: "full")
 - Arguments don't match the tool's schema
 - Solution: Use \`get_tool_details\` to review the exact schema, then fix your arguments
 - Use dry_run: true to test arguments
+- \`max_output_chars\`, \`output_offset\`, \`schema_hash\`, \`dry_run\` and \`result_id\` are top-level \`use_tool\` parameters — never nest them inside \`args\` (args holds the tool's own arguments only)
 
 ### -33004: PACKAGE_UNAVAILABLE
 - Package is configured but not responding
@@ -303,6 +304,7 @@ The arguments provided don't match the tool's expected schema.
 2. Ensure all required fields are present
 3. Check that types match exactly (string vs number)
 4. Use \`dry_run: true\` to test before executing
+5. Keep \`max_output_chars\`, \`output_offset\`, \`schema_hash\`, \`dry_run\` and \`result_id\` at the TOP LEVEL of the \`use_tool\` call — they are \`use_tool\` parameters, not tool arguments, so nesting them inside \`args\` will be rejected
 
 ## Common Issues
 - Missing required fields

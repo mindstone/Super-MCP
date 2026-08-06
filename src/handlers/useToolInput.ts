@@ -1,5 +1,11 @@
 import { z } from "zod";
-import { ERROR_CODES, type UseToolInput } from "../types.js";
+import {
+  ERROR_CODES,
+  USE_TOOL_HARD_REJECT_META_PARAMS,
+  USE_TOOL_META_PARAMS,
+  type UseToolInput,
+  type UseToolMetaParam,
+} from "../types.js";
 import { coerceStringifiedJson } from "../utils/normalizeInput.js";
 
 type UseToolHandlerInput = UseToolInput & {
@@ -10,15 +16,20 @@ type UseToolHandlerInput = UseToolInput & {
 const RECOVERY_GUIDANCE =
   'Use search_tools(query: "...") to find a tool by intent, list_tools(package_id: "...", detail: "lite") to browse tools, or get_tool_details(tool_ids: ["Package__tool"]) to inspect the argument schema.';
 
+// Meta-param entries derive from the SSOT (types.ts USE_TOOL_META_PARAMS) so the
+// envelope and the misplacement guard can never drift apart: adding a meta-param there
+// adds it here. package_id/tool_id/args and the _rebel_staged* internals stay explicit
+// literals — they are the envelope's own structural fields and must never be
+// classified as misplaceable meta-params.
+const metaParamShape = Object.fromEntries(
+  USE_TOOL_META_PARAMS.map((param) => [param, z.unknown().optional()]),
+) as { [K in UseToolMetaParam]: z.ZodOptional<z.ZodUnknown> };
+
 const useToolEnvelopeSchema = z.object({
   package_id: z.unknown().optional(),
   tool_id: z.unknown().optional(),
   args: z.unknown().optional(),
-  dry_run: z.unknown().optional(),
-  max_output_chars: z.unknown().optional(),
-  result_id: z.unknown().optional(),
-  output_offset: z.unknown().optional(),
-  schema_hash: z.unknown().optional(),
+  ...metaParamShape,
   _rebel_staged: z.unknown().optional(),
   _rebel_staged_message: z.unknown().optional(),
 }).passthrough();
@@ -50,6 +61,8 @@ function throwDispatchArgValidation(
     package_id?: unknown;
     tool_id?: unknown;
     provided_args?: string[];
+    /** Set when the failure is a use_tool meta-param nested inside `args` (REBEL-7JD). */
+    misplaced_param?: string;
   },
 ): never {
   throw {
@@ -63,6 +76,7 @@ function throwDispatchArgValidation(
       package_id: data.package_id ?? null,
       tool_id: data.tool_id ?? null,
       provided_args: data.provided_args ?? [],
+      ...(data.misplaced_param ? { misplaced_param: data.misplaced_param } : {}),
     },
   };
 }
@@ -106,6 +120,63 @@ function isContinuationCall(input: { result_id?: unknown }): boolean {
   return Boolean(input.result_id);
 }
 
+/**
+ * REBEL-7JD: reject a `use_tool` meta-param that the model nested inside `args`.
+ *
+ * The old failure path was indirect: the downstream schema rejected the key as an
+ * unknown field ("This tool takes no arguments"), which never told the model that
+ * the key is a legitimate TOP-LEVEL `use_tool` parameter that was merely misplaced —
+ * so it re-sent the same shape and looped. Rejecting here is deterministic on the
+ * first attempt and independent of the downstream schema.
+ *
+ * Only fires when the key is absent at top level, so passing the param top-level as
+ * well remains a working escape hatch for a tool that genuinely declares it.
+ *
+ * Called ONCE, on the normal path, after `parseArgsContainer`. Continuation calls
+ * early-return above and ignore `args` entirely, so there is nothing to guard there
+ * (a pre-continuation call site would be dead code that invites relaxing the
+ * top-level-absence check — which is what keeps legitimate tools callable).
+ */
+function rejectMisplacedMetaParams(input: {
+  package_id?: unknown;
+  tool_id?: unknown;
+  args?: unknown;
+  [key: string]: unknown;
+}): void {
+  const args = input.args;
+  if (!isArgsObject(args)) return;
+
+  for (const param of USE_TOOL_HARD_REJECT_META_PARAMS) {
+    if (!(param in args)) continue;
+    // Escape hatch: the model also passed it top-level, so the meta-param is being
+    // honoured and the nested copy is (at worst) a redundant tool argument.
+    if (input[param] !== undefined) continue;
+
+    const packageId = optionalString(input.package_id) ?? "<unknown>";
+    const toolId = optionalString(input.tool_id) ?? "<unknown>";
+    const nestedValue = JSON.stringify(args[param]) ?? String(args[param]);
+    throwDispatchArgValidation(
+      // The leading clause is classifier-stable: the host app substring-matches
+      // "Argument validation failed for tool" to render this as a calm recoverable
+      // arg-validation failure rather than a raw error toast. Keep it first.
+      `Argument validation failed for tool '${toolId}' in package '${packageId}'. ` +
+        `use_tool parameter "${param}" was nested inside "args". It is a top-level ` +
+        `use_tool parameter, not a tool argument. Retry with: use_tool({ package_id: ` +
+        `"${packageId}", tool_id: "${toolId}", args: { ...tool arguments only... }, ` +
+        `${param}: ${nestedValue} }). ${RECOVERY_GUIDANCE}`,
+      {
+        field: `args.${param}`,
+        expected: "top-level use_tool parameter",
+        got: "nested inside args",
+        package_id: input.package_id,
+        tool_id: input.tool_id,
+        provided_args: getProvidedArgs(args),
+        misplaced_param: param,
+      },
+    );
+  }
+}
+
 export function parseUseToolInput(input: unknown): UseToolHandlerInput {
   const envelope = useToolEnvelopeSchema.safeParse(input);
   if (!envelope.success) {
@@ -139,8 +210,12 @@ export function parseUseToolInput(input: unknown): UseToolHandlerInput {
     );
   }
 
-  return {
+  const normalized = {
     ...parsed,
     args: parseArgsContainer(parsed),
-  } as UseToolHandlerInput;
+  };
+
+  rejectMisplacedMetaParams(normalized);
+
+  return normalized as UseToolHandlerInput;
 }

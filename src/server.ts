@@ -801,7 +801,13 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
               helpfulMessage += ". Try 'search_tools(query: \"...\")' to find tools by intent, or 'list_tools(package_id: \"...\", detail: \"lite\")' to browse.";
               break;
             case ERROR_CODES.ARG_VALIDATION_FAILED:
-              helpfulMessage += ". Use 'get_tool_details' to review the schema, or 'dry_run: true' to test arguments.";
+              // Dispatch-stage failures (parseUseToolInput) already carry their own
+              // recovery guidance and, for misplaced meta-params, the exact corrected
+              // call shape. The generic schema advice contradicts or dilutes that, so
+              // suppress it for the whole dispatch stage. See handlers/useToolInput.ts.
+              if ((error as any).data?.validation_stage !== "dispatch") {
+                helpfulMessage += ". Use 'get_tool_details' to review the schema, or 'dry_run: true' to test arguments.";
+              }
               break;
             case ERROR_CODES.AUTH_REQUIRED:
               helpfulMessage += ". Run 'authenticate(package_id: \"...\")' to connect this package.";

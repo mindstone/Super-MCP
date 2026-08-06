@@ -205,6 +205,56 @@ export interface UseToolInput {
   schema_hash?: string;
 }
 
+/**
+ * SSOT for the `use_tool` envelope's meta-parameters: the top-level parameters that
+ * belong to super-mcp itself, NOT to the downstream tool's `args`.
+ *
+ * Models routinely nest one of these inside `args` (REBEL-7JD: `max_output_chars`
+ * inside `args` for a no-argument tool), which the downstream schema then rejects as
+ * an unknown field. Consumers:
+ *   - `handlers/useToolInput.ts` — envelope schema entries + the misplacement guard.
+ *   - `handlers/useTool.ts` — misplacement-aware repair-ticket text (all five).
+ * Adding a sixth meta-param to `UseToolInput`? Add it here too — the `satisfies`
+ * check below only proves membership, not exhaustiveness.
+ */
+export const USE_TOOL_META_PARAMS = [
+  'max_output_chars',
+  'dry_run',
+  'result_id',
+  'output_offset',
+  'schema_hash',
+] as const satisfies readonly (keyof UseToolInput)[];
+
+export type UseToolMetaParam = (typeof USE_TOOL_META_PARAMS)[number];
+
+/**
+ * Meta-params EXCLUDED from the hard-reject guard (see below). Derived by explicit
+ * exclusion so the reason for each is recorded where a future reader will see it.
+ */
+const USE_TOOL_SOFT_META_PARAMS: readonly UseToolMetaParam[] = [
+  // dry_run: plausible as a legitimate third-party tool argument (plenty of real
+  // tools take a `dry_run` flag). A false positive would make that tool permanently
+  // uncallable, so dry_run is taught by the schema-aware repair ticket instead.
+  'dry_run',
+  // result_id: the guard is UNREACHABLE for it. `isContinuationCall(input)` is
+  // `Boolean(input.result_id)` (handlers/useToolInput.ts) and the guard only fires
+  // when the key is ABSENT at top level — exact logical complements. Worse, the
+  // guard's own advice ("pass it top-level") would hijack the call into the
+  // continuation branch at useTool.ts:969, which returns cache-miss prose without
+  // ever invoking the tool: a silent failure. Taught by the repair ticket instead.
+  'result_id',
+];
+
+/**
+ * Meta-params rejected outright when nested inside `args` with no top-level twin.
+ * All three are consumed by the envelope before the downstream schema is ever
+ * fetched, and all three have a verified-working escape hatch: pass the param
+ * top-level as well and the call proceeds (so a tool that legitimately declares
+ * one of these stays callable).
+ */
+export const USE_TOOL_HARD_REJECT_META_PARAMS: readonly UseToolMetaParam[] =
+  USE_TOOL_META_PARAMS.filter((param) => !USE_TOOL_SOFT_META_PARAMS.includes(param));
+
 export interface UseToolOutput {
   package_id: string;
   tool_id: string;
