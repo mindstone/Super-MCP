@@ -214,8 +214,9 @@ export interface UseToolInput {
  * an unknown field. Consumers:
  *   - `handlers/useToolInput.ts` — envelope schema entries + the misplacement guard.
  *   - `handlers/useTool.ts` — misplacement-aware repair-ticket text (all five).
- * Adding a sixth meta-param to `UseToolInput`? Add it here too — the `satisfies`
- * check below only proves membership, not exhaustiveness.
+ * Adding a sixth meta-param to `UseToolInput`? Add it here too. The `satisfies` check
+ * below proves membership only; exhaustiveness is gated by
+ * `USE_TOOL_INPUT_FIELD_CLASSIFICATION` (tsc) plus its drift-guard test.
  */
 export const USE_TOOL_META_PARAMS = [
   'max_output_chars',
@@ -226,6 +227,33 @@ export const USE_TOOL_META_PARAMS = [
 ] as const satisfies readonly (keyof UseToolInput)[];
 
 export type UseToolMetaParam = (typeof USE_TOOL_META_PARAMS)[number];
+
+/**
+ * Compile-time exhaustiveness gate for the SSOT above (planner F6 / reviewer-opus F1).
+ *
+ * `satisfies readonly (keyof UseToolInput)[]` proves MEMBERSHIP only: a sixth field
+ * added to `UseToolInput` and forgotten here would go silently unguarded by the
+ * misplacement guard and untaught by the repair ticket. This `Record` makes that
+ * omission a tsc error (`npm run build`), and the drift-guard test
+ * (test/useTool-metaParam-contract.test.ts) asserts the two stay in agreement at
+ * runtime — so classifying a new field as 'meta' without adding it to
+ * USE_TOOL_META_PARAMS is caught too.
+ *
+ * 'structural' = the envelope's own addressing fields; never a misplaceable meta-param.
+ */
+export const USE_TOOL_INPUT_FIELD_CLASSIFICATION: Record<
+  keyof UseToolInput,
+  'meta' | 'structural'
+> = {
+  package_id: 'structural',
+  tool_id: 'structural',
+  args: 'structural',
+  dry_run: 'meta',
+  max_output_chars: 'meta',
+  result_id: 'meta',
+  output_offset: 'meta',
+  schema_hash: 'meta',
+};
 
 /**
  * Meta-params EXCLUDED from the hard-reject guard (see below). Derived by explicit

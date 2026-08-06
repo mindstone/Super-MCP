@@ -16,6 +16,23 @@ type UseToolHandlerInput = UseToolInput & {
 const RECOVERY_GUIDANCE =
   'Use search_tools(query: "...") to find a tool by intent, list_tools(package_id: "...", detail: "lite") to browse tools, or get_tool_details(tool_ids: ["Package__tool"]) to inspect the argument schema.';
 
+/**
+ * Cap for the misplaced value echoed back inside the retry instruction. The whole
+ * message competes for the host's 2000-char error-data budget
+ * (superproject src/core/rebelCore/mcpClient.ts MCP_ERROR_DATA_MAX_LEN), which
+ * truncates tail-first — so a pathological nested value (a megabyte of text parked
+ * under `max_output_chars`) must not be able to push the leading classifier clause
+ * or the teaching text out of the budget (reviewer-kimi F4).
+ */
+const MAX_ECHOED_VALUE_CHARS = 200;
+
+function echoValue(value: unknown): string {
+  const stringified = JSON.stringify(value) ?? String(value);
+  return stringified.length > MAX_ECHOED_VALUE_CHARS
+    ? `${stringified.slice(0, MAX_ECHOED_VALUE_CHARS)}… (truncated)`
+    : stringified;
+}
+
 // Meta-param entries derive from the SSOT (types.ts USE_TOOL_META_PARAMS) so the
 // envelope and the misplacement guard can never drift apart: adding a meta-param there
 // adds it here. package_id/tool_id/args and the _rebel_staged* internals stay explicit
@@ -152,17 +169,27 @@ function rejectMisplacedMetaParams(input: {
     // honoured and the nested copy is (at worst) a redundant tool argument.
     if (input[param] !== undefined) continue;
 
-    const packageId = optionalString(input.package_id) ?? "<unknown>";
+    const suppliedPackageId = optionalString(input.package_id);
     const toolId = optionalString(input.tool_id) ?? "<unknown>";
-    const nestedValue = JSON.stringify(args[param]) ?? String(args[param]);
+    const nestedValue = echoValue(args[param]);
+    // Echo back only what the caller actually supplied. A namespaced tool_id
+    // ("pkg__tool") with no package_id is a supported call shape (useTool.ts case 1),
+    // so emitting `package_id: "<unknown>"` would teach a retry shape that itself
+    // fails package lookup — the very failure class this guard exists to end
+    // (reviewer-kimi F2). For the prose clause, fall back to the namespace prefix;
+    // if there is no prefix either, drop the package clause rather than invent one.
+    const namespacePrefix = toolId.includes("__") ? toolId.split("__")[0] : undefined;
+    const packageLabel = suppliedPackageId ?? namespacePrefix;
+    const packageClause = packageLabel ? ` in package '${packageLabel}'` : "";
+    const packageIdClause = suppliedPackageId ? `package_id: "${suppliedPackageId}", ` : "";
     throwDispatchArgValidation(
       // The leading clause is classifier-stable: the host app substring-matches
       // "Argument validation failed for tool" to render this as a calm recoverable
       // arg-validation failure rather than a raw error toast. Keep it first.
-      `Argument validation failed for tool '${toolId}' in package '${packageId}'. ` +
+      `Argument validation failed for tool '${toolId}'${packageClause}. ` +
         `use_tool parameter "${param}" was nested inside "args". It is a top-level ` +
-        `use_tool parameter, not a tool argument. Retry with: use_tool({ package_id: ` +
-        `"${packageId}", tool_id: "${toolId}", args: { ...tool arguments only... }, ` +
+        `use_tool parameter, not a tool argument. Retry with: use_tool({ ${packageIdClause}` +
+        `tool_id: "${toolId}", args: { ...tool arguments only... }, ` +
         `${param}: ${nestedValue} }). ${RECOVERY_GUIDANCE}`,
       {
         field: `args.${param}`,

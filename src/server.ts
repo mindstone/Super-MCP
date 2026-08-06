@@ -96,6 +96,43 @@ type ManifestPackageEntry = {
   status: string;
 };
 
+/**
+ * Append the code-specific recovery advice super-mcp adds to a thrown handler error
+ * before it leaves the CallToolRequest handler.
+ *
+ * Extracted from the handler's catch block so the suppression gate below is unit
+ * testable: every other test drives the handlers directly, well below this layer, so
+ * the gate was previously an untested inline closure (reviewer-opus F2 / kimi F3 /
+ * planner F7).
+ */
+export function appendErrorAdvice(code: unknown, message: string, data?: unknown): string {
+  switch (code) {
+    case ERROR_CODES.PACKAGE_NOT_FOUND:
+      return message + ". Run 'list_tool_packages()' to see available packages.";
+    case ERROR_CODES.TOOL_NOT_FOUND:
+      return message + ". Try 'search_tools(query: \"...\")' to find tools by intent, or 'list_tools(package_id: \"...\", detail: \"lite\")' to browse.";
+    case ERROR_CODES.ARG_VALIDATION_FAILED:
+      // Dispatch-stage failures (parseUseToolInput) already carry their own recovery
+      // guidance and, for misplaced meta-params, the exact corrected call shape. The
+      // generic schema advice contradicts or dilutes that, so suppress it for the
+      // whole dispatch stage. See handlers/useToolInput.ts.
+      if ((data as { validation_stage?: unknown } | undefined)?.validation_stage === "dispatch") {
+        return message;
+      }
+      return message + ". Use 'get_tool_details' to review the schema, or 'dry_run: true' to test arguments.";
+    case ERROR_CODES.AUTH_REQUIRED:
+      return message + ". Run 'authenticate(package_id: \"...\")' to connect this package.";
+    case ERROR_CODES.PACKAGE_UNAVAILABLE:
+      return message + ". Run 'health_check_all()' to diagnose the issue.";
+    case ERROR_CODES.DOWNSTREAM_ERROR:
+      return message + ". Check the error details above. If the error persists, try 'restart_package(package_id: \"...\")' to reconnect.";
+    case ERROR_CODES.TOOL_BLOCKED:
+      return message + ". This tool has been blocked by the security policy.";
+    default:
+      return message;
+  }
+}
+
 function parseRequestedPackageIds(queryValue: unknown): string[] | null {
   const rawValues = Array.isArray(queryValue) ? queryValue : [queryValue];
   const packageIds = rawValues
@@ -479,7 +516,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
                 },
                 args: {
                   type: "object",
-                  description: "Tool-specific arguments matching the schema from get_tool_details or list_tools",
+                  description: "Tool-specific arguments matching the schema from get_tool_details or list_tools. Holds the tool's own arguments ONLY — max_output_chars, output_offset, schema_hash, dry_run and result_id are top-level use_tool parameters, not tool arguments, so never nest them inside args.",
                   examples: [
                     { path: "/Users/example/file.txt" },
                     { query: "language:python stars:>100" }
@@ -790,42 +827,13 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
         });
 
         if (error && typeof error === "object" && "code" in error) {
-          const errorCode = (error as any).code;
-          let helpfulMessage = (error as any).message;
-          
-          switch (errorCode) {
-            case ERROR_CODES.PACKAGE_NOT_FOUND:
-              helpfulMessage += ". Run 'list_tool_packages()' to see available packages.";
-              break;
-            case ERROR_CODES.TOOL_NOT_FOUND:
-              helpfulMessage += ". Try 'search_tools(query: \"...\")' to find tools by intent, or 'list_tools(package_id: \"...\", detail: \"lite\")' to browse.";
-              break;
-            case ERROR_CODES.ARG_VALIDATION_FAILED:
-              // Dispatch-stage failures (parseUseToolInput) already carry their own
-              // recovery guidance and, for misplaced meta-params, the exact corrected
-              // call shape. The generic schema advice contradicts or dilutes that, so
-              // suppress it for the whole dispatch stage. See handlers/useToolInput.ts.
-              if ((error as any).data?.validation_stage !== "dispatch") {
-                helpfulMessage += ". Use 'get_tool_details' to review the schema, or 'dry_run: true' to test arguments.";
-              }
-              break;
-            case ERROR_CODES.AUTH_REQUIRED:
-              helpfulMessage += ". Run 'authenticate(package_id: \"...\")' to connect this package.";
-              break;
-            case ERROR_CODES.PACKAGE_UNAVAILABLE:
-              helpfulMessage += ". Run 'health_check_all()' to diagnose the issue.";
-              break;
-            case ERROR_CODES.DOWNSTREAM_ERROR:
-              helpfulMessage += ". Check the error details above. If the error persists, try 'restart_package(package_id: \"...\")' to reconnect.";
-              break;
-            case ERROR_CODES.TOOL_BLOCKED:
-              helpfulMessage += ". This tool has been blocked by the security policy.";
-              break;
-          }
-          
           throw {
             ...error,
-            message: helpfulMessage,
+            message: appendErrorAdvice(
+              (error as any).code,
+              (error as any).message,
+              (error as any).data,
+            ),
           };
         }
 

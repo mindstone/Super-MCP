@@ -466,6 +466,91 @@ describe("useTool misplaced meta-param rejection", () => {
     expect(mockClient.callTool).not.toHaveBeenCalled();
   });
 
+  it("(iv-b) rejects nested schema_hash at dispatch", async () => {
+    // schema_hash is the third hard-rejected param and had no direct case before
+    // (reviewer-opus F1); the drift-guard test pins the set, this pins the behaviour.
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createMocks({
+      schema: NO_ARG_SCHEMA,
+      realValidator: true,
+    });
+
+    const error = await catchError(
+      handleUseTool(
+        {
+          package_id: "pkg1",
+          tool_id: "tool1",
+          args: { schema_hash: "abc123" },
+        } as unknown as Parameters<typeof handleUseTool>[0],
+        mockRegistry,
+        mockCatalog,
+        mockValidator,
+      ),
+    );
+
+    expect(error).toMatchObject({ code: ERROR_CODES.ARG_VALIDATION_FAILED });
+    expect(error.message).toContain("Argument validation failed for tool");
+    expect(error.message).toContain("schema_hash");
+    expect(error.data).toMatchObject({
+      validation_stage: "dispatch",
+      field: "args.schema_hash",
+      misplaced_param: "schema_hash",
+    });
+    expect(mockValidator.validate).not.toHaveBeenCalled();
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it("(vii) never emits a placeholder package_id in the retry template for a namespaced call", async () => {
+    // reviewer-kimi F2: `{tool_id: "pkg1__tool1"}` with no package_id is a supported
+    // shape, so a retry template containing `package_id: "<unknown>"` would teach a
+    // call that itself fails package lookup — the same "error message teaches a
+    // broken shape" failure class this guard exists to end.
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createMocks();
+
+    const error = await catchError(
+      handleUseTool(
+        {
+          tool_id: "pkg1__tool1",
+          args: { max_output_chars: 5 },
+        } as unknown as Parameters<typeof handleUseTool>[0],
+        mockRegistry,
+        mockCatalog,
+        mockValidator,
+      ),
+    );
+
+    expect(error).toMatchObject({ code: ERROR_CODES.ARG_VALIDATION_FAILED });
+    expect(error.message).toContain("Argument validation failed for tool");
+    expect(error.message).not.toContain("<unknown>");
+    // The namespaced tool_id alone is a resolvable retry shape.
+    expect(error.message).toContain('use_tool({ tool_id: "pkg1__tool1"');
+    // (RECOVERY_GUIDANCE legitimately mentions package_id in its list_tools example,
+    // so assert on the retry template itself rather than the whole message.)
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it("(viii) caps the echoed nested value so it cannot crowd out the leading clause", async () => {
+    // reviewer-kimi F4: the composed message competes for the host's 2000-char
+    // error-data budget, which truncates tail-first.
+    const { mockRegistry, mockCatalog, mockValidator } = createMocks();
+
+    const error = await catchError(
+      handleUseTool(
+        {
+          package_id: "pkg1",
+          tool_id: "tool1",
+          args: { max_output_chars: "x".repeat(50_000) },
+        } as unknown as Parameters<typeof handleUseTool>[0],
+        mockRegistry,
+        mockCatalog,
+        mockValidator,
+      ),
+    );
+
+    expect(error.message).toContain("(truncated)");
+    expect(error.message.length).toBeLessThan(1200);
+    expect(error.message.startsWith("Argument validation failed for tool")).toBe(true);
+  });
+
   it("(v) does NOT reject when the meta-param is ALSO present top-level (escape hatch)", async () => {
     // The escape hatch that keeps a tool legitimately declaring one of the hard-rejected
     // params callable: pass it top-level too. Verified genuine for all three
