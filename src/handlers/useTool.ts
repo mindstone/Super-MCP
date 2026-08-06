@@ -201,6 +201,11 @@ interface RepairTicket {
    *
    * Secondary carrier only — the prose in `message` is the truncation-safe one
    * (the host caps the JOINED error string at 2000 chars, tail-first).
+   *
+   * In practice only the SOFT meta-params (`dry_run`, `result_id`) can appear
+   * here: the hard-reject three are stopped earlier at the envelope guard
+   * (useToolInput.ts rejectMisplacedMetaParams), so a nested occurrence of those
+   * never reaches the validator to be stripped and classified into this field.
    */
   misplaced_params?: string[];
   did_you_mean: Record<string, string>;
@@ -238,11 +243,15 @@ export function schemaStripsUnknownArgs(schema: unknown): boolean {
   if ("additionalProperties" in schema) {
     return false;
   }
+  // TRUTHINESS, byte-for-byte with the validator's condition (validator.ts:57-64)
+  // — deliberately not `=== undefined`. The forms diverge on falsy-but-present
+  // combinators (`anyOf: null`, `oneOf: false`, …): the validator treats those as
+  // absent, so it DOES inject and strip, while `=== undefined` would report
+  // "passes through" and wrongly suppress the observability warn. (`anyOf: []` is
+  // not such a case — `[]` is truthy, so both forms agree on "no injection".)
+  // The drift-pin suite covers this boundary.
   return (
-    schema.oneOf === undefined &&
-    schema.allOf === undefined &&
-    schema.anyOf === undefined &&
-    schema.patternProperties === undefined
+    !schema.oneOf && !schema.allOf && !schema.anyOf && !schema.patternProperties
   );
 }
 

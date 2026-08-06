@@ -1274,6 +1274,30 @@ describe("REBEL-7JD: misplaced use_tool meta-params in the repair ticket", () =>
     expect(error.message).not.toContain('move it outside "args"');
   });
 
+  it("treats an explicitly falsy top-level twin as PRESENT (remove, not move)", async () => {
+    const schema = {
+      type: "object",
+      properties: {},
+    };
+
+    const error = await runValidationFailure({
+      schema,
+      args: { dry_run: true },
+      // `dry_run: false` is explicitly supplied at the top level. Presence is
+      // pinned to `!== undefined` (getTopLevelMetaParamPresence), matching the
+      // envelope guard — so this is the "remove" case even though the value is
+      // falsy. A truthiness test here would wrongly emit "move it outside args"
+      // and lose the user's explicit `false` (Stage 2 review F4).
+      extraInput: { dry_run: false },
+    });
+
+    const repairTicket = expectRepairTicket(error);
+    expect(repairTicket.misplaced_params).toEqual(["dry_run"]);
+    expect(error.message).toContain("remove it from \"args\"");
+    expect(error.message).toContain("the top-level value is the one used");
+    expect(error.message).not.toContain('move it outside "args"');
+  });
+
   it("warns that a nested result_id turns the retry into a continuation call", async () => {
     const schema = {
       type: "object",
@@ -1548,6 +1572,43 @@ describe("REBEL-7JD: non-stripping-schema drift pin", () => {
 
       expect(observedStripping).toBe(testCase.expectStripping);
       expect(schemaStripsUnknownArgs(testCase.schema)).toBe(testCase.expectStripping);
+    });
+  }
+
+  /**
+   * Falsy-but-present combinator keys. The validator's condition is TRUTHINESS
+   * (`!schema.anyOf`), so `anyOf: null` still INJECTS `additionalProperties:
+   * false` and strips — whereas an `=== undefined` form of the duplicated
+   * predicate would report "passes through" and suppress the observability
+   * warn. This is the case where the two forms genuinely diverge, so it pins the
+   * duplicate to truthiness (Stage 2 review F2).
+   *
+   * Note `anyOf: []` is NOT such a case: `[]` is truthy, so both forms agree on
+   * "no injection" (and Ajv rejects an empty `anyOf` outright).
+   */
+  const falsyCombinatorCases: Array<{ name: string; schema: any }> = [
+    { name: "anyOf: null", schema: { type: "object", properties: { query: { type: "string" } }, anyOf: null } },
+    { name: "oneOf: false", schema: { type: "object", properties: { query: { type: "string" } }, oneOf: false } },
+    { name: "allOf: 0", schema: { type: "object", properties: { query: { type: "string" } }, allOf: 0 } },
+    {
+      name: "patternProperties: null",
+      schema: { type: "object", properties: { query: { type: "string" } }, patternProperties: null },
+    },
+  ];
+
+  for (const testCase of falsyCombinatorCases) {
+    it(`agrees with the validator on a falsy-but-present combinator: ${testCase.name}`, () => {
+      const validator = new Validator();
+      const data: Record<string, unknown> = { query: "hello", surprise_field: 1 };
+
+      // Ajv rejects a non-array combinator, so `validate` throws at COMPILE.
+      // Stripping runs before compilation (validator.ts strips, then compiles),
+      // so the in-place mutation of `data` is the observable evidence that the
+      // injection branch was taken.
+      expect(() => validator.validate(testCase.schema, data)).toThrow();
+      expect("surprise_field" in data).toBe(false);
+
+      expect(schemaStripsUnknownArgs(testCase.schema)).toBe(true);
     });
   }
 });
