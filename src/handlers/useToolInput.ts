@@ -167,6 +167,13 @@ function rejectMisplacedMetaParams(input: {
     if (!(param in args)) continue;
     // Escape hatch: the model also passed it top-level, so the meta-param is being
     // honoured and the nested copy is (at worst) a redundant tool argument.
+    //
+    // "At worst" is schema-dependent: on a non-stripping schema
+    // (additionalProperties: true) the nested key is forwarded downstream VERBATIM as
+    // a real tool argument; on a stripping schema the validator strips-and-throws
+    // instead. The non-stripping passthrough is warned about at the validation seam
+    // (useTool.ts detector (ii)) rather than blocked here, because blocking it would
+    // break the tools this escape hatch exists to keep callable.
     if (input[param] !== undefined) continue;
 
     const suppliedPackageId = optionalString(input.package_id);

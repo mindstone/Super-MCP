@@ -171,6 +171,16 @@ const STOP_RETRYING_MESSAGE =
  * Terminal guidance for the MISPLACED-meta-param case, which the shared message
  * above fits badly: the model can fix this itself in one move, so telling it to
  * "report what failed" would strand a recoverable call (REBEL-7JD).
+ *
+ * CROSS-REPO (reciprocal of the note on `STOP_RETRYING_MESSAGE` above): this line
+ * must NOT match `isArgValidationExhausted` in the superproject's
+ * src/renderer/features/inbox/hooks/usePendingApprovals.ts. That classifier keys on
+ * "stop re-sending the same call shape"; this message says "this call shape" — the
+ * one-word distance is LOAD-BEARING, not incidental phrasing. Rewording this to
+ * "the same call shape" would silently flip a user-facing inbox state, surfacing
+ * the terminal "Rebel needs a bit more from you" copy for a call-shape mistake the
+ * user did not make and cannot fix. A negative test pins the non-match
+ * (usePendingApprovals.test.ts).
  */
 function buildMisplacedStopRetryingMessage(misplacedParams: string[]): string {
   const names = misplacedParams.join(", ");
@@ -1461,6 +1471,13 @@ export async function handleUseTool(
         // name equals a use_tool meta-param, so the misplacement teaching would be
         // WRONG for this tool. If this fires for a hard-rejected param, that param
         // must leave USE_TOOL_HARD_REJECT_META_PARAMS.
+        //
+        // Coverage caveat for a HARD-REJECTED param: a call that nests it WITHOUT a
+        // top-level twin is rejected at the envelope guard (rejectMisplacedMetaParams,
+        // useToolInput.ts) before this validation seam ever runs — that guard is
+        // deliberately schema-independent, so it cannot know about the collision. So
+        // for hard-rejected params this warn surfaces collisions ONLY via escape-hatch
+        // calls (the top-level twin present, which the guard skips).
         logger.warn("use_tool meta-param name collides with legitimate schema property", {
           handler: "use_tool",
           package_id,
