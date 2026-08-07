@@ -1457,6 +1457,96 @@ describe("REBEL-7JD: meta-param observability warns at the validation seam", () 
     }
   });
 
+  it("warns with the canonical-twin variant when only the TWIN is declared (F4)", async () => {
+    // The tool declares `dryRun`; the call nests `dry_run`. That is not a literal
+    // collision, but it IS the twin path (now renamed before dispatch), so it must
+    // be observable — and distinguishable from the literal case in the message.
+    const warnSpy = vi.spyOn(getLogger(), "warn");
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const toolId = nextId("tool");
+    const packageId = nextId("pkg");
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { dryRun: { type: "boolean" } },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    try {
+      const result = await handleUseTool(
+        {
+          package_id: packageId,
+          tool_id: toolId,
+          args: { dry_run: true },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+
+      expect(result.isError).toBe(false);
+      const twinWarn = findWarn(
+        warnSpy,
+        "use_tool meta-param collides with a CANONICAL TWIN of a schema property",
+      );
+      expect(twinWarn).toBeDefined();
+      expect(twinWarn?.[1]).toMatchObject({
+        package_id: packageId,
+        tool_id: toolId,
+        param: "dry_run",
+        declared_property: "dryRun",
+      });
+      // The literal-collision message must NOT be used for the twin case.
+      expect(
+        findWarn(warnSpy, "use_tool meta-param name collides with legitimate schema property"),
+      ).toBeUndefined();
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it("warns ONCE per tool+param for the canonical-twin arm too (shared once-set)", async () => {
+    const warnSpy = vi.spyOn(getLogger(), "warn");
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const toolId = nextId("tool");
+    const packageId = nextId("pkg");
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { dryRun: { type: "boolean" } },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    try {
+      for (let call = 0; call < 3; call += 1) {
+        const result = await handleUseTool(
+          {
+            package_id: packageId,
+            tool_id: toolId,
+            args: { dry_run: true },
+          },
+          registry as any,
+          catalog as any,
+          validator,
+        );
+        expect(result.isError).toBe(false);
+      }
+
+      const twinWarns = warnSpy.mock.calls.filter(
+        (call: unknown[]) =>
+          call[0] === "use_tool meta-param collides with a CANONICAL TWIN of a schema property" &&
+          (call[1] as { tool_id?: string } | undefined)?.tool_id === toolId,
+      );
+      expect(twinWarns).toHaveLength(1);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it("does not warn when args carry no meta-param names", async () => {
     const warnSpy = vi.spyOn(getLogger(), "warn");
     const callTool = vi.fn(async () => ({ ok: true }));
@@ -1575,11 +1665,12 @@ describe("REBEL-7JD: declared-property misplacement gate", () => {
     expect(callTool).toHaveBeenCalledTimes(1);
   });
 
-  it("(ii-b) dispatches when the schema declares the CANONICAL TWIN dryRun", async () => {
-    // canonicalKeyNormalize renames nested `dry_run` → declared `dryRun` and the
-    // call dispatches today. A naive key-set gate would throw instead, breaking a
-    // working call (Amendment A / kimi F2). Non-stripping schema so the auto-repair
-    // seam does not even fire — the gate itself must subtract canonical twins.
+  it("(ii-b) RENAMES the canonical twin before dispatch when the schema declares dryRun", async () => {
+    // DA F1: the gate subtracts canonical twins, but on a NON-STRIPPING schema the
+    // auto-repair seam never runs (validation passes clean), so the literal
+    // `dry_run` key used to be dispatched VERBATIM — the tool ignores the unknown
+    // key, keeps its declared `dryRun` default (false) and MUTATES FOR REAL. The
+    // gate seam must normalise the key itself: `dry_run` → declared `dryRun`.
     const callTool = vi.fn(async () => ({ ok: true }));
     const { registry, catalog, validator } = createUseToolDeps(
       {
@@ -1603,6 +1694,167 @@ describe("REBEL-7JD: declared-property misplacement gate", () => {
 
     expect(result.isError).toBe(false);
     expect(callTool).toHaveBeenCalledTimes(1);
+    // The load-bearing assertion (DA F3): WHICH args reached the tool. Asserting
+    // only the call count pinned the silent-mutation hole green.
+    const dispatchedArgs = (callTool.mock.calls[0] as any[])[1] as Record<string, unknown>;
+    expect(dispatchedArgs).toEqual({ dryRun: true });
+    expect("dry_run" in dispatchedArgs).toBe(false);
+  });
+
+  it("(ii-c) never dispatches the literal dry_run key on a permissive twin schema (DA F1 trace)", async () => {
+    // The exact trace the Devil's Advocate walked: schema declares `dryRun`,
+    // additionalProperties: true, args nest `dry_run: true`. Validation passes
+    // clean, so pre-fix the tool received `{dry_run: true}`, ignored it, and
+    // executed a real mutation for a model that asked for a dry run.
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { target: { type: "string" }, dryRun: { type: "boolean" } },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    const result = await handleUseTool(
+      {
+        package_id: nextId("pkg"),
+        tool_id: nextId("tool"),
+        args: { target: "prod", dry_run: true },
+      },
+      registry as any,
+      catalog as any,
+      validator,
+    );
+
+    expect(result.isError).toBe(false);
+    const dispatchedArgs = (callTool.mock.calls[0] as any[])[1] as Record<string, unknown>;
+    expect(dispatchedArgs.dryRun).toBe(true);
+    expect("dry_run" in dispatchedArgs).toBe(false);
+    expect(dispatchedArgs).toEqual({ target: "prod", dryRun: true });
+  });
+
+  it("(ii-d) renames a canonical-twin result_id (declared resultId) before dispatch", async () => {
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { resultId: { type: "string" } },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    const result = await handleUseTool(
+      {
+        package_id: nextId("pkg"),
+        tool_id: nextId("tool"),
+        args: { result_id: "abc123" },
+      },
+      registry as any,
+      catalog as any,
+      validator,
+    );
+
+    expect(result.isError).toBe(false);
+    expect((callTool.mock.calls[0] as any[])[1]).toEqual({ resultId: "abc123" });
+  });
+
+  it("(ii-e) leaves a LITERALLY declared dry_run untouched (no rename)", async () => {
+    // A literal declaration is a legitimate tool argument — the rename must not fire.
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { dry_run: { type: "boolean" } },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    const result = await handleUseTool(
+      {
+        package_id: nextId("pkg"),
+        tool_id: nextId("tool"),
+        args: { dry_run: true },
+      },
+      registry as any,
+      catalog as any,
+      validator,
+    );
+
+    expect(result.isError).toBe(false);
+    expect((callTool.mock.calls[0] as any[])[1]).toEqual({ dry_run: true });
+  });
+
+  it("(ii-f) throws the misplacement ticket when the canonical twin is AMBIGUOUS", async () => {
+    // Two declared properties share the canonical form `dryrun`, so which one the
+    // model meant is undecidable. Fail visible rather than guess or pass through.
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { dryRun: { type: "boolean" }, "dry-run": { type: "boolean" } },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    let error: any;
+    try {
+      await handleUseTool(
+        {
+          package_id: nextId("pkg"),
+          tool_id: nextId("tool"),
+          args: { dry_run: true },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+      throw new Error("Expected the misplacement gate to reject the call");
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error.code).toBe(ERROR_CODES.ARG_VALIDATION_FAILED);
+    expect(error.data?.repair_ticket?.misplaced_params).toEqual(["dry_run"]);
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("(ii-g) does not clobber an existing value at the canonical-twin target", async () => {
+    // Both declared `dryRun` and nested `dry_run` present: renaming would overwrite
+    // an explicit value. Undecidable → misplacement ticket, never a silent overwrite.
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { dryRun: { type: "boolean" } },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    let error: any;
+    try {
+      await handleUseTool(
+        {
+          package_id: nextId("pkg"),
+          tool_id: nextId("tool"),
+          args: { dryRun: false, dry_run: true },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+      throw new Error("Expected the misplacement gate to reject the call");
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error.code).toBe(ERROR_CODES.ARG_VALIDATION_FAILED);
+    expect(error.data?.repair_ticket?.misplaced_params).toEqual(["dry_run"]);
+    expect(callTool).not.toHaveBeenCalled();
   });
 
   it("(iii) says REMOVE (not move) when a top-level twin is already present", async () => {

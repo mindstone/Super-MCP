@@ -830,31 +830,69 @@ function classifyMisplacedMetaParams(
  * (useToolInput.ts rejectMisplacedMetaParams) and keep their top-level-twin escape
  * hatch — widening this gate to cover them would silently revoke it.
  *
- * CANONICAL TWINS are subtracted too: a schema declaring `dryRun` legitimises a
- * nested `dry_run`, which `canonicalKeyNormalize` renames and dispatches today.
- * A literal-key-only gate would throw on that working call.
+ * CANONICAL TWINS are NOT dispatched verbatim — they are RENAMED first (DA F1).
+ * A schema declaring `dryRun` legitimises a nested `dry_run`, so the gate must not
+ * throw on that working call. But the earlier design (subtract the twin, dispatch
+ * the literal key) re-opened the very hole this gate exists to close: on a
+ * permissive schema (`additionalProperties: true`) the nested `dry_run` validates
+ * clean, so the auto-repair seam's condition (`!isValid || strippedArgs.length > 0`)
+ * is false and `canonicalKeyNormalize` never runs — the tool then received the
+ * unknown `dry_run`, ignored it, kept its own `dryRun` default (false) and MUTATED
+ * FOR REAL. So this gate performs the rename itself: `dry_run` → declared `dryRun`.
+ * Both readings of the call are then safe — if the model meant the tool's own
+ * `dryRun`, the spelling is fixed; if it meant use_tool's dry-run, the tool does a
+ * dry run and nothing mutates.
+ *
+ * A twin is only renamed when the intent is DECIDABLE:
+ *   - exactly ONE declared property shares the canonical form (ambiguous twins are
+ *     pathological — e.g. `dryRun` and `dry-run` both declared), and
+ *   - the target key is not already present in `args` (renaming would clobber an
+ *     explicit value).
+ * Otherwise the param is reported as misplaced, so the call fails VISIBLY with the
+ * teaching ticket rather than guessing or silently passing through.
  *
  * Evaluate on the POST-repair effective `args` (the keys actually about to be
  * dispatched), not on the pre-validation snapshot.
  */
-function findMisplacedSoftMetaParams(
+type SoftMetaParamGateResult = {
+  /** Soft meta-params that must be taught (not declared, no decidable twin). */
+  misplaced: string[];
+  /** Canonical-twin renames to apply to the dispatched args before sending. */
+  renames: { from: string; to: string }[];
+};
+
+function classifySoftMetaParamsForDispatch(
   effectiveArgs: unknown,
   schema: unknown,
-): string[] {
+): SoftMetaParamGateResult {
+  const result: SoftMetaParamGateResult = { misplaced: [], renames: [] };
   if (!isRecord(effectiveArgs)) {
-    return [];
+    return result;
   }
   const declared = isRecord(schema) && isRecord(schema.properties) ? schema.properties : {};
-  const declaredCanonical = new Set(Object.keys(declared).map(canonicalKey));
+  const declaredKeys = Object.keys(declared);
 
-  const misplaced: string[] = [];
   for (const param of USE_TOOL_SOFT_META_PARAMS) {
     if (!(param in effectiveArgs)) continue;
+    // Literally declared → a legitimate tool argument, untouched.
     if (param in declared) continue;
-    if (declaredCanonical.has(canonicalKey(param))) continue;
-    misplaced.push(param);
+    const target = canonicalKey(param);
+    const twins = declaredKeys.filter((key) => canonicalKey(key) === target);
+    if (twins.length !== 1) {
+      // No twin at all, or an ambiguous one: teach, never dispatch.
+      result.misplaced.push(param);
+      continue;
+    }
+    const to = twins[0]!;
+    if (Object.prototype.hasOwnProperty.call(effectiveArgs, to)) {
+      // The declared spelling already carries a value; renaming would clobber it
+      // and the model's intent is undecidable. Fail visible.
+      result.misplaced.push(param);
+      continue;
+    }
+    result.renames.push({ from: param, to });
   }
-  return misplaced;
+  return result;
 }
 
 /**
@@ -1476,9 +1514,13 @@ export async function handleUseTool(
   let strippedArgs = validationResult.strippedArgs;
   let isValid = validationResult.valid;
 
-  // REBEL-7JD observability warn (i) — the COLLISION detector. Reads
-  // `preValidationSnapshot`, because `validator.validate` strips unknown keys from
-  // `args` IN PLACE. This is the wake-up signal the deferred residue items are
+  // REBEL-7JD observability warn (i) — the COLLISION detector, in two arms:
+  // LITERAL (the tool declares a property named exactly like a meta-param) and
+  // CANONICAL TWIN (it declares `dryRun` and the call nested `dry_run`; DA F4).
+  // Distinct messages so telemetry can tell the two apart; both share the once-set.
+  //
+  // Reads `preValidationSnapshot`, because `validator.validate` strips unknown keys
+  // from `args` IN PLACE. This is the wake-up signal the deferred residue items are
   // conditioned on (PLAN.md § Explicitly out of scope).
   //
   // Warn (ii) (the non-stripping-schema PASSTHROUGH detector) was deleted with the
@@ -1492,9 +1534,19 @@ export async function handleUseTool(
   if (preValidationSnapshot) {
     const declaredProperties =
       isRecord(schema) && isRecord(schema.properties) ? schema.properties : undefined;
+    const declaredKeys = declaredProperties ? Object.keys(declaredProperties) : [];
     for (const param of USE_TOOL_META_PARAMS) {
       if (!(param in preValidationSnapshot)) continue;
-      if (!declaredProperties || !(param in declaredProperties)) continue;
+      if (!declaredProperties) continue;
+      const isLiteralCollision = param in declaredProperties;
+      // CANONICAL-TWIN arm (DA F4): the tool declares `dryRun` and the call nested
+      // `dry_run`. Not a literal collision, but it IS the twin path the gate below
+      // now renames before dispatch — so it must be observable too, and
+      // distinguishable from the literal case (different message + declared_property).
+      const canonicalTwins = isLiteralCollision
+        ? []
+        : declaredKeys.filter((key) => canonicalKey(key) === canonicalKey(param));
+      if (!isLiteralCollision && canonicalTwins.length === 0) continue;
       // (i) Collision detector: the tool legitimately declares a property whose
       // name equals a use_tool meta-param, so the misplacement teaching would be
       // WRONG for this tool. If this fires for a hard-rejected param, that param
@@ -1512,12 +1564,22 @@ export async function handleUseTool(
       const collisionKey = `${package_id}:${tool_id}:${param}`;
       if (metaParamCollisionWarned.has(collisionKey)) continue;
       metaParamCollisionWarned.add(collisionKey);
-      logger.warn("use_tool meta-param name collides with legitimate schema property", {
-        handler: "use_tool",
-        package_id,
-        tool_id,
-        param,
-      });
+      if (isLiteralCollision) {
+        logger.warn("use_tool meta-param name collides with legitimate schema property", {
+          handler: "use_tool",
+          package_id,
+          tool_id,
+          param,
+        });
+      } else {
+        logger.warn("use_tool meta-param collides with a CANONICAL TWIN of a schema property", {
+          handler: "use_tool",
+          package_id,
+          tool_id,
+          param,
+          declared_property: canonicalTwins.length === 1 ? canonicalTwins[0] : canonicalTwins,
+        });
+      }
     }
   }
 
@@ -1604,10 +1666,33 @@ export async function handleUseTool(
   // a model that asked for a dry run).
   //
   // Ordering is load-bearing: AFTER validation and the auto-repair seam (so a
-  // canonical rename like `dry_run`→declared `dryRun` has already happened and this
-  // sees the effective args), and BEFORE both the top-level `dry_run` short-circuit
-  // and dispatch (so a misplacement can never reach the downstream tool).
-  const misplacedSoftParams = findMisplacedSoftMetaParams(args, schema);
+  // canonical rename like `dry_run`→declared `dryRun` performed THERE has already
+  // happened and this sees the effective args), and BEFORE both the top-level
+  // `dry_run` short-circuit and dispatch (so neither a misplacement nor a
+  // verbatim canonical twin can ever reach the downstream tool).
+  const softParamGate = classifySoftMetaParamsForDispatch(args, schema);
+
+  // DA F1 — normalize-before-dispatch. A decidable canonical twin is RENAMED into
+  // the tool's declared spelling here, because on a permissive schema the
+  // auto-repair seam above never ran (validation passed clean) and dispatching the
+  // literal `dry_run` would let a "dry run" request execute a real mutation.
+  if (softParamGate.renames.length > 0 && isRecord(args)) {
+    for (const { from, to } of softParamGate.renames) {
+      (args as Record<string, unknown>)[to] = (args as Record<string, unknown>)[from];
+      delete (args as Record<string, unknown>)[from];
+      normalisations.push(formatAutoRepairBreadcrumb({ kind: "key", from, to }));
+      // NOTE message-first logger (src/logging.ts), NOT pino's ({data}, msg).
+      logger.info("Renamed nested soft meta-param to its declared canonical twin", {
+        handler: "use_tool",
+        package_id,
+        tool_id,
+        from,
+        to,
+      });
+    }
+  }
+
+  const misplacedSoftParams = softParamGate.misplaced;
   if (misplacedSoftParams.length > 0) {
     resetValidationAttempt(downstreamValidationAttemptKey);
     // Same counter as the teaching branch (invariant 6): threshold and terminal

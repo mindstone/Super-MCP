@@ -250,11 +250,14 @@ type JsonSchemaLike = {
 /**
  * Mirrors `super-mcp/src/utils/fuzzyMatch.ts` `canonicalize()`.
  *
- * Exported because the declared-property misplacement gate (handlers/useTool.ts)
- * must subtract the CANONICAL twins of the schema's declared properties — a tool
- * declaring `dryRun` legitimises a nested `dry_run`, which `canonicalKeyNormalize`
- * renames and dispatches. The gate and the rename must agree on what "same key"
- * means, so they share this one definition (REBEL-7JD / plan Amendment A).
+ * Exported because the declared-property misplacement gate (handlers/useTool.ts
+ * `classifySoftMetaParamsForDispatch`) resolves the CANONICAL twins of the schema's
+ * declared properties — a tool declaring `dryRun` legitimises a nested `dry_run`,
+ * which the gate then RENAMES into the declared spelling before dispatch (it cannot
+ * rely on `canonicalKeyNormalize` doing it: on a permissive schema validation passes
+ * clean and the auto-repair seam never fires — DA F1). The gate and the auto-repair
+ * rename must agree on what "same key" means, so they share this one definition
+ * (REBEL-7JD / plan Amendment A).
  */
 export function canonicalKey(name: string): string {
   return name.replace(/[-_]/g, "").toLowerCase();

@@ -176,9 +176,11 @@ function rejectMisplacedMetaParams(input: {
     //
     // Note the asymmetry with the SOFT pair (dry_run, result_id), which never reaches
     // this guard: for those the validation seam's declared-property gate
-    // (useTool.ts findMisplacedSoftMetaParams) now BLOCKS the equivalent passthrough
-    // outright — there the escape hatch is "declare the property in your schema"
-    // (literal or canonical twin), not "pass it top-level too". REBEL-7JD residue R1.
+    // (useTool.ts classifySoftMetaParamsForDispatch) now BLOCKS the equivalent
+    // passthrough outright — there the escape hatch is "declare the property in your
+    // schema", and a canonical twin is RENAMED into the declared spelling rather than
+    // forwarded verbatim, so nothing unknown reaches the tool. REBEL-7JD residue R1
+    // (+ DA F1).
     if (input[param] !== undefined) continue;
 
     const suppliedPackageId = optionalString(input.package_id);
