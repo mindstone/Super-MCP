@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+> Shipped to Rebel from submodule source (the app bundles super-mcp at build time), so these changes are live without an npm release. The package version stays at **2.7.6**; the next npm publish folds this section into a version heading.
+
+### Fixed
+- **A misplaced `dry_run` / `result_id` nested inside `args` can no longer silently run the real action.** `use_tool` takes these two as **top-level** parameters (siblings of `args`), and a model that nests one is making a call-shape mistake. Previously the router only taught that mistake when the tool's own JSON Schema would strip the unknown key; on a permissive schema (`additionalProperties`, or no declared `properties` at all) the nested key validated clean and the call **dispatched** — so a model that asked to "dry run" a tool got the real, unreverted action, with nothing but a log warning to show for it. The gate is now keyed on **declared properties** rather than stripping behaviour: at a new unconditional post-validation seam (after auto-repair, before the `dry_run` short-circuit and before dispatch), any of the soft pair present in the effective args and *not* declared by the schema — nor by its canonical-form twin, so a declared `dryRun` still legitimises a nested `dry_run` — throws `-33003` with a misplacement repair ticket naming the exact corrected call shape, and is never dispatched. A tool that genuinely declares `dry_run` or `result_id` as its own parameter passes through unchanged (the declare-it escape hatch). The three hard-rejected meta-params (`max_output_chars`, `output_offset`, `schema_hash`) are unaffected — they stay envelope-layer-only, including their top-level-twin escape hatch.
+- **The generic "use `dry_run` to preview" advice suffix is no longer appended to misplacement errors.** `appendErrorAdvice` suppressed it only for dispatch-stage failures, so a validation-stage repair ticket that had just taught the model where `dry_run` belongs was followed by boilerplate suggesting it use `dry_run` — contradictory advice on the one error where the model was already being told the answer. Suppression is now keyed on the ticket carrying a misplacement (any stage).
+
+### Changed
+- **The meta-param name-collision warning fires once per tool+param instead of on every call.** It exists to flag a tool whose schema legitimately declares a property named like a `use_tool` meta-param (in which case the misplacement teaching would be wrong for that tool); on a hot tool it re-emitted per call and buried its own signal.
+
+### Removed
+- **`schemaStripsUnknownArgs` and its drift-pin suite**, dead once the misplacement gate stopped asking whether the validator would strip an unknown key. It had duplicated `validator.ts`'s stripping semantics and needed a pin suite to keep the two in sync.
+- **The non-stripping-schema passthrough warning** (the "warn (ii)" companion to the collision warning). For the soft pair the passthrough it detected is now structurally impossible — the gate throws instead of dispatching.
+
 ## [2.7.3] - 2026-07-01
 
 ### Fixed
