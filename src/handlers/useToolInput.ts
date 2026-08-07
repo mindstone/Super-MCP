@@ -171,9 +171,14 @@ function rejectMisplacedMetaParams(input: {
     // "At worst" is schema-dependent: on a non-stripping schema
     // (additionalProperties: true) the nested key is forwarded downstream VERBATIM as
     // a real tool argument; on a stripping schema the validator strips-and-throws
-    // instead. The non-stripping passthrough is warned about at the validation seam
-    // (useTool.ts detector (ii)) rather than blocked here, because blocking it would
-    // break the tools this escape hatch exists to keep callable.
+    // instead. That non-stripping passthrough is deliberately NOT blocked here —
+    // blocking it would break the tools this escape hatch exists to keep callable.
+    //
+    // Note the asymmetry with the SOFT pair (dry_run, result_id), which never reaches
+    // this guard: for those the validation seam's declared-property gate
+    // (useTool.ts findMisplacedSoftMetaParams) now BLOCKS the equivalent passthrough
+    // outright — there the escape hatch is "declare the property in your schema"
+    // (literal or canonical twin), not "pass it top-level too". REBEL-7JD residue R1.
     if (input[param] !== undefined) continue;
 
     const suppliedPackageId = optionalString(input.package_id);

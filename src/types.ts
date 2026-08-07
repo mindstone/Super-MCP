@@ -258,8 +258,14 @@ export const USE_TOOL_INPUT_FIELD_CLASSIFICATION: Record<
 /**
  * Meta-params EXCLUDED from the hard-reject guard (see below). Derived by explicit
  * exclusion so the reason for each is recorded where a future reader will see it.
+ *
+ * Exported because these two are ALSO the exact scope of the declared-property
+ * misplacement gate at the validation seam (handlers/useTool.ts). The gate is
+ * deliberately the complement of the envelope guard: the hard three never reach
+ * the validator, and widening the gate to cover them would break their
+ * top-level-twin escape hatch (REBEL-7JD residue R1 / plan Amendment A).
  */
-const USE_TOOL_SOFT_META_PARAMS: readonly UseToolMetaParam[] = [
+export const USE_TOOL_SOFT_META_PARAMS: readonly UseToolMetaParam[] = [
   // dry_run: plausible as a legitimate third-party tool argument (plenty of real
   // tools take a `dry_run` flag). A false positive would make that tool permanently
   // uncallable, so dry_run is taught by the schema-aware repair ticket instead.

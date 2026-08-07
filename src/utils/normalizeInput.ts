@@ -247,8 +247,16 @@ type JsonSchemaLike = {
   const?: unknown;
 } & Record<string, unknown>;
 
-/** Mirrors `super-mcp/src/utils/fuzzyMatch.ts` `canonicalize()`. */
-function canonicalKey(name: string): string {
+/**
+ * Mirrors `super-mcp/src/utils/fuzzyMatch.ts` `canonicalize()`.
+ *
+ * Exported because the declared-property misplacement gate (handlers/useTool.ts)
+ * must subtract the CANONICAL twins of the schema's declared properties — a tool
+ * declaring `dryRun` legitimises a nested `dry_run`, which `canonicalKeyNormalize`
+ * renames and dispatches. The gate and the rename must agree on what "same key"
+ * means, so they share this one definition (REBEL-7JD / plan Amendment A).
+ */
+export function canonicalKey(name: string): string {
   return name.replace(/[-_]/g, "").toLowerCase();
 }
 

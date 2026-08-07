@@ -111,7 +111,7 @@ export function appendErrorAdvice(code: unknown, message: string, data?: unknown
       return message + ". Run 'list_tool_packages()' to see available packages.";
     case ERROR_CODES.TOOL_NOT_FOUND:
       return message + ". Try 'search_tools(query: \"...\")' to find tools by intent, or 'list_tools(package_id: \"...\", detail: \"lite\")' to browse.";
-    case ERROR_CODES.ARG_VALIDATION_FAILED:
+    case ERROR_CODES.ARG_VALIDATION_FAILED: {
       // Dispatch-stage failures (parseUseToolInput) already carry their own recovery
       // guidance and, for misplaced meta-params, the exact corrected call shape. The
       // generic schema advice contradicts or dilutes that, so suppress it for the
@@ -119,7 +119,21 @@ export function appendErrorAdvice(code: unknown, message: string, data?: unknown
       if ((data as { validation_stage?: unknown } | undefined)?.validation_stage === "dispatch") {
         return message;
       }
+      // REBEL-7JD residue R9: same reasoning, stage-independent. A repair ticket
+      // that teaches a MISPLACEMENT already names the exact corrected call shape, so
+      // ". Use 'get_tool_details' … or 'dry_run: true' to test arguments" is at best
+      // noise and at worst self-contradictory — the misplaced param is often
+      // `dry_run` itself. Keyed on the ticket, not the stage, so the validation-stage
+      // declared-property gate (handlers/useTool.ts) is covered too. Plain validation
+      // failures with no misplacement keep the advice.
+      const misplacedParams = (
+        data as { repair_ticket?: { misplaced_params?: unknown } } | undefined
+      )?.repair_ticket?.misplaced_params;
+      if (Array.isArray(misplacedParams) && misplacedParams.length > 0) {
+        return message;
+      }
       return message + ". Use 'get_tool_details' to review the schema, or 'dry_run: true' to test arguments.";
+    }
     case ERROR_CODES.AUTH_REQUIRED:
       return message + ". Run 'authenticate(package_id: \"...\")' to connect this package.";
     case ERROR_CODES.PACKAGE_UNAVAILABLE:

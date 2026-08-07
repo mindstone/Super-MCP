@@ -2,7 +2,6 @@ import { describe, it, expect, vi } from "vitest";
 import { Validator, ValidationError } from "../src/validator.js";
 import {
   handleUseTool,
-  schemaStripsUnknownArgs,
   STOP_RETRYING_THRESHOLD,
 } from "../src/handlers/useTool.js";
 import { ERROR_CODES } from "../src/types.js";
@@ -1414,43 +1413,45 @@ describe("REBEL-7JD: meta-param observability warns at the validation seam", () 
     }
   });
 
-  it("warns when a meta-param passes through a non-stripping schema", async () => {
+  it("warns ONCE per tool+param across repeated calls (R8 once-set)", async () => {
     const warnSpy = vi.spyOn(getLogger(), "warn");
     const callTool = vi.fn(async () => ({ ok: true }));
     const toolId = nextId("tool");
     const packageId = nextId("pkg");
-    // additionalProperties: true → the validator injects nothing and strips
-    // nothing, so a nested meta-param reaches the downstream tool untouched.
+    // The tool legitimately declares `dry_run`, so every call takes the collision
+    // (i) branch. The warn is a wake-up signal, not a per-call metric — it must
+    // fire once per tool+param, not once per call (R8).
     const { registry, catalog, validator } = createUseToolDeps(
       {
         type: "object",
         properties: {
-          query: { type: "string" },
+          dry_run: { type: "boolean" },
         },
-        additionalProperties: true,
       },
       { callTool },
     );
 
     try {
-      const result = await handleUseTool(
-        {
-          package_id: packageId,
-          tool_id: toolId,
-          args: { query: "hello", dry_run: true },
-        },
-        registry as any,
-        catalog as any,
-        validator,
-      );
+      for (let call = 0; call < 3; call += 1) {
+        const result = await handleUseTool(
+          {
+            package_id: packageId,
+            tool_id: toolId,
+            args: { dry_run: true },
+          },
+          registry as any,
+          catalog as any,
+          validator,
+        );
+        expect(result.isError).toBe(false);
+      }
 
-      expect(result.isError).toBe(false);
-      const warn = findWarn(
-        warnSpy,
-        "use_tool meta-param nested in args passed through non-stripping schema",
+      const collisionWarns = warnSpy.mock.calls.filter(
+        (call: unknown[]) =>
+          call[0] === "use_tool meta-param name collides with legitimate schema property" &&
+          (call[1] as { tool_id?: string } | undefined)?.tool_id === toolId,
       );
-      expect(warn).toBeDefined();
-      expect(warn?.[1]).toMatchObject({ package_id: packageId, tool_id: toolId, param: "dry_run" });
+      expect(collisionWarns).toHaveLength(1);
     } finally {
       warnSpy.mockRestore();
     }
@@ -1485,130 +1486,266 @@ describe("REBEL-7JD: meta-param observability warns at the validation seam", () 
       expect(
         findWarn(warnSpy, "use_tool meta-param name collides with legitimate schema property"),
       ).toBeUndefined();
-      expect(
-        findWarn(warnSpy, "use_tool meta-param nested in args passed through non-stripping schema"),
-      ).toBeUndefined();
     } finally {
       warnSpy.mockRestore();
     }
   });
 });
 
-describe("REBEL-7JD: non-stripping-schema drift pin", () => {
-  /**
-   * The observability warn (ii) in handlers/useTool.ts duplicates the
-   * Validator's additionalProperties-injection condition (validator.ts:58-74)
-   * rather than plumbing a new field through ValidationResult
-   * (reviewer-kimi F5). Duplication needs a tripwire: this test asserts the
-   * duplicated predicate agrees with the validator's OBSERVED stripping
-   * behaviour across the condition's decision boundary, so if the validator's
-   * condition changes, this test goes red and the duplicate gets updated.
-   */
-  const cases: Array<{ name: string; schema: any; expectStripping: boolean }> = [
-    {
-      name: "properties present, additionalProperties omitted → injects (strips)",
-      schema: { type: "object", properties: { query: { type: "string" } } },
-      expectStripping: true,
-    },
-    {
-      name: "additionalProperties: true → no injection (passes through)",
-      schema: { type: "object", properties: { query: { type: "string" } }, additionalProperties: true },
-      expectStripping: false,
-    },
-    {
-      name: "additionalProperties: false → already strict (strips)",
-      schema: { type: "object", properties: { query: { type: "string" } }, additionalProperties: false },
-      expectStripping: true,
-    },
-    {
-      name: "no properties → no injection (passes through)",
-      schema: { type: "object" },
-      expectStripping: false,
-    },
-    {
-      name: "anyOf present → no injection (passes through)",
-      schema: {
+/**
+ * REBEL-7JD (residue R1): the DECLARED-PROPERTY misplacement gate.
+ *
+ * The prior gate asked "will the validator strip this unknown arg?". On a
+ * permissive schema (`additionalProperties: true`, or no `properties` at all)
+ * the answer is no, so a nested `dry_run` validated clean and was DISPATCHED —
+ * a real mutation running when the model asked for a dry run.
+ *
+ * The gate now asks the right question: "does this tool DECLARE this parameter?"
+ * Scoped to the SOFT pair (`dry_run`, `result_id`) only — the hard three are
+ * handled at the envelope layer (useToolInput.ts) and their top-level-twin escape
+ * hatch must stay intact (test/useTool-dispatch-validation.test.ts case (v)).
+ */
+describe("REBEL-7JD: declared-property misplacement gate", () => {
+  it("(i) throws a -33003 misplacement ticket for a nested dry_run on a NON-STRIPPING schema", async () => {
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const packageId = nextId("pkg");
+    const toolId = nextId("tool");
+    // additionalProperties: true and `dry_run` NOT declared → the validator
+    // neither strips nor rejects, so before the gate this silently dispatched.
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
         type: "object",
         properties: { query: { type: "string" } },
-        anyOf: [{ required: ["query"] }],
+        additionalProperties: true,
       },
-      expectStripping: false,
-    },
-    {
-      name: "oneOf present → no injection (passes through)",
-      schema: {
+      { callTool },
+    );
+
+    let error: any;
+    try {
+      await handleUseTool(
+        {
+          package_id: packageId,
+          tool_id: toolId,
+          args: { query: "hello", dry_run: true },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+      throw new Error("Expected the misplacement gate to reject the call");
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error.code).toBe(ERROR_CODES.ARG_VALIDATION_FAILED);
+    // Classifier-stable prefix (kimi F5): the host substring-matches this clause.
+    expect(error.message.startsWith("Argument validation failed for tool")).toBe(true);
+    expect(error.message).toContain(`Argument validation failed for tool '${toolId}' in package '${packageId}'.`);
+    expect(error.message).toContain("Misplaced use_tool parameters: dry_run.");
+    expect(error.message).toContain('move it outside "args"');
+    expect(error.data?.repair_ticket?.misplaced_params).toEqual(["dry_run"]);
+    // The whole point: the downstream tool must NOT run.
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("(ii) dispatches when the schema DECLARES dry_run (legitimate tool argument)", async () => {
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { dry_run: { type: "boolean" } },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    const result = await handleUseTool(
+      {
+        package_id: nextId("pkg"),
+        tool_id: nextId("tool"),
+        args: { dry_run: true },
+      },
+      registry as any,
+      catalog as any,
+      validator,
+    );
+
+    expect(result.isError).toBe(false);
+    expect(callTool).toHaveBeenCalledTimes(1);
+  });
+
+  it("(ii-b) dispatches when the schema declares the CANONICAL TWIN dryRun", async () => {
+    // canonicalKeyNormalize renames nested `dry_run` → declared `dryRun` and the
+    // call dispatches today. A naive key-set gate would throw instead, breaking a
+    // working call (Amendment A / kimi F2). Non-stripping schema so the auto-repair
+    // seam does not even fire — the gate itself must subtract canonical twins.
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { dryRun: { type: "boolean" } },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    const result = await handleUseTool(
+      {
+        package_id: nextId("pkg"),
+        tool_id: nextId("tool"),
+        args: { dry_run: true },
+      },
+      registry as any,
+      catalog as any,
+      validator,
+    );
+
+    expect(result.isError).toBe(false);
+    expect(callTool).toHaveBeenCalledTimes(1);
+  });
+
+  it("(iii) says REMOVE (not move) when a top-level twin is already present", async () => {
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
         type: "object",
         properties: { query: { type: "string" } },
-        oneOf: [{ required: ["query"] }],
+        additionalProperties: true,
       },
-      expectStripping: false,
-    },
-    {
-      name: "allOf present → no injection (passes through)",
-      schema: {
+      { callTool },
+    );
+
+    let error: any;
+    try {
+      await handleUseTool(
+        {
+          package_id: nextId("pkg"),
+          tool_id: nextId("tool"),
+          // Top-level twin present, so "move it" would be wrong advice. NOTE the
+          // top-level `dry_run: true` also means the call would short-circuit into
+          // the dry-run branch — the gate must fire BEFORE that.
+          dry_run: true,
+          args: { query: "hello", dry_run: true },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+      throw new Error("Expected the misplacement gate to reject the call");
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error.code).toBe(ERROR_CODES.ARG_VALIDATION_FAILED);
+    expect(error.data?.repair_ticket?.misplaced_params).toEqual(["dry_run"]);
+    expect(error.message).toContain('remove it from "args"');
+    expect(error.message).toContain("the top-level value is the one used");
+    expect(error.message).not.toContain('move it outside "args"');
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("(iv) throws a misplacement ticket on a schema-less tool (no properties)", async () => {
+    // Accepted behaviour change #1: previously this dispatched silently.
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      { type: "object" },
+      { callTool },
+    );
+
+    let error: any;
+    try {
+      await handleUseTool(
+        {
+          package_id: nextId("pkg"),
+          tool_id: nextId("tool"),
+          args: { result_id: "abc123" },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+      throw new Error("Expected the misplacement gate to reject the call");
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error.code).toBe(ERROR_CODES.ARG_VALIDATION_FAILED);
+    expect(error.message.startsWith("Argument validation failed for tool")).toBe(true);
+    expect(error.data?.repair_ticket?.misplaced_params).toEqual(["result_id"]);
+    expect(error.message).toContain(
+      "passing result_id at the top level makes this a continuation call — the tool will not run",
+    );
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("increments the shared validation attempt counter and reaches the misplacement terminal line", async () => {
+    // Invariant (6): gate-injected failures use the SAME counter, so the existing
+    // threshold/terminal behaviour applies unchanged.
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const packageId = nextId("pkg");
+    const toolId = nextId("tool");
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
         type: "object",
         properties: { query: { type: "string" } },
-        allOf: [{ type: "object" }],
+        additionalProperties: true,
       },
-      expectStripping: false,
-    },
-    {
-      name: "patternProperties present → no injection (passes through)",
-      schema: {
+      { callTool },
+    );
+
+    let error: any;
+    for (let attempt = 0; attempt < STOP_RETRYING_THRESHOLD; attempt += 1) {
+      try {
+        await handleUseTool(
+          {
+            package_id: packageId,
+            tool_id: toolId,
+            args: { query: "hello", dry_run: true },
+          },
+          registry as any,
+          catalog as any,
+          validator,
+        );
+        throw new Error("Expected the misplacement gate to reject the call");
+      } catch (caught) {
+        error = caught;
+      }
+    }
+
+    expect(error.data?.repair_ticket?.attempt).toBe(STOP_RETRYING_THRESHOLD);
+    // Byte-identical terminal line (invariant 3) — deliberately NOT the shared
+    // STOP_RETRYING_MESSAGE, and deliberately NOT matching isArgValidationExhausted.
+    expect(error.message).toContain("Stop re-sending this call shape");
+    expect(error.message).not.toContain("These arguments have failed validation several times");
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("does not fire for a nested key that is neither a soft meta-param nor declared", async () => {
+    // Scope discipline: the gate only knows about {dry_run, result_id}. An ordinary
+    // unknown key on a permissive schema still passes through as before.
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
         type: "object",
         properties: { query: { type: "string" } },
-        patternProperties: { "^x-": { type: "string" } },
+        additionalProperties: true,
       },
-      expectStripping: false,
-    },
-  ];
+      { callTool },
+    );
 
-  for (const testCase of cases) {
-    it(`agrees with the validator: ${testCase.name}`, () => {
-      const validator = new Validator();
-      const data: Record<string, unknown> = { query: "hello", surprise_field: 1 };
-      const result = validator.validate(testCase.schema, data);
-      const observedStripping = result.strippedArgs.includes("surprise_field");
+    const result = await handleUseTool(
+      {
+        package_id: nextId("pkg"),
+        tool_id: nextId("tool"),
+        args: { query: "hello", surprise_field: 1 },
+      },
+      registry as any,
+      catalog as any,
+      validator,
+    );
 
-      expect(observedStripping).toBe(testCase.expectStripping);
-      expect(schemaStripsUnknownArgs(testCase.schema)).toBe(testCase.expectStripping);
-    });
-  }
-
-  /**
-   * Falsy-but-present combinator keys. The validator's condition is TRUTHINESS
-   * (`!schema.anyOf`), so `anyOf: null` still INJECTS `additionalProperties:
-   * false` and strips — whereas an `=== undefined` form of the duplicated
-   * predicate would report "passes through" and suppress the observability
-   * warn. This is the case where the two forms genuinely diverge, so it pins the
-   * duplicate to truthiness (Stage 2 review F2).
-   *
-   * Note `anyOf: []` is NOT such a case: `[]` is truthy, so both forms agree on
-   * "no injection" (and Ajv rejects an empty `anyOf` outright).
-   */
-  const falsyCombinatorCases: Array<{ name: string; schema: any }> = [
-    { name: "anyOf: null", schema: { type: "object", properties: { query: { type: "string" } }, anyOf: null } },
-    { name: "oneOf: false", schema: { type: "object", properties: { query: { type: "string" } }, oneOf: false } },
-    { name: "allOf: 0", schema: { type: "object", properties: { query: { type: "string" } }, allOf: 0 } },
-    {
-      name: "patternProperties: null",
-      schema: { type: "object", properties: { query: { type: "string" } }, patternProperties: null },
-    },
-  ];
-
-  for (const testCase of falsyCombinatorCases) {
-    it(`agrees with the validator on a falsy-but-present combinator: ${testCase.name}`, () => {
-      const validator = new Validator();
-      const data: Record<string, unknown> = { query: "hello", surprise_field: 1 };
-
-      // Ajv rejects a non-array combinator, so `validate` throws at COMPILE.
-      // Stripping runs before compilation (validator.ts strips, then compiles),
-      // so the in-place mutation of `data` is the observable evidence that the
-      // injection branch was taken.
-      expect(() => validator.validate(testCase.schema, data)).toThrow();
-      expect("surprise_field" in data).toBe(false);
-
-      expect(schemaStripsUnknownArgs(testCase.schema)).toBe(true);
-    });
-  }
+    expect(result.isError).toBe(false);
+    expect(callTool).toHaveBeenCalledTimes(1);
+  });
 });

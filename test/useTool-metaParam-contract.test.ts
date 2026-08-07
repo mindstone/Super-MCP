@@ -101,6 +101,37 @@ describe("appendErrorAdvice suffix gate", () => {
     ).toBe(message + ADVICE);
   });
 
+  it("suppresses the generic schema advice for ANY misplacement ticket (R9)", () => {
+    // The repair ticket's misplacement section already names the exact corrected
+    // call shape, so appending "or 'dry_run: true' to test arguments" contradicts
+    // it — worst of all when the misplaced param IS dry_run. Suppression keys on
+    // the ticket, not the stage, so validation-stage tickets are covered too.
+    const message =
+      "Argument validation failed for tool 'tool1' in package 'pkg1'. Misplaced use_tool parameters: dry_run.";
+
+    expect(
+      appendErrorAdvice(ERROR_CODES.ARG_VALIDATION_FAILED, message, {
+        repair_ticket: { misplaced_params: ["dry_run"] },
+      }),
+    ).toBe(message);
+  });
+
+  it("keeps the generic schema advice for a ticket with NO misplacement", () => {
+    const message = "Argument validation failed for tool 'tool1' in package 'pkg1'. Missing required: query.";
+
+    // Empty array and absent field both mean "no misplacement taught".
+    expect(
+      appendErrorAdvice(ERROR_CODES.ARG_VALIDATION_FAILED, message, {
+        repair_ticket: { misplaced_params: [] },
+      }),
+    ).toBe(message + ADVICE);
+    expect(
+      appendErrorAdvice(ERROR_CODES.ARG_VALIDATION_FAILED, message, {
+        repair_ticket: { missing_required: ["query"] },
+      }),
+    ).toBe(message + ADVICE);
+  });
+
   it("leaves other error codes' advice untouched", () => {
     expect(appendErrorAdvice(ERROR_CODES.PACKAGE_NOT_FOUND, "nope")).toContain(
       "list_tool_packages()",

@@ -4,6 +4,7 @@ import {
   UseToolOutput,
   ERROR_CODES,
   USE_TOOL_META_PARAMS,
+  USE_TOOL_SOFT_META_PARAMS,
   type ToolBlockedReason,
 } from "../types.js";
 import { PackageRegistry } from "../registry.js";
@@ -18,6 +19,7 @@ import {
   coerceStringifiedNumber,
   normalizeArgKeys,
   formatKeyAliasBreadcrumb,
+  canonicalKey,
   canonicalKeyNormalize,
   coerceArgsToSchema,
   formatAutoRepairBreadcrumb,
@@ -227,42 +229,6 @@ interface RepairTicket {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/**
- * Whether the Validator will strip unknown top-level keys from `args` under this
- * schema (REBEL-7JD observability warn (ii)).
- *
- * DUPLICATED from Validator.validate (src/validator.ts): it injects
- * `additionalProperties: false` only when `properties` is present, the keyword is
- * absent, and there is no oneOf/allOf/anyOf/patternProperties — and it strips only
- * when the effective schema ends up `additionalProperties: false`. Duplicating the
- * predicate was chosen over widening `ValidationResult` (reviewer-kimi F5), so it
- * needs a tripwire: test/validator.test.ts "non-stripping-schema drift pin" asserts
- * this function agrees with the validator's OBSERVED behaviour across the
- * condition's decision boundary. If the validator's condition changes, that test
- * goes red.
- */
-export function schemaStripsUnknownArgs(schema: unknown): boolean {
-  if (!isRecord(schema) || !isRecord(schema.properties)) {
-    return false;
-  }
-  if (schema.additionalProperties === false) {
-    return true;
-  }
-  if ("additionalProperties" in schema) {
-    return false;
-  }
-  // TRUTHINESS, byte-for-byte with the validator's condition (validator.ts:57-64)
-  // — deliberately not `=== undefined`. The forms diverge on falsy-but-present
-  // combinators (`anyOf: null`, `oneOf: false`, …): the validator treats those as
-  // absent, so it DOES inject and strip, while `=== undefined` would report
-  // "passes through" and wrongly suppress the observability warn. (`anyOf: []` is
-  // not such a case — `[]` is truthy, so both forms agree on "no injection".)
-  // The drift-pin suite covers this boundary.
-  return (
-    !schema.oneOf && !schema.allOf && !schema.anyOf && !schema.patternProperties
-  );
 }
 
 type ConnectDiagnosticErrorClass =
@@ -810,8 +776,12 @@ type MisplacedParamMap = Record<string, MisplacedParamFix>;
  * subset: this is the only path that teaches `dry_run` and `result_id`, which the
  * envelope guard deliberately lets through (see types.ts USE_TOOL_SOFT_META_PARAMS).
  *
- * Reads `strippedArgs` (the validator's pre-strip key names) — NOT the post-strip
- * `provided_args` — because the validator deletes unknown keys in place.
+ * Two callers supply the candidate key set:
+ *   - the stripping path passes `strippedArgs` (the validator's pre-strip key
+ *     names — NOT the post-strip `provided_args`, because the validator deletes
+ *     unknown keys in place);
+ *   - the declared-property gate passes the keys IT computed (residue R1), because
+ *     on a permissive schema nothing is stripped and `strippedArgs` is empty.
  */
 /**
  * Which `use_tool` meta-params the caller actually supplied at the TOP level.
@@ -831,16 +801,69 @@ function getTopLevelMetaParamPresence(input: unknown): Record<string, boolean> {
 }
 
 function classifyMisplacedMetaParams(
-  strippedArgs: string[],
+  candidateKeys: readonly string[],
   topLevelPresence: Record<string, boolean> | undefined,
 ): MisplacedParamMap {
   const misplaced: MisplacedParamMap = {};
-  for (const key of strippedArgs) {
+  for (const key of candidateKeys) {
     if (!(USE_TOOL_META_PARAMS as readonly string[]).includes(key)) continue;
     misplaced[key] = topLevelPresence?.[key] ? "remove" : "move";
   }
   return misplaced;
 }
+
+/**
+ * Soft `use_tool` meta-params (`dry_run`, `result_id`) present in `args` that the
+ * tool's schema does NOT declare — i.e. the misplacement pattern (REBEL-7JD
+ * residue R1).
+ *
+ * WHY DECLARED-PROPERTY, not "will the validator strip this": the stripping
+ * question leaves a silent-dispatch hole. On a permissive schema
+ * (`additionalProperties: true`, or no `properties` at all) a nested `dry_run`
+ * validates clean and used to reach the downstream tool — so a model asking for a
+ * dry run executed a real mutation. The right question is whether the tool
+ * declares the parameter: if it does, the key is a legitimate tool argument; if it
+ * does not, it is the misplacement pattern and must be taught, never dispatched.
+ *
+ * Scope is the SOFT pair ONLY (plan Amendment A / reviewer-opus F3). The hard three
+ * (max_output_chars, output_offset, schema_hash) are handled at the envelope layer
+ * (useToolInput.ts rejectMisplacedMetaParams) and keep their top-level-twin escape
+ * hatch — widening this gate to cover them would silently revoke it.
+ *
+ * CANONICAL TWINS are subtracted too: a schema declaring `dryRun` legitimises a
+ * nested `dry_run`, which `canonicalKeyNormalize` renames and dispatches today.
+ * A literal-key-only gate would throw on that working call.
+ *
+ * Evaluate on the POST-repair effective `args` (the keys actually about to be
+ * dispatched), not on the pre-validation snapshot.
+ */
+function findMisplacedSoftMetaParams(
+  effectiveArgs: unknown,
+  schema: unknown,
+): string[] {
+  if (!isRecord(effectiveArgs)) {
+    return [];
+  }
+  const declared = isRecord(schema) && isRecord(schema.properties) ? schema.properties : {};
+  const declaredCanonical = new Set(Object.keys(declared).map(canonicalKey));
+
+  const misplaced: string[] = [];
+  for (const param of USE_TOOL_SOFT_META_PARAMS) {
+    if (!(param in effectiveArgs)) continue;
+    if (param in declared) continue;
+    if (declaredCanonical.has(canonicalKey(param))) continue;
+    misplaced.push(param);
+  }
+  return misplaced;
+}
+
+/**
+ * Tool+param pairs the collision warn (i) has already fired for. The warn is a
+ * wake-up signal (does any real tool declare a meta-param name?), not a per-call
+ * metric, so once per tool+param is the useful cardinality (REBEL-7JD residue R8).
+ * Unbounded growth is bounded in practice by the tool catalogue size × 2 soft params.
+ */
+const metaParamCollisionWarned = new Set<string>();
 
 function summarizeMisplacedParams(misplaced: MisplacedParamMap): string[] {
   const names = Object.keys(misplaced);
@@ -1453,48 +1476,48 @@ export async function handleUseTool(
   let strippedArgs = validationResult.strippedArgs;
   let isValid = validationResult.valid;
 
-  // REBEL-7JD observability. Reads `preValidationSnapshot`, because
-  // `validator.validate` strips unknown keys from `args` IN PLACE. Both warns are
-  // the wake-up signals the deferred residue items are conditioned on (PLAN.md
-  // § Explicitly out of scope).
+  // REBEL-7JD observability warn (i) — the COLLISION detector. Reads
+  // `preValidationSnapshot`, because `validator.validate` strips unknown keys from
+  // `args` IN PLACE. This is the wake-up signal the deferred residue items are
+  // conditioned on (PLAN.md § Explicitly out of scope).
+  //
+  // Warn (ii) (the non-stripping-schema PASSTHROUGH detector) was deleted with the
+  // declared-property gate below: for the soft pair the passthrough it warned about
+  // is now structurally impossible (the gate throws instead of dispatching), so the
+  // warn could only ever have fired on a hard-reject param sneaking in via the
+  // envelope escape hatch — which is exactly the case warn (i) already covers.
   //
   // NOTE super-mcp's logger is MESSAGE-FIRST — `warn(msg, data)` (src/logging.ts).
   // This is NOT the superproject's pino `({ data }, msg)` convention.
   if (preValidationSnapshot) {
     const declaredProperties =
       isRecord(schema) && isRecord(schema.properties) ? schema.properties : undefined;
-    const stripsUnknownArgs = schemaStripsUnknownArgs(schema);
     for (const param of USE_TOOL_META_PARAMS) {
       if (!(param in preValidationSnapshot)) continue;
-      if (declaredProperties && param in declaredProperties) {
-        // (i) Collision detector: the tool legitimately declares a property whose
-        // name equals a use_tool meta-param, so the misplacement teaching would be
-        // WRONG for this tool. If this fires for a hard-rejected param, that param
-        // must leave USE_TOOL_HARD_REJECT_META_PARAMS.
-        //
-        // Coverage caveat for a HARD-REJECTED param: a call that nests it WITHOUT a
-        // top-level twin is rejected at the envelope guard (rejectMisplacedMetaParams,
-        // useToolInput.ts) before this validation seam ever runs — that guard is
-        // deliberately schema-independent, so it cannot know about the collision. So
-        // for hard-rejected params this warn surfaces collisions ONLY via escape-hatch
-        // calls (the top-level twin present, which the guard skips).
-        logger.warn("use_tool meta-param name collides with legitimate schema property", {
-          handler: "use_tool",
-          package_id,
-          tool_id,
-          param,
-        });
-      } else if (!stripsUnknownArgs) {
-        // (ii) Passthrough detector: a non-stripping schema means the nested
-        // meta-param reaches the downstream tool untouched — for `dry_run` that can
-        // mean a real mutation executes silently (top residue-ledger item).
-        logger.warn("use_tool meta-param nested in args passed through non-stripping schema", {
-          handler: "use_tool",
-          package_id,
-          tool_id,
-          param,
-        });
-      }
+      if (!declaredProperties || !(param in declaredProperties)) continue;
+      // (i) Collision detector: the tool legitimately declares a property whose
+      // name equals a use_tool meta-param, so the misplacement teaching would be
+      // WRONG for this tool. If this fires for a hard-rejected param, that param
+      // must leave USE_TOOL_HARD_REJECT_META_PARAMS.
+      //
+      // Coverage caveat for a HARD-REJECTED param: a call that nests it WITHOUT a
+      // top-level twin is rejected at the envelope guard (rejectMisplacedMetaParams,
+      // useToolInput.ts) before this validation seam ever runs — that guard is
+      // deliberately schema-independent, so it cannot know about the collision. So
+      // for hard-rejected params this warn surfaces collisions ONLY via escape-hatch
+      // calls (the top-level twin present, which the guard skips).
+      //
+      // Once per tool+param (residue R8): a hot tool would otherwise emit this on
+      // every call, drowning the signal it exists to raise.
+      const collisionKey = `${package_id}:${tool_id}:${param}`;
+      if (metaParamCollisionWarned.has(collisionKey)) continue;
+      metaParamCollisionWarned.add(collisionKey);
+      logger.warn("use_tool meta-param name collides with legitimate schema property", {
+        handler: "use_tool",
+        package_id,
+        tool_id,
+        param,
+      });
     }
   }
 
@@ -1567,6 +1590,54 @@ export async function handleUseTool(
         tool_id,
         errors: validationResult.errors,
         provided_args: args ? Object.keys(args) : [],
+        repair_ticket: repairTicket,
+      },
+    };
+  }
+
+  // REBEL-7JD residue R1 — DECLARED-PROPERTY misplacement gate.
+  //
+  // Unconditional seam, deliberately OUTSIDE the teaching branch above: that
+  // branch's condition (`!isValid || strippedArgs.length > 0`) is false on exactly
+  // the hole path — a nested soft meta-param on a permissive schema validates
+  // clean, so nothing was ever taught and the call dispatched (a real mutation for
+  // a model that asked for a dry run).
+  //
+  // Ordering is load-bearing: AFTER validation and the auto-repair seam (so a
+  // canonical rename like `dry_run`→declared `dryRun` has already happened and this
+  // sees the effective args), and BEFORE both the top-level `dry_run` short-circuit
+  // and dispatch (so a misplacement can never reach the downstream tool).
+  const misplacedSoftParams = findMisplacedSoftMetaParams(args, schema);
+  if (misplacedSoftParams.length > 0) {
+    resetValidationAttempt(downstreamValidationAttemptKey);
+    // Same counter as the teaching branch (invariant 6): threshold and terminal
+    // behaviour apply to gate-injected failures unchanged.
+    const attempt = incrementValidationAttempt(validationAttemptKey);
+    // Top-level presence is read from `input` (the parsed envelope) rather than the
+    // destructured locals, because `dry_run` is destructured with a `= false`
+    // default that would misreport an omitted param as present.
+    const misplacedParams = classifyMisplacedMetaParams(
+      misplacedSoftParams,
+      getTopLevelMetaParamPresence(input),
+    );
+    // No validation ERRORS to report — validation passed; the fault is purely the
+    // call shape. The ticket therefore carries only the misplacement teaching.
+    const repairTicket = buildRepairTicket(schema, [], [], attempt, misplacedParams);
+
+    throw {
+      code: ERROR_CODES.ARG_VALIDATION_FAILED,
+      message: summarizeRepairTicket(
+        package_id,
+        tool_id,
+        repairTicket,
+        attempt >= STOP_RETRYING_THRESHOLD,
+        misplacedParams,
+      ),
+      data: {
+        package_id,
+        tool_id,
+        errors: [],
+        provided_args: isRecord(args) ? Object.keys(args) : [],
         repair_ticket: repairTicket,
       },
     };
