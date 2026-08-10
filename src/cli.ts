@@ -162,6 +162,7 @@ async function main() {
   const ownerPidRaw = getArg("rebel-owner-pid");
   const ownerStartRaw = getArg("rebel-owner-start");
   const ownerIdRaw = getArg("rebel-owner-id");
+  const healthOwnerIdRaw = getArg("rebel-health-owner-id");
 
   // Strict integer parse: reject "123abc", leading/trailing junk, and non-safe integers.
   // parseInt("123abc") = 123; this guard requires String(n) === raw (whole-string match).
@@ -191,8 +192,13 @@ async function main() {
     isUuidShaped(ownerId)
       ? { ownerPid, ownerStartMs, ownerId }
       : undefined;
+  const healthOwnerId = isUuidShaped(healthOwnerIdRaw)
+    ? healthOwnerIdRaw
+    : isUuidShaped(ownerId)
+      ? ownerId
+      : undefined;
 
-  await startServer({ configPaths, logLevel, transport, port, ownerInfo });
+  await startServer({ configPaths, logLevel, transport, port, ownerInfo, healthOwnerId });
 }
 
 // Run main

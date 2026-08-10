@@ -10,6 +10,7 @@ import { PackageRegistry } from "./registry.js";
 import { Catalog } from "./catalog.js";
 import { getValidator } from "./validator.js";
 import { getLogger } from "./logging.js";
+import { registerSuperMcpHealthRoute } from "./health.js";
 import { ConfigWatcher } from "./configWatcher.js";
 import { getSecurityPolicy } from "./security.js";
 import {
@@ -173,13 +174,12 @@ export function registerHttpApiRoutes(
     registry: PackageRegistry;
     catalog: Catalog;
     dnsRebindingGuard: express.RequestHandler;
+    healthOwnerId?: string;
   }
 ): void {
-  const { registry, catalog, dnsRebindingGuard } = options;
+  const { registry, catalog, dnsRebindingGuard, healthOwnerId } = options;
 
-  app.get("/health", (_req, res) => {
-    res.json({ status: "ok", transport: "http" });
-  });
+  registerSuperMcpHealthRoute(app, healthOwnerId);
 
   // Lightweight config-hash endpoint: returns a hash of the package registry config
   // without spinning up any MCP servers. Used by Rebel as a cheap first-tier check
@@ -386,8 +386,18 @@ export async function startServer(options: {
   port?: number;
   /** Owner-liveness watchdog info.  Present only when spawned by Rebel with owner flags. */
   ownerInfo?: { ownerPid: number; ownerStartMs: number; ownerId: string };
+  /** Health identity remains available even if owner start-time probing failed. */
+  healthOwnerId?: string;
 }): Promise<void> {
-  const { configPath, configPaths, logLevel = "info", transport = "stdio", port = 3000, ownerInfo } = options;
+  const {
+    configPath,
+    configPaths,
+    logLevel = "info",
+    transport = "stdio",
+    port = 3000,
+    ownerInfo,
+    healthOwnerId,
+  } = options;
   
   const paths = configPaths || (configPath ? [configPath] : ["super-mcp-config.json"]);
 
@@ -909,7 +919,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       app.use('/mcp', dnsRebindingGuard);
 
       app.use(express.json());
-      registerHttpApiRoutes(app, { registry, catalog, dnsRebindingGuard });
+      registerHttpApiRoutes(app, { registry, catalog, dnsRebindingGuard, healthOwnerId });
 
       interface SessionEntry {
         server: Server;
