@@ -1,15 +1,16 @@
 import type express from "express";
-import { createRequire } from "node:module";
+import { GENERATED_SUPER_MCP_BUILD_VERSION } from "./buildVersion.generated.js";
 
 export const SUPER_MCP_HEALTH_SCHEMA_VERSION = 1 as const;
 
-const packageMetadata = createRequire(import.meta.url)("../package.json") as {
-  version?: unknown;
-};
-if (typeof packageMetadata.version !== "string" || packageMetadata.version.length === 0) {
-  throw new Error("super-mcp package version is missing");
-}
-export const SUPER_MCP_BUILD_VERSION = packageMetadata.version;
+// Keep malformed generated metadata non-fatal at runtime. The build generator
+// rejects it before compilation, while this guard ensures health metadata can
+// never stop the router during module evaluation in a packaged installation.
+export const SUPER_MCP_BUILD_VERSION =
+  typeof GENERATED_SUPER_MCP_BUILD_VERSION === "string" &&
+  GENERATED_SUPER_MCP_BUILD_VERSION.length > 0
+    ? GENERATED_SUPER_MCP_BUILD_VERSION
+    : null;
 
 export function buildSuperMcpHealthResponse(ownerId?: string) {
   return {

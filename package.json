@@ -16,9 +16,10 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "node scripts/generate-build-version.mjs && tsc",
     "dev": "tsx src/cli.ts --config ./super-mcp-config.json",
     "start": "node dist/cli.js --config ./super-mcp-config.json",
+    "pretest": "npm run build",
     "test": "vitest run",
     "clean": "rm -rf dist/",
     "prepublishOnly": "npm run clean && npm run build"
