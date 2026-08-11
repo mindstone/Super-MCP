@@ -1697,6 +1697,19 @@ export async function handleUseTool(
   // per-rename commit would leave `args` partially renamed when a later rename
   // fails, so the ticket's `provided_args` would list keys the model never sent.
   //
+  // MIXED MISPLACEMENT (Stage-2 review, opus F4): the renames are attempted only when
+  // `softParamGate.misplaced` is EMPTY. A non-empty `misplaced` unconditionally throws
+  // the teaching ticket a few lines below, so nothing downstream can ever need the
+  // rename — while committing it would rebind `args` and make that ticket's
+  // `provided_args` echo a key the model never sent (`dryRun` for a call that sent
+  // `dry_run`), plus emit a rename breadcrumb and info log for a call that never
+  // dispatched. Same call-shape-accuracy invariant as the atomic rule above, applied
+  // to an INDEPENDENT misplacement rather than a failing sibling rename.
+  //
+  // The twin itself is NOT taught in that case — it is still a legitimate, decidable
+  // rename, so once the model corrects the real misplacement the retry renames and
+  // dispatches exactly as before.
+  //
   // A CLONE because `validator.validate` strips unknown top-level keys IN PLACE, and
   // the seam ordering invariants depend on `args` mutating exactly once, here.
   //
@@ -1704,7 +1717,11 @@ export async function handleUseTool(
   // otherwise the teaching branch above threw — so ANY failure of this
   // re-validation is rename-attributable.
   let renameValidationErrors: any[] = [];
-  if (softParamGate.renames.length > 0 && isRecord(args)) {
+  if (
+    softParamGate.renames.length > 0 &&
+    softParamGate.misplaced.length === 0 &&
+    isRecord(args)
+  ) {
     const candidate = structuredClone(args) as Record<string, unknown>;
     for (const { from, to } of softParamGate.renames) {
       candidate[to] = candidate[from];

@@ -2010,6 +2010,141 @@ describe("REBEL-7JD: declared-property misplacement gate", () => {
     expect(callTool).not.toHaveBeenCalled();
   });
 
+  it("(ii-j) dispatches a well-typed twin on a COMPOSED (oneOf) schema", async () => {
+    // Failure Mode Matrix over-fire mitigation (Stage-2 review R1). A composed schema
+    // skips the validator's `additionalProperties: false` injection (validator.ts), so
+    // the nested `dry_run` is neither stripped nor rejected and the gate is the only
+    // thing standing between the call and dispatch. The rename must survive BOTH the
+    // injection skip and oneOf branch selection: a working call must stay a working
+    // call, not become a -33003.
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { dryRun: { type: "boolean" }, query: { type: "string" } },
+        oneOf: [{ required: ["query"] }],
+      },
+      { callTool },
+    );
+
+    const result = await handleUseTool(
+      {
+        package_id: nextId("pkg"),
+        tool_id: nextId("tool"),
+        args: { query: "x", dry_run: true },
+      },
+      registry as any,
+      catalog as any,
+      validator,
+    );
+
+    expect(result.isError).toBe(false);
+    expect(callTool).toHaveBeenCalledTimes(1);
+    const dispatchedArgs = (callTool.mock.calls[0] as any[])[1] as Record<string, unknown>;
+    expect(dispatchedArgs).toEqual({ query: "x", dryRun: true });
+    expect("dry_run" in dispatchedArgs).toBe(false);
+  });
+
+  it("(ii-k) TEACHES a composed-schema twin whose rename flips oneOf branch membership", async () => {
+    // The negative sibling of (ii-j), and the DESIGNED loud failure: this schema means
+    // "exactly one of query or dryRun". Pre-rename `{query, dry_run}` satisfies branch
+    // one (dryRun absent); the renamed `{query, dryRun}` satisfies NEITHER branch. R10
+    // re-validation therefore rejects the rename, and the call fails VISIBLY with the
+    // teaching ticket rather than dispatching a shape the tool would reject anyway.
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { dryRun: { type: "boolean" }, query: { type: "string" } },
+        oneOf: [
+          { required: ["query"], not: { required: ["dryRun"] } },
+          { required: ["dryRun"], not: { required: ["query"] } },
+        ],
+      },
+      { callTool },
+    );
+
+    let error: any;
+    try {
+      await handleUseTool(
+        {
+          package_id: nextId("pkg"),
+          tool_id: nextId("tool"),
+          args: { query: "x", dry_run: true },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+      throw new Error("Expected the misplacement gate to reject the call");
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error.code).toBe(ERROR_CODES.ARG_VALIDATION_FAILED);
+    expect(error.message.startsWith("Argument validation failed for tool")).toBe(true);
+    expect(error.data?.repair_ticket?.misplaced_params).toEqual(["dry_run"]);
+    // Fail-visible, not fail-silent: the rename is rolled back, the ticket carries the
+    // re-validation's composition errors, and the model sees back exactly what it sent.
+    expect(error.data?.errors?.length).toBeGreaterThan(0);
+    expect(error.data?.provided_args).toEqual(["query", "dry_run"]);
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("(ii-l) does NOT commit the rename when an independent misplacement is about to throw", async () => {
+    // Stage-2 review R2 / opus F4. Mixed case: `dry_run` is a decidable twin of the
+    // declared `dryRun`, but `result_id` is a genuine misplacement, so this call throws
+    // no matter what. Committing the rename anyway would rebind `args` and make the
+    // ticket's `provided_args` echo `dryRun` — a key the model never sent — and log a
+    // rename for a call that never dispatched. The ticket must mirror the model's own
+    // call shape (same accuracy invariant as the atomic rollback in (ii-i)).
+    const infoSpy = vi.spyOn(getLogger(), "info");
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { dryRun: { type: "boolean" } },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    let error: any;
+    try {
+      await handleUseTool(
+        {
+          package_id: nextId("pkg"),
+          tool_id: nextId("tool"),
+          args: { dry_run: true, result_id: "x" },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+      throw new Error("Expected the misplacement gate to reject the call");
+    } catch (caught) {
+      error = caught;
+    }
+
+    try {
+      expect(error.code).toBe(ERROR_CODES.ARG_VALIDATION_FAILED);
+      // The load-bearing assertion: the model-sent keys, verbatim.
+      expect(error.data?.provided_args).toEqual(["dry_run", "result_id"]);
+      // Only the genuine misplacement is taught; the decidable twin is not (the retry
+      // that moves result_id top-level will rename and dispatch as before).
+      expect(error.data?.repair_ticket?.misplaced_params).toEqual(["result_id"]);
+      // No rename breadcrumb/log for a call that never dispatched.
+      const renameLogs = infoSpy.mock.calls.filter(
+        (call: unknown[]) =>
+          call[0] === "Renamed nested soft meta-param to its declared canonical twin",
+      );
+      expect(renameLogs).toHaveLength(0);
+      expect(callTool).not.toHaveBeenCalled();
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
   it("(iii) says REMOVE (not move) when a top-level twin is already present", async () => {
     const callTool = vi.fn(async () => ({ ok: true }));
     const { registry, catalog, validator } = createUseToolDeps(
