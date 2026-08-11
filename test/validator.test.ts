@@ -1547,6 +1547,65 @@ describe("REBEL-7JD: meta-param observability warns at the validation seam", () 
     }
   });
 
+  it("warns with the canonical-twin variant for a HARD param, which is still dispatched VERBATIM (R11)", async () => {
+    // R11: pins the widened warn scope (the collision loop runs over the FULL
+    // USE_TOOL_META_PARAMS set, not just the soft pair) AND the hard/soft asymmetry:
+    // the soft pair gets renamed into its declared twin, the hard three never do —
+    // their escape hatch is the top-level twin, so the nested copy is forwarded to the
+    // tool untouched. A future scoping tidy-up must not silently narrow either half
+    // away: the deferred residue items (R12/R15) are conditioned on this signal.
+    //
+    // The top-level `max_output_chars` is REQUIRED here: without it
+    // rejectMisplacedMetaParams (useToolInput.ts) throws at the envelope layer before
+    // the validation seam ever runs. Unique package/tool ids because the warn is
+    // once-per-tool+param via a module-level Set.
+    const warnSpy = vi.spyOn(getLogger(), "warn");
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const toolId = nextId("tool");
+    const packageId = nextId("pkg");
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { maxOutputChars: { type: "number" } },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    try {
+      const result = await handleUseTool(
+        {
+          package_id: packageId,
+          tool_id: toolId,
+          max_output_chars: 2000,
+          args: { max_output_chars: 2000 },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+
+      expect(result.isError).toBe(false);
+      const twinWarn = warnSpy.mock.calls.find(
+        (call: unknown[]) =>
+          call[0] === "use_tool meta-param collides with a CANONICAL TWIN of a schema property" &&
+          (call[1] as { param?: string } | undefined)?.param === "max_output_chars",
+      );
+      expect(twinWarn).toBeDefined();
+      expect(twinWarn?.[1]).toMatchObject({
+        package_id: packageId,
+        tool_id: toolId,
+        param: "max_output_chars",
+        declared_property: "maxOutputChars",
+      });
+      // Hard params are never renamed: the nested key reaches the tool verbatim.
+      expect(callTool).toHaveBeenCalledTimes(1);
+      expect((callTool.mock.calls[0] as any[])[1]).toEqual({ max_output_chars: 2000 });
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   it("does not warn when args carry no meta-param names", async () => {
     const warnSpy = vi.spyOn(getLogger(), "warn");
     const callTool = vi.fn(async () => ({ ok: true }));
@@ -1854,6 +1913,100 @@ describe("REBEL-7JD: declared-property misplacement gate", () => {
 
     expect(error.code).toBe(ERROR_CODES.ARG_VALIDATION_FAILED);
     expect(error.data?.repair_ticket?.misplaced_params).toEqual(["dry_run"]);
+    expect(callTool).not.toHaveBeenCalled();
+  });
+
+  it("(ii-h) TEACHES a canonical twin whose value the declared property rejects (R10)", async () => {
+    // R10: the rename fixes the SPELLING; it cannot prove the VALUE. The tool
+    // declares `resultId: {type: 'string'}`; the call nests `result_id: 42`. On this
+    // permissive schema the pre-rename validation passes clean (unknown key allowed),
+    // so pre-fix the gate renamed and DISPATCHED `{resultId: 42}` — type-invalid, and
+    // failing differently (and unhelpfully) downstream. The rename is now re-validated
+    // and, on failure, the param is taught instead.
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { resultId: { type: "string" } },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    let error: any;
+    try {
+      await handleUseTool(
+        {
+          package_id: nextId("pkg"),
+          tool_id: nextId("tool"),
+          args: { result_id: 42 },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+      throw new Error("Expected the misplacement gate to reject the call");
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error.code).toBe(ERROR_CODES.ARG_VALIDATION_FAILED);
+    expect(error.message.startsWith("Argument validation failed for tool")).toBe(true);
+    expect(error.data?.repair_ticket?.misplaced_params).toEqual(["result_id"]);
+    // The load-bearing R10 assertion (opus F4): the ticket must carry the
+    // re-validation's errors so it names the DECLARED property and its expected type —
+    // the exact corrected shape for the "I meant the tool's own resultId" reading. An
+    // empty-errors ticket would teach only 'move it outside "args"', which is the
+    // wrong correction for a type mismatch.
+    expect(error.data?.errors?.length).toBeGreaterThan(0);
+    expect(error.data?.repair_ticket?.type_errors).toEqual([
+      { field: "resultId", expected: "string", got: "number", value: 42 },
+    ]);
+    expect(error.message).toContain("Type errors: resultId (expected string, got number)");
+    expect(Object.keys(error.data?.repair_ticket?.schema_fragments ?? {})).toContain("resultId");
+    // Never dispatched, and the args the ticket echoes are the ones the model sent.
+    expect(callTool).not.toHaveBeenCalled();
+    expect(error.data?.provided_args).toEqual(["result_id"]);
+    // ONE counter bump for the whole call (no second increment from the re-validation).
+    expect(error.data?.repair_ticket?.attempt).toBe(1);
+  });
+
+  it("(ii-i) rolls back ALL renames atomically when one of them fails re-validation", async () => {
+    // kimi F2: renames are applied to a single clone and committed together. A
+    // per-rename commit would leave `args` partially renamed, so the ticket's
+    // `provided_args` would list keys the model never sent (`dryRun`) — teaching the
+    // model about a call shape it did not make.
+    const callTool = vi.fn(async () => ({ ok: true }));
+    const { registry, catalog, validator } = createUseToolDeps(
+      {
+        type: "object",
+        properties: { dryRun: { type: "boolean" }, resultId: { type: "string" } },
+        additionalProperties: true,
+      },
+      { callTool },
+    );
+
+    let error: any;
+    try {
+      await handleUseTool(
+        {
+          package_id: nextId("pkg"),
+          tool_id: nextId("tool"),
+          // `dry_run` would rename cleanly; `result_id` would not (declared string).
+          args: { dry_run: true, result_id: 42 },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+      throw new Error("Expected the misplacement gate to reject the call");
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error.code).toBe(ERROR_CODES.ARG_VALIDATION_FAILED);
+    expect(error.data?.repair_ticket?.misplaced_params).toEqual(["dry_run", "result_id"]);
+    expect(error.data?.provided_args).toEqual(["dry_run", "result_id"]);
     expect(callTool).not.toHaveBeenCalled();
   });
 

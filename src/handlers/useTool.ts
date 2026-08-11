@@ -839,15 +839,22 @@ function classifyMisplacedMetaParams(
  * is false and `canonicalKeyNormalize` never runs — the tool then received the
  * unknown `dry_run`, ignored it, kept its own `dryRun` default (false) and MUTATED
  * FOR REAL. So this gate performs the rename itself: `dry_run` → declared `dryRun`.
- * Both readings of the call are then safe — if the model meant the tool's own
- * `dryRun`, the spelling is fixed; if it meant use_tool's dry-run, the tool does a
- * dry run and nothing mutates.
+ *
+ * The rename fixes the SPELLING; the seam then RE-PROVES THE VALUE against the
+ * declared property before dispatching (R10 — see the rename block in
+ * `handleUseTool`). Only then are both readings of the call safe: if the model meant
+ * the tool's own `dryRun`, the spelling is fixed and the value is known-valid; if it
+ * meant use_tool's dry-run, the tool does a dry run and nothing mutates. A
+ * type-mismatched twin (`{result_id: 42}` against a declared `resultId: string`) is
+ * NOT a decidable intent — it is taught, not dispatched.
  *
  * A twin is only renamed when the intent is DECIDABLE:
  *   - exactly ONE declared property shares the canonical form (ambiguous twins are
  *     pathological — e.g. `dryRun` and `dry-run` both declared), and
  *   - the target key is not already present in `args` (renaming would clobber an
- *     explicit value).
+ *     explicit value), and
+ *   - the renamed shape re-validates cleanly against the schema (R10; decided at the
+ *     seam, which owns the validator, not in this classifier).
  * Otherwise the param is reported as misplaced, so the call fails VISIBLY with the
  * teaching ticket rather than guessing or silently passing through.
  *
@@ -1676,18 +1683,64 @@ export async function handleUseTool(
   // the tool's declared spelling here, because on a permissive schema the
   // auto-repair seam above never ran (validation passed clean) and dispatching the
   // literal `dry_run` would let a "dry run" request execute a real mutation.
+  //
+  // R10 — RE-VALIDATE the renamed shape before committing it. The rename fixes the
+  // SPELLING; it cannot prove the VALUE. `{result_id: 42}` against a declared
+  // `resultId: {type: "string"}` renames into a type-invalid `{resultId: 42}` that
+  // used to be dispatched (on a permissive schema the validation above passed clean,
+  // so nothing else could catch it) and then failed differently — and unhelpfully —
+  // downstream. So: apply the renames to ONE clone, validate the clone, and adopt it
+  // only if it proves clean. Same accept condition as the auto-repair seam above
+  // (`valid && strippedArgs.length === 0`).
+  //
+  // ATOMIC on purpose (kimi F2): all renames are committed together or none are. A
+  // per-rename commit would leave `args` partially renamed when a later rename
+  // fails, so the ticket's `provided_args` would list keys the model never sent.
+  //
+  // A CLONE because `validator.validate` strips unknown top-level keys IN PLACE, and
+  // the seam ordering invariants depend on `args` mutating exactly once, here.
+  //
+  // INVARIANT: the pre-rename `args` already validated clean with zero strips —
+  // otherwise the teaching branch above threw — so ANY failure of this
+  // re-validation is rename-attributable.
+  let renameValidationErrors: any[] = [];
   if (softParamGate.renames.length > 0 && isRecord(args)) {
+    const candidate = structuredClone(args) as Record<string, unknown>;
     for (const { from, to } of softParamGate.renames) {
-      (args as Record<string, unknown>)[to] = (args as Record<string, unknown>)[from];
-      delete (args as Record<string, unknown>)[from];
-      normalisations.push(formatAutoRepairBreadcrumb({ kind: "key", from, to }));
-      // NOTE message-first logger (src/logging.ts), NOT pino's ({data}, msg).
-      logger.info("Renamed nested soft meta-param to its declared canonical twin", {
+      candidate[to] = candidate[from];
+      delete candidate[from];
+    }
+    const renameValidation = validator.validate(schema, candidate, { package_id, tool_id });
+    if (renameValidation.valid && renameValidation.strippedArgs.length === 0) {
+      args = candidate as typeof args;
+      for (const { from, to } of softParamGate.renames) {
+        normalisations.push(formatAutoRepairBreadcrumb({ kind: "key", from, to }));
+        // NOTE message-first logger (src/logging.ts), NOT pino's ({data}, msg).
+        logger.info("Renamed nested soft meta-param to its declared canonical twin", {
+          handler: "use_tool",
+          package_id,
+          tool_id,
+          from,
+          to,
+        });
+      }
+    } else {
+      // The declared property rejects the supplied value, so the twin reading is not a
+      // decidable rename after all. `args` stays UNTOUCHED and the affected keys are
+      // taught through the established misplacement ticket below — carrying THIS
+      // re-validation's Ajv errors, so the ticket names the declared property and its
+      // expected type. An empty-errors ticket would teach only 'move it outside
+      // "args"', the wrong correction for a type mismatch (opus F4).
+      renameValidationErrors = renameValidation.errors;
+      for (const { from } of softParamGate.renames) {
+        softParamGate.misplaced.push(from);
+      }
+      logger.warn("Canonical-twin rename rejected by the declared property — teaching, not dispatching", {
         handler: "use_tool",
         package_id,
         tool_id,
-        from,
-        to,
+        renames: softParamGate.renames.map(({ from, to }) => `${from}->${to}`),
+        stripped: renameValidation.strippedArgs,
       });
     }
   }
@@ -1705,9 +1758,19 @@ export async function handleUseTool(
       misplacedSoftParams,
       getTopLevelMetaParamPresence(input),
     );
-    // No validation ERRORS to report — validation passed; the fault is purely the
-    // call shape. The ticket therefore carries only the misplacement teaching.
-    const repairTicket = buildRepairTicket(schema, [], [], attempt, misplacedParams);
+    // Normally there are no validation ERRORS to report — validation passed and the
+    // fault is purely the call shape, so the ticket carries only the misplacement
+    // teaching. The one exception is a canonical twin whose renamed value the declared
+    // property rejects (R10): those Ajv errors are carried through so the ticket names
+    // the declared property and its expected type alongside the misplacement teaching
+    // (both readings of the call get the exact corrected shape).
+    const repairTicket = buildRepairTicket(
+      schema,
+      renameValidationErrors,
+      [],
+      attempt,
+      misplacedParams,
+    );
 
     throw {
       code: ERROR_CODES.ARG_VALIDATION_FAILED,
@@ -1721,7 +1784,7 @@ export async function handleUseTool(
       data: {
         package_id,
         tool_id,
-        errors: [],
+        errors: renameValidationErrors,
         provided_args: isRecord(args) ? Object.keys(args) : [],
         repair_ticket: repairTicket,
       },
