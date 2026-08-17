@@ -96,6 +96,9 @@ The request queue ensures:
 - Cache invalidated via ETag changes from MCP servers
 - Reduces round-trips for repeated tool calls
 
+### Tool Notes Store
+Tool notes use a bounded, OS-user-local store with one note per package/tool pair, a 200-character limit, fixed capacity ceilings, and a hard 30-day TTL. A note is tied to the tool's current schema hash, so schema changes suppress and clean up stale advice. Reads are pull-only: one immutable snapshot is consulted per `get_tool_details` request, and matching notes are never added to list, search, manifest, REST catalog, or tool-advertisement surfaces.
+
 ### Auth Error Retry
 - Packages returning auth errors are marked with retry delay
 - Retry after 60 seconds to allow user authentication
