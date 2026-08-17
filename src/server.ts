@@ -26,6 +26,7 @@ import {
   handleRestartPackage,
   handleSearchTools,
   handleReadResource,
+  handleRecordToolNote,
   computeSecurityAnnotation,
   extractRawToolId,
 } from "./handlers/index.js";
@@ -763,6 +764,38 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
             },
           },
           {
+            name: "record_tool_note",
+            description:
+              "Save or replace one short note for a tool, shown next time its details are requested. Use only for durable lessons not obvious from the schema; never record secrets or transient failures. Notes are limited to 200 characters and expire within 30 days. Use `remove: true` to delete one.",
+            inputSchema: {
+              type: "object",
+              properties: {
+                package_id: {
+                  type: "string",
+                  description: "Package ID containing the tool (from list_tool_packages).",
+                  examples: ["filesystem", "github"],
+                },
+                tool_id: {
+                  type: "string",
+                  description:
+                    "Bare canonical tool name from list_tools (e.g. 'read_file'), not the combined discovery form 'package__tool'.",
+                  examples: ["read_file", "search_repositories"],
+                },
+                note: {
+                  type: "string",
+                  description:
+                    "One short usage lesson for future sessions. Omit when remove is true.",
+                },
+                remove: {
+                  type: "boolean",
+                  description: "When true, delete the stored note for this tool.",
+                  default: false,
+                },
+              },
+              required: ["package_id", "tool_id"],
+            },
+          },
+          {
             name: "search_tools",
             description: "Search across all tools using natural language. Returns the most relevant tools matching your query with full schemas, ready to use. Much faster than browsing packages manually. Use this when you know what you want to do but not which tool to use.",
             inputSchema: {
@@ -837,6 +870,9 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
 
           case "search_tools":
             return await handleSearchTools(args as any, registry, catalog);
+
+          case "record_tool_note":
+            return await handleRecordToolNote(args as any, catalog);
 
           default:
             throw {

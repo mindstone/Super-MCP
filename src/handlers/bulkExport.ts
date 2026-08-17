@@ -93,6 +93,7 @@ const SELF_RECURSION_TOOL_IDS = new Set([
   "authenticate",
   "restart_package",
   "search_tools",
+  "record_tool_note",
 ]);
 
 const readOnlyPatterns = TRUSTABLE_READ_ONLY_VERBS.map(
