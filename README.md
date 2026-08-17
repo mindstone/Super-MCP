@@ -23,7 +23,7 @@ Super MCP Router allows you to configure multiple MCP servers (both local stdio 
 - `list_tool_packages` - List available MCP packages and discover their capabilities
 - `list_tools` - Browse tools in a package (use `detail:"lite"` for names + descriptions, `detail:"full"` for complete schemas)
 - `get_tool_details` - Get full schema for specific tools before first use
-- `record_tool_note` - Save or replace one short, 30-day note that appears when that tool's details are next requested
+- `record_tool_note` - Save or replace one durable, non-obvious tool lesson (200 characters max); it surfaces on matching-schema detail requests for up to 30 days
 - `use_tool` - Execute a tool from any package
 - `search_tools` - BM25 keyword search across all available tools
 - `get_help` - Get detailed guidance on using Super-MCP effectively

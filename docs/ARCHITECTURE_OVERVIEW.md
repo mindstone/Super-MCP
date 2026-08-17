@@ -97,7 +97,7 @@ The request queue ensures:
 - Reduces round-trips for repeated tool calls
 
 ### Tool Notes Store
-Tool notes use a bounded, OS-user-local store with one note per package/tool pair, a 200-character limit, fixed capacity ceilings, and a hard 30-day TTL. A note is tied to the tool's current schema hash, so schema changes suppress and clean up stale advice. Reads are pull-only: one immutable snapshot is consulted per `get_tool_details` request, and matching notes are never added to list, search, manifest, REST catalog, or tool-advertisement surfaces.
+Tool notes use a bounded, OS-user-global store shared by every Super MCP instance and configuration for that OS user, with one note per package/tool pair, a 200-character limit, fixed capacity ceilings, and a hard 30-day TTL. A note surfaces whenever its package ID, tool name, and current schema hash match, so it intentionally follows the tool across MCP hosts and configurations until it expires; schema changes suppress and clean up stale advice. Reads are pull-only: one immutable snapshot is consulted per `get_tool_details` request, and matching notes are never added to list, search, manifest, REST catalog, or tool-advertisement surfaces.
 
 ### Auth Error Retry
 - Packages returning auth errors are marked with retry delay

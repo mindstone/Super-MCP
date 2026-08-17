@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { fork, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -70,6 +71,85 @@ import {
   type ToolNoteEntry,
 } from "../src/toolNotes.js";
 import { ERROR_CODES } from "../src/types.js";
+
+interface ChildWriter {
+  child: ChildProcess;
+  ready: Promise<void>;
+  completed: Promise<void>;
+}
+
+function spawnChildWriter(
+  scriptPath: string,
+  args: readonly string[],
+  isolatedHome: string,
+): ChildWriter {
+  const child = fork(scriptPath, [...args], {
+    env: {
+      ...process.env,
+      HOME: isolatedHome,
+      USERPROFILE: isolatedHome,
+    },
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+
+  let stderr = "";
+  let readySettled = false;
+  let resolveReady!: () => void;
+  let rejectReady!: (error: Error) => void;
+  const ready = new Promise<void>((resolve, reject) => {
+    resolveReady = resolve;
+    rejectReady = reject;
+  });
+
+  const completed = new Promise<void>((resolve, reject) => {
+    child.on("message", (message) => {
+      if (!readySettled && message === "READY") {
+        readySettled = true;
+        resolveReady();
+      }
+    });
+    child.stderr?.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    child.once("error", (error) => {
+      if (!readySettled) {
+        readySettled = true;
+        rejectReady(error);
+      }
+      reject(error);
+    });
+    child.once("close", (code, signal) => {
+      if (code === 0) {
+        if (!readySettled) {
+          readySettled = true;
+          rejectReady(new Error("child writer exited before signalling readiness"));
+        }
+        resolve();
+        return;
+      }
+
+      const failure = new Error(
+        `child writer exited with code ${String(code)} and signal ${String(signal)}: ${stderr.trim()}`,
+      );
+      if (!readySettled) {
+        readySettled = true;
+        rejectReady(failure);
+      }
+      reject(failure);
+    });
+  });
+
+  // A spawn failure rejects both coordination promises; keep the completion
+  // branch observed while the caller handles the readiness failure.
+  void completed.catch(() => undefined);
+
+  return { child, ready, completed };
+}
+
+function isChildProcessUnavailable(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return ["EACCES", "ENOENT", "ENOSYS", "EPERM"].includes(code ?? "");
+}
 
 function futureIso(days: number, from = new Date()): string {
   return new Date(from.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
@@ -658,6 +738,90 @@ describe("ToolNotesStore", () => {
       first.record("filesystem", "read_file", "note A", "hash-a"),
       second.record("github", "search", "note B", "hash-b"),
     ]);
+
+    const snapshot = await store(sharedFile).readSnapshot();
+    expect(findNote(snapshot, "filesystem", "read_file")?.note).toBe("note A");
+    expect(findNote(snapshot, "github", "search")?.note).toBe("note B");
+  });
+
+  it("preserves concurrent writes from two child processes", async (context) => {
+    const sharedFile = path.join(tempDir, "child-process-shared.json");
+    const childScript = path.join(tempDir, "record-tool-note.mjs");
+    const toolNotesModuleUrl = new URL(
+      "../dist/toolNotes.js",
+      import.meta.url,
+    ).href;
+    await fs.writeFile(
+      childScript,
+      `
+        const [moduleUrl, storeFile, nowIso, packageId, toolName, note, schemaHash] = process.argv.slice(2);
+        try {
+          const { createToolNotesStore } = await import(moduleUrl);
+          const subject = createToolNotesStore(storeFile, () => new Date(nowIso));
+          if (!process.send) {
+            throw new Error("child IPC channel is unavailable");
+          }
+          process.send("READY");
+          await new Promise((resolve) => {
+            process.once("message", resolve);
+          });
+          const result = await subject.record(packageId, toolName, note, schemaHash);
+          if (result.status !== "recorded") {
+            throw new Error("record rejected: " + JSON.stringify(result));
+          }
+        } catch (error) {
+          process.stderr.write(error instanceof Error ? error.stack ?? error.message : String(error));
+          process.exitCode = 1;
+        } finally {
+          process.disconnect?.();
+        }
+      `,
+    );
+
+    const commonArgs = [toolNotesModuleUrl, sharedFile, now.toISOString()];
+    const writers = [
+      spawnChildWriter(
+        childScript,
+        [...commonArgs, "filesystem", "read_file", "note A", "hash-a"],
+        tempDir,
+      ),
+      spawnChildWriter(
+        childScript,
+        [...commonArgs, "github", "search", "note B", "hash-b"],
+        tempDir,
+      ),
+    ];
+
+    try {
+      await Promise.all(writers.map((writer) => writer.ready));
+      await Promise.all(
+        writers.map(
+          (writer) =>
+            new Promise<void>((resolve, reject) => {
+              writer.child.send("GO", (error) => {
+                if (error) {
+                  reject(error);
+                  return;
+                }
+                resolve();
+              });
+            }),
+        ),
+      );
+      await Promise.all(writers.map((writer) => writer.completed));
+    } catch (error) {
+      if (isChildProcessUnavailable(error)) {
+        context.skip();
+      }
+      throw error;
+    } finally {
+      for (const writer of writers) {
+        if (writer.child.exitCode === null && writer.child.signalCode === null) {
+          writer.child.kill();
+        }
+      }
+      await Promise.allSettled(writers.map((writer) => writer.completed));
+    }
 
     const snapshot = await store(sharedFile).readSnapshot();
     expect(findNote(snapshot, "filesystem", "read_file")?.note).toBe("note A");
