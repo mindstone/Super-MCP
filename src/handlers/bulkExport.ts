@@ -8,7 +8,13 @@ import { getLogger } from "../logging.js";
 import { PackageRegistry } from "../registry.js";
 import { getSecurityPolicy } from "../security.js";
 import { BulkExportInput, BulkExportOutput } from "../types.js";
-import { coerceStringifiedJson, coerceStringifiedNumber } from "../utils/normalizeInput.js";
+import {
+  coerceStringifiedJson,
+  coerceStringifiedNumber,
+  isMissingPackageId,
+  packageIdRequiredMessage,
+  PACKAGE_DISCOVERY_HINT,
+} from "../utils/normalizeInput.js";
 
 const logger = getLogger();
 
@@ -265,8 +271,14 @@ function parseNamespacedTool(packageId: string | undefined, toolId: string): { p
     };
   }
 
-  if (!packageId) {
-    throw new Error("package_id is required unless tool_id is namespaced like 'Package__tool_name'.");
+  if (typeof packageId !== "string" || isMissingPackageId(packageId)) {
+    // Shared validation (residue-chunk9 item 3, origin 260811#R4): catches the
+    // stringified "undefined"/"null" shapes the old falsy check missed, and
+    // points the caller at the discovery tool instead of a bare "required".
+    throw new Error(
+      `${packageIdRequiredMessage("bulk_export", packageId)} ` +
+        `Alternatively, pass a namespaced tool_id like 'Package__tool_name'.`,
+    );
   }
 
   return { packageId, toolId };
@@ -780,7 +792,10 @@ function validateSecurityPolicy(packageId: string, toolId: string, registry: Pac
 
   const packageConfig = registry.getPackage(packageId);
   if (!packageConfig) {
-    return `Package not found: ${packageId}`;
+    // bulk_export returns error responses rather than throwing coded JSON-RPC
+    // errors, so no server-level advice gets appended here — the discovery hint
+    // must be in the message itself (residue-chunk9 item 3).
+    return `Package not found: ${packageId}. ${PACKAGE_DISCOVERY_HINT}`;
   }
 
   if (securityPolicy.isAdminDisabled(packageConfig.catalogId, toolId)) {

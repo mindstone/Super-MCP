@@ -8,7 +8,11 @@ import {
   makeToolNoteKey,
   type LiveToolNote,
 } from "../toolNotes.js";
-import { coerceStringifiedJson } from "../utils/normalizeInput.js";
+import {
+  coerceStringifiedJson,
+  isMissingPackageId,
+  PACKAGE_DISCOVERY_HINT,
+} from "../utils/normalizeInput.js";
 
 const logger = getLogger();
 const TOOL_NOTE_NOTICE =
@@ -65,6 +69,11 @@ export async function handleGetToolDetails(
 
   // Group by package_id for efficiency
   const byPackage = new Map<string, Array<{ toolId: string; rawName: string }>>();
+  // Tool IDs whose package prefix is missing/"undefined" (e.g. "undefined__tool",
+  // "__tool") — the model stringified an absent package_id into the tool_id.
+  // Reported per-entry below instead of grouping, so one bad ID can't fail the
+  // whole batch. Residue-chunk9 item 3, origin 260811#R4.
+  const missingPackagePrefixIds: string[] = [];
   for (const toolId of tool_ids) {
     const sepIndex = toolId.indexOf('__');
     if (sepIndex < 0) {
@@ -74,6 +83,10 @@ export async function handleGetToolDetails(
     }
     const packageId = toolId.slice(0, sepIndex);
     const rawName = toolId.slice(sepIndex + 2);
+    if (isMissingPackageId(packageId)) {
+      missingPackagePrefixIds.push(toolId);
+      continue;
+    }
     if (!byPackage.has(packageId)) {
       byPackage.set(packageId, []);
     }
@@ -92,6 +105,19 @@ export async function handleGetToolDetails(
     };
   };
   const resultMap = new Map<string, ResultEntry>();
+
+  for (const toolId of missingPackagePrefixIds) {
+    resultMap.set(toolId, {
+      package_id: "",
+      tool_id: toolId,
+      name: toolId,
+      schema_hash: "",
+      not_found: true,
+      description:
+        `Invalid tool ID '${toolId}': its package prefix is empty or undefined. ` +
+        `${PACKAGE_DISCOVERY_HINT} Then use IDs of the form 'package__tool_name' from list_tools(package_id: "...").`,
+    });
+  }
 
   for (const [packageId, toolRequests] of byPackage) {
     try {
@@ -212,7 +238,7 @@ export async function handleGetToolDetails(
         name: toolId,
         schema_hash: "",
         not_found: true,
-        description: `Invalid tool ID format: expected 'package__tool_name'.`,
+        description: `Invalid tool ID format: expected 'package__tool_name'. ${PACKAGE_DISCOVERY_HINT}`,
       });
     }
   }
