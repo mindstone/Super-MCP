@@ -641,10 +641,27 @@ function getValidationAttemptKey(packageId: string, toolId: string): string {
 }
 
 function incrementValidationAttempt(key: string): number {
-  if (validationAttemptMap.size >= MAX_ATTEMPT_MAP_SIZE) {
-    validationAttemptMap.clear();
+  // Bounded LRU eviction: a Map preserves insertion order, so the oldest entry
+  // sits at the front. Evict only the least-recently-used entry when at
+  // capacity — a wholesale clear() at the cap silently reset every caller's
+  // retry counter at once (one caller hitting the 500-entry cap erased other
+  // callers' progress toward STOP_RETRYING_THRESHOLD). Re-insert the key on
+  // update to bump recency so recently-touched entries survive overflow.
+  // Read the counter BEFORE any mutation: the recency refresh below deletes
+  // the key, and reading after the delete would always see undefined and reset
+  // the counter to 1 on every access.
+  const current = validationAttemptMap.get(key) ?? 0;
+  if (validationAttemptMap.has(key)) {
+    // Refresh recency on access: delete + re-set moves the key to the end of
+    // the iteration order, mirroring a classic LRU touch.
+    validationAttemptMap.delete(key);
+  } else if (validationAttemptMap.size >= MAX_ATTEMPT_MAP_SIZE) {
+    const oldestKey = validationAttemptMap.keys().next().value;
+    if (oldestKey !== undefined) {
+      validationAttemptMap.delete(oldestKey);
+    }
   }
-  const attempt = (validationAttemptMap.get(key) ?? 0) + 1;
+  const attempt = current + 1;
   validationAttemptMap.set(key, attempt);
   return attempt;
 }

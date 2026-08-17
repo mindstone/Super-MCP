@@ -21,6 +21,18 @@ export async function handleListTools(
   // See: anthropics/claude-code#25865
   page_size = coerceStringifiedNumber(page_size, { handler: "list_tools", field: "page_size" }) as typeof page_size;
 
+  // Required-parameter pre-validation: list_tools cannot operate without a
+  // package_id. Guarding up front turns the misleading "Package 'undefined' is
+  // unavailable" (ensurePackageLoaded falling through to the status branch)
+  // into an actionable contract error naming the absent field.
+  if (typeof package_id !== "string" || package_id.trim().length === 0) {
+    throw {
+      code: ERROR_CODES.INVALID_PARAMS,
+      message: "Missing required parameter: package_id",
+      data: { field: "package_id" },
+    };
+  }
+
   if (detail !== "lite" && detail !== "full") {
     throw {
       code: ERROR_CODES.INVALID_PARAMS,
