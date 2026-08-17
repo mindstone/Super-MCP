@@ -50,12 +50,23 @@ type ReadState =
 
 interface NoteAnalysis {
   visibleNotes: Record<string, ToolNoteEntry>;
+  discardCandidates: Record<string, ToolNoteEntry>;
   needsCompaction: boolean;
   overQuota: boolean;
 }
 
+interface CompactionObservation {
+  observedNotes: Record<string, ToolNoteEntry>;
+  discardCandidates: Record<string, ToolNoteEntry>;
+}
+
 interface MutationContext {
   analysis: NoteAnalysis;
+}
+
+interface LockedMutationOptions {
+  compactionObservation?: CompactionObservation;
+  preserveCurrentEntries?: boolean;
 }
 
 export type RecordNoteResult =
@@ -230,6 +241,23 @@ function entryMatchesSnapshot(
   );
 }
 
+/** A cleanup may discard an entry only when the persisted value is unchanged. */
+function entryMatchesObservation(left: unknown, right: unknown): boolean {
+  if (isEntryShape(left) && isEntryShape(right)) {
+    return (
+      left.note === right.note &&
+      left.written_at === right.written_at &&
+      left.expires_at === right.expires_at &&
+      left.schema_hash === right.schema_hash
+    );
+  }
+  try {
+    return JSON.stringify(left) === JSON.stringify(right);
+  } catch {
+    return false;
+  }
+}
+
 function getErrorCode(error: unknown): string | undefined {
   const code = (error as NodeJS.ErrnoException | undefined)?.code;
   return typeof code === "string" ? code : undefined;
@@ -290,22 +318,32 @@ export class ToolNotesStore {
     );
 
     if (analysis.needsCompaction) {
-      this.scheduleBestEffortCompaction();
+      this.scheduleBestEffortCompaction({
+        observedNotes: { ...state.data.notes },
+        discardCandidates: { ...analysis.discardCandidates },
+      });
     }
     return snapshot;
   }
 
   /**
-   * Re-read under the lock, compact invalid/over-quota entries, and remove only
-   * snapshot entries that are still byte-for-byte unchanged. Stage 2 can use
-   * this for schema-stale cleanup without deleting a concurrent replacement.
+   * Re-read under the lock and remove only snapshot entries that are still
+   * byte-for-byte unchanged. Stage 2 can use this for schema-stale cleanup
+   * without deleting a concurrent replacement.
    */
   async compactSnapshotEntries(
     entriesToRemove: readonly LiveToolNote[] = [],
   ): Promise<void> {
+    await this.compactEntries(entriesToRemove);
+  }
+
+  private async compactEntries(
+    entriesToRemove: readonly LiveToolNote[],
+    observation?: CompactionObservation,
+  ): Promise<void> {
     await this.withLockedMutation(
       (data, { analysis }) => {
-        let changed = analysis.needsCompaction;
+        let changed = observation !== undefined && analysis.needsCompaction;
         for (const snapshot of entriesToRemove) {
           const key = makeToolNoteKey(snapshot.packageId, snapshot.toolName);
           const current = data.notes[key];
@@ -316,7 +354,9 @@ export class ToolNotesStore {
         }
         return changed ? data : undefined;
       },
-      { compactOverQuota: true },
+      observation
+        ? { compactionObservation: observation }
+        : { preserveCurrentEntries: true },
     );
   }
 
@@ -484,6 +524,7 @@ export class ToolNotesStore {
     now: Date,
   ): NoteAnalysis {
     const visibleNotes: Record<string, ToolNoteEntry> = {};
+    const discardCandidates: Record<string, ToolNoteEntry> = {};
     const packageCounts = new Map<string, number>();
     let globalCount = 0;
     let needsCompaction = false;
@@ -495,6 +536,7 @@ export class ToolNotesStore {
     for (const [key, entry] of entries) {
       const parsedKey = parseCanonicalToolNoteKey(key);
       if (!parsedKey || !isEntryShape(entry) || !isValidLiveEntry(entry, now)) {
+        discardCandidates[key] = entry;
         needsCompaction = true;
         continue;
       }
@@ -504,6 +546,7 @@ export class ToolNotesStore {
         globalCount >= MAX_NOTES_GLOBAL ||
         packageCount >= MAX_NOTES_PER_PACKAGE
       ) {
+        discardCandidates[key] = entry;
         needsCompaction = true;
         overQuota = true;
         continue;
@@ -514,11 +557,18 @@ export class ToolNotesStore {
       packageCounts.set(parsedKey.packageId, packageCount + 1);
     }
 
-    return { visibleNotes, needsCompaction, overQuota };
+    return {
+      visibleNotes,
+      discardCandidates,
+      needsCompaction,
+      overQuota,
+    };
   }
 
-  private scheduleBestEffortCompaction(): void {
-    void this.compactSnapshotEntries().catch((error) => {
+  private scheduleBestEffortCompaction(
+    observation: CompactionObservation,
+  ): void {
+    void this.compactEntries([], observation).catch((error) => {
       logger.warn(
         "tool notes compaction failed; read snapshot remains usable",
         {
@@ -528,6 +578,90 @@ export class ToolNotesStore {
         },
       );
     });
+  }
+
+  /**
+   * Concurrently changed or added entries get first claim on quota. Stable
+   * entries then fill the remaining deterministic subset, so cleanup can
+   * restore caps without deleting a write made after the read snapshot.
+   */
+  private reconcileObservedCompaction(
+    currentNotes: Record<string, ToolNoteEntry>,
+    observation: CompactionObservation,
+    now: Date,
+  ): Record<string, ToolNoteEntry> | undefined {
+    const retainedEntries: Array<[string, ToolNoteEntry]> = [];
+    const concurrentKeys = new Set<string>();
+    const currentEntries = Object.entries(currentNotes).sort(
+      ([left], [right]) => (left < right ? -1 : left > right ? 1 : 0),
+    );
+
+    for (const [key, entry] of currentEntries) {
+      const wasObserved = Object.prototype.hasOwnProperty.call(
+        observation.observedNotes,
+        key,
+      );
+      const unchanged =
+        wasObserved &&
+        entryMatchesObservation(entry, observation.observedNotes[key]);
+      const wasDiscardCandidate = Object.prototype.hasOwnProperty.call(
+        observation.discardCandidates,
+        key,
+      );
+
+      if (
+        unchanged &&
+        wasDiscardCandidate &&
+        entryMatchesObservation(entry, observation.discardCandidates[key])
+      ) {
+        continue;
+      }
+      if (!unchanged) {
+        concurrentKeys.add(key);
+      }
+      retainedEntries.push([key, entry]);
+    }
+
+    const selectedNotes: Record<string, ToolNoteEntry> = {};
+    const packageCounts = new Map<string, number>();
+    let globalCount = 0;
+
+    const addWithinQuota = (
+      [key, entry]: [string, ToolNoteEntry],
+      mustRetain: boolean,
+    ): boolean => {
+      const parsedKey = parseCanonicalToolNoteKey(key);
+      if (!parsedKey || !isEntryShape(entry) || !isValidLiveEntry(entry, now)) {
+        selectedNotes[key] = entry;
+        return true;
+      }
+
+      const packageCount = packageCounts.get(parsedKey.packageId) ?? 0;
+      if (
+        globalCount >= MAX_NOTES_GLOBAL ||
+        packageCount >= MAX_NOTES_PER_PACKAGE
+      ) {
+        return !mustRetain;
+      }
+
+      selectedNotes[key] = entry;
+      globalCount += 1;
+      packageCounts.set(parsedKey.packageId, packageCount + 1);
+      return true;
+    };
+
+    for (const entry of retainedEntries) {
+      if (concurrentKeys.has(entry[0]) && !addWithinQuota(entry, true)) {
+        return undefined;
+      }
+    }
+    for (const entry of retainedEntries) {
+      if (!concurrentKeys.has(entry[0])) {
+        addWithinQuota(entry, false);
+      }
+    }
+
+    return selectedNotes;
   }
 
   private async readFileState(): Promise<ReadState> {
@@ -670,7 +804,7 @@ export class ToolNotesStore {
       data: ToolNotesFile,
       context: MutationContext,
     ) => ToolNotesFile | undefined | Promise<ToolNotesFile | undefined>,
-    options: { compactOverQuota?: boolean } = {},
+    options: LockedMutationOptions = {},
   ): Promise<void> {
     await this.ensureStoreFileExists();
 
@@ -711,17 +845,47 @@ export class ToolNotesStore {
         throw new ToolNotesInternalError("Tool notes storage is unavailable.");
       }
 
-      const analysis =
+      const now = this.clock();
+      const analysis: NoteAnalysis =
         state.kind === "ok"
-          ? this.analyzeNotes(state.data.notes, this.clock())
-          : { visibleNotes: {}, needsCompaction: false, overQuota: false };
-      const preserveOverQuota = analysis.overQuota && !options.compactOverQuota;
+          ? this.analyzeNotes(state.data.notes, now)
+          : {
+              visibleNotes: {},
+              discardCandidates: {},
+              needsCompaction: false,
+              overQuota: false,
+            };
+      const reconciledNotes =
+        state.kind === "ok" && options.compactionObservation
+          ? this.reconcileObservedCompaction(
+              state.data.notes,
+              options.compactionObservation,
+              now,
+            )
+          : undefined;
+      if (
+        state.kind === "ok" &&
+        options.compactionObservation &&
+        !reconciledNotes
+      ) {
+        logger.warn(
+          "tool notes compaction skipped to preserve concurrent writes",
+          {
+            file_path: this.filePath,
+          },
+        );
+        return;
+      }
       const base: ToolNotesFile = {
         version: STORE_VERSION,
         notes:
-          state.kind === "ok" && preserveOverQuota
-            ? { ...state.data.notes }
-            : { ...analysis.visibleNotes },
+          state.kind === "ok"
+            ? options.compactionObservation
+              ? { ...reconciledNotes }
+              : options.preserveCurrentEntries || analysis.overQuota
+                ? { ...state.data.notes }
+                : { ...analysis.visibleNotes }
+            : {},
       };
 
       const next = await mutate(base, { analysis });

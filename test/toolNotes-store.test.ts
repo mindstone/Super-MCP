@@ -14,6 +14,7 @@ const lockTestState = vi.hoisted(() => ({
   compromiseNext: false,
   contentionNext: false,
   errnoNext: undefined as string | undefined,
+  beforeLockNext: undefined as (() => Promise<void>) | undefined,
 }));
 
 vi.mock("../src/logging.js", () => ({
@@ -36,6 +37,9 @@ vi.mock("proper-lockfile", async (importOriginal) => {
           lockTestState.errnoNext = undefined;
           throw Object.assign(new Error("filesystem failure"), { code });
         }
+        const beforeLock = lockTestState.beforeLockNext;
+        lockTestState.beforeLockNext = undefined;
+        await beforeLock?.();
         const release = await lock(file, options);
         if (lockTestState.compromiseNext) {
           lockTestState.compromiseNext = false;
@@ -87,6 +91,7 @@ describe("ToolNotesStore", () => {
     lockTestState.compromiseNext = false;
     lockTestState.contentionNext = false;
     lockTestState.errnoNext = undefined;
+    lockTestState.beforeLockNext = undefined;
     vi.clearAllMocks();
   });
 
@@ -395,6 +400,41 @@ describe("ToolNotesStore", () => {
     await vi.waitFor(async () => {
       expect(Object.keys(await readPersistedNotes())).toHaveLength(
         MAX_NOTES_PER_PACKAGE,
+      );
+    });
+  });
+
+  it("preserves a replaced tail entry during read-triggered over-quota compaction", async () => {
+    const reader = store();
+    const writer = store();
+    const notes: Record<string, ToolNoteEntry> = {};
+    const tailToolName = `tool_${MAX_NOTES_PER_PACKAGE}`;
+    for (let index = 0; index <= MAX_NOTES_PER_PACKAGE; index += 1) {
+      notes[makeToolNoteKey("pkg", `tool_${String(index).padStart(2, "0")}`)] =
+        liveEntry(`note ${index}`);
+    }
+    await writeRaw(JSON.stringify({ version: STORE_VERSION, notes }));
+
+    let replacement: Promise<void> | undefined;
+    lockTestState.beforeLockNext = async () => {
+      replacement = writer
+        .record("pkg", tailToolName, "replacement survives", "hash-1")
+        .then((result) => {
+          expect(result).toEqual({ status: "recorded" });
+        });
+      await replacement;
+    };
+
+    const snapshot = await reader.readSnapshot();
+    expect(findNote(snapshot, "pkg", tailToolName)).toBeUndefined();
+    await vi.waitFor(() => expect(replacement).toBeDefined());
+    await replacement;
+
+    await vi.waitFor(async () => {
+      const persisted = await readPersistedNotes();
+      expect(Object.keys(persisted)).toHaveLength(MAX_NOTES_PER_PACKAGE);
+      expect(persisted[makeToolNoteKey("pkg", tailToolName)]?.note).toBe(
+        "replacement survives",
       );
     });
   });
