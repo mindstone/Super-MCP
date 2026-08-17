@@ -3,7 +3,6 @@ import { ERROR_CODES } from "../types.js";
 import { getLogger } from "../logging.js";
 import { coerceStringifiedBoolean } from "../utils/normalizeInput.js";
 import {
-  createToolNotesStore,
   getToolNotesStore,
   normalizeNoteText,
   type ToolNotesStore,
@@ -48,16 +47,26 @@ export async function handleRecordToolNote(
   });
   const note = input.note;
 
-  if (!package_id || typeof package_id !== "string" || package_id.trim().length === 0) {
+  if (
+    !package_id ||
+    typeof package_id !== "string" ||
+    package_id.trim().length === 0
+  ) {
     return makeResponse(
-      { status: "error", message: "package_id is required and must be a non-empty string." },
+      {
+        status: "error",
+        message: "package_id is required and must be a non-empty string.",
+      },
       true,
     );
   }
 
   if (!tool_id || typeof tool_id !== "string" || tool_id.trim().length === 0) {
     return makeResponse(
-      { status: "error", message: "tool_id is required and must be a non-empty string." },
+      {
+        status: "error",
+        message: "tool_id is required and must be a non-empty string.",
+      },
       true,
     );
   }
@@ -70,9 +79,12 @@ export async function handleRecordToolNote(
     };
   }
 
-  if (remove === true && note !== undefined && note !== null && String(note).length > 0) {
+  if (remove === true && Object.prototype.hasOwnProperty.call(input, "note")) {
     return makeResponse(
-      { status: "error", message: "remove: true cannot be combined with a note." },
+      {
+        status: "error",
+        message: "remove: true cannot be combined with a note.",
+      },
       true,
     );
   }
@@ -98,7 +110,13 @@ export async function handleRecordToolNote(
 
   if (remove === true) {
     const result = await notesStore.remove(package_id, canonicalToolName);
-    return makeResponse({ status: result.status }, result.status === "not_found");
+    if (result.status === "rejected") {
+      return makeResponse({ status: "rejected", message: result.reason }, true);
+    }
+    return makeResponse(
+      { status: result.status },
+      result.status === "not_found",
+    );
   }
 
   if (note === undefined || note === null) {
@@ -109,7 +127,10 @@ export async function handleRecordToolNote(
   }
 
   if (typeof note !== "string") {
-    return makeResponse({ status: "error", message: "note must be a string." }, true);
+    return makeResponse(
+      { status: "error", message: "note must be a string." },
+      true,
+    );
   }
 
   const normalized = normalizeNoteText(note);
@@ -119,7 +140,10 @@ export async function handleRecordToolNote(
       tool_id: canonicalToolName,
       reason: normalized.reason,
     });
-    return makeResponse({ status: "rejected", message: normalized.reason }, true);
+    return makeResponse(
+      { status: "rejected", message: normalized.reason },
+      true,
+    );
   }
 
   const recordResult = await notesStore.record(

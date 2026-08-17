@@ -2,44 +2,124 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+
+const loggerMocks = vi.hoisted(() => ({
+  setLevel: vi.fn(),
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  fatal: vi.fn(),
+  debug: vi.fn(),
+}));
+
+const serverHarness = vi.hoisted(() => ({
+  handlers: new Map<unknown, (...args: any[]) => unknown>(),
+  connect: vi.fn().mockResolvedValue(undefined),
+  close: vi.fn().mockResolvedValue(undefined),
+}));
+
+const dispatchRecordToolNote = vi.hoisted(() =>
+  vi
+    .fn()
+    .mockResolvedValue({ content: [{ type: "text", text: "dispatched" }] }),
+);
+
+vi.mock("../../logging.js", () => ({
+  getLogger: () => loggerMocks,
+}));
+
+vi.mock("@modelcontextprotocol/sdk/server/index.js", () => ({
+  Server: class MockServer {
+    setRequestHandler(
+      schema: unknown,
+      handler: (...args: any[]) => unknown,
+    ): void {
+      serverHarness.handlers.set(schema, handler);
+    }
+
+    async connect(): Promise<void> {
+      await serverHarness.connect();
+    }
+
+    async close(): Promise<void> {
+      await serverHarness.close();
+    }
+  },
+}));
+
+vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
+  StdioServerTransport: class MockStdioServerTransport {},
+}));
+
+vi.mock("../../registry.js", () => ({
+  PackageRegistry: class MockPackageRegistry {
+    static async fromConfigFiles(): Promise<Record<string, unknown>> {
+      return {
+        startIdleReaper: vi.fn(),
+        closeAll: vi.fn().mockResolvedValue(undefined),
+        getPackages: vi.fn().mockReturnValue([]),
+      };
+    }
+  },
+}));
+
+vi.mock("../../configWatcher.js", () => ({
+  ConfigWatcher: class MockConfigWatcher {
+    async start(): Promise<void> {}
+    async stop(): Promise<void> {}
+  },
+}));
+
+vi.mock("../index.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../index.js")>();
+  return {
+    ...actual,
+    handleRecordToolNote: dispatchRecordToolNote,
+  };
+});
+
 import { handleRecordToolNote } from "../recordToolNote.js";
-import { createToolNotesStore } from "../../toolNotes.js";
+import { createToolNotesStore, makeToolNoteKey } from "../../toolNotes.js";
 import type { Catalog } from "../../catalog.js";
 import { ERROR_CODES } from "../../types.js";
 
-vi.mock("../src/logging.js", () => ({
-  getLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }),
-}));
-
 function createMockCatalog(
-  tools: Record<string, Record<string, { schemaHash: string }>>,
+  tools: Record<
+    string,
+    Record<string, { schemaHash: string; canonicalName?: string }>
+  >,
 ): Catalog {
   return {
     ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
     getPackageStatus: vi.fn().mockReturnValue("ready"),
-    getTool: vi.fn().mockImplementation(async (packageId: string, toolName: string) => {
-      const pkgTools = tools[packageId];
-      const tool = pkgTools?.[toolName];
-      if (!tool) return undefined;
-      return {
-        packageId,
-        tool: { name: toolName, description: `Description for ${toolName}` },
-        summary: `Summary for ${toolName}`,
-        argsSkeleton: {},
-        schemaHash: tool.schemaHash,
-      };
-    }),
+    getTool: vi
+      .fn()
+      .mockImplementation(async (packageId: string, toolName: string) => {
+        const tool = tools[packageId]?.[toolName];
+        if (!tool) return undefined;
+        const canonicalName = tool.canonicalName ?? toolName;
+        return {
+          packageId,
+          tool: {
+            name: canonicalName,
+            description: `Description for ${canonicalName}`,
+          },
+          summary: `Summary for ${canonicalName}`,
+          argsSkeleton: {},
+          schemaHash: tool.schemaHash,
+        };
+      }),
   } as unknown as Catalog;
 }
 
-function parseResponse(result: { content: Array<{ text: string }>; isError: boolean }) {
+function parseResponse(result: {
+  content: Array<{ text: string }>;
+  isError: boolean;
+}) {
   return JSON.parse(result.content[0].text);
 }
 
@@ -50,25 +130,41 @@ describe("handleRecordToolNote", () => {
   let catalog: Catalog;
 
   beforeEach(async () => {
-    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "super-mcp-record-note-"));
+    tempDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), "super-mcp-record-note-"),
+    );
     notesFile = path.join(tempDir, "tool-notes.json");
     store = createToolNotesStore(notesFile);
     catalog = createMockCatalog({
       filesystem: {
+        read_file_alias: {
+          canonicalName: "read_file",
+          schemaHash: "hash-read-file",
+        },
         read_file: { schemaHash: "hash-read-file" },
       },
     });
+    vi.clearAllMocks();
   });
 
   afterEach(async () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  it("records, replaces, and removes notes for an exact catalog tool", async () => {
+  async function storedNote(
+    packageId: string,
+    toolName: string,
+  ): Promise<string | undefined> {
+    return (await store.readSnapshot()).find(
+      (entry) => entry.packageId === packageId && entry.toolName === toolName,
+    )?.note;
+  }
+
+  it("records canonical names, replaces, and removes notes for an exact catalog tool", async () => {
     const recorded = await handleRecordToolNote(
       {
         package_id: "filesystem",
-        tool_id: "read_file",
+        tool_id: "read_file_alias",
         note: "Paths must be absolute.",
       },
       catalog,
@@ -76,9 +172,10 @@ describe("handleRecordToolNote", () => {
     );
     expect(parseResponse(recorded)).toEqual({ status: "recorded" });
     expect(recorded.isError).toBe(false);
-    expect(await store.lookup("filesystem", "read_file", "hash-read-file")).toBe(
+    expect(await storedNote("filesystem", "read_file")).toBe(
       "Paths must be absolute.",
     );
+    expect(await storedNote("filesystem", "read_file_alias")).toBeUndefined();
 
     const replaced = await handleRecordToolNote(
       {
@@ -90,7 +187,7 @@ describe("handleRecordToolNote", () => {
       store,
     );
     expect(parseResponse(replaced)).toEqual({ status: "recorded" });
-    expect(await store.lookup("filesystem", "read_file", "hash-read-file")).toBe(
+    expect(await storedNote("filesystem", "read_file")).toBe(
       "Use absolute paths only.",
     );
 
@@ -104,7 +201,7 @@ describe("handleRecordToolNote", () => {
       store,
     );
     expect(parseResponse(removed)).toEqual({ status: "removed" });
-    expect(await store.lookup("filesystem", "read_file", "hash-read-file")).toBeUndefined();
+    expect(await storedNote("filesystem", "read_file")).toBeUndefined();
   });
 
   it("rejects combined discovery tool_id values with an actionable invalid-params error", async () => {
@@ -138,19 +235,56 @@ describe("handleRecordToolNote", () => {
     expect(result.isError).toBe(true);
   });
 
-  it("rejects remove combined with note text", async () => {
+  it.each([
+    ["text", "still here"],
+    ["empty string", ""],
+    ["null", null],
+    ["non-string", 42],
+  ])("rejects remove combined with a present %s note", async (_label, note) => {
     const result = await handleRecordToolNote(
       {
         package_id: "filesystem",
         tool_id: "read_file",
-        note: "still here",
+        note,
         remove: true,
-      },
+      } as any,
       catalog,
       store,
     );
     expect(parseResponse(result).message).toContain("remove: true");
     expect(result.isError).toBe(true);
+  });
+
+  it("passes removal rejection reasons through without claiming not_found", async () => {
+    const unsupported = JSON.stringify(
+      {
+        version: 99,
+        notes: {
+          [makeToolNoteKey("filesystem", "read_file")]: {
+            note: "preserve me",
+            written_at: new Date().toISOString(),
+            expires_at: new Date(Date.now() + 60_000).toISOString(),
+            schema_hash: "hash-read-file",
+          },
+        },
+      },
+      null,
+      2,
+    );
+    await fs.writeFile(notesFile, unsupported);
+
+    const result = await handleRecordToolNote(
+      { package_id: "filesystem", tool_id: "read_file", remove: true },
+      catalog,
+      store,
+    );
+
+    expect(parseResponse(result)).toMatchObject({
+      status: "rejected",
+      message: expect.stringContaining("unsupported"),
+    });
+    expect(result.isError).toBe(true);
+    expect(await fs.readFile(notesFile, "utf8")).toBe(unsupported);
   });
 
   it("rejects overlong notes without truncation", async () => {
@@ -165,16 +299,88 @@ describe("handleRecordToolNote", () => {
     );
     expect(parseResponse(result).status).toBe("rejected");
     expect(result.isError).toBe(true);
-    expect(await store.lookup("filesystem", "read_file", "hash-read-file")).toBeUndefined();
+    expect(await storedNote("filesystem", "read_file")).toBeUndefined();
+  });
+
+  it("never includes note text in logger calls", async () => {
+    const distinctiveNote = "DISTINCTIVE_NOTE_TEXT_7f341";
+    await handleRecordToolNote(
+      {
+        package_id: "filesystem",
+        tool_id: "read_file",
+        note: distinctiveNote,
+      },
+      catalog,
+      store,
+    );
+
+    expect(
+      JSON.stringify(
+        Object.values(loggerMocks).flatMap((mock) => mock.mock.calls),
+      ),
+    ).not.toContain(distinctiveNote);
   });
 });
 
 describe("server registration contract", () => {
-  it("advertises and dispatches record_tool_note", () => {
-    const serverPath = fileURLToPath(new URL("../../server.ts", import.meta.url));
-    const src = readFileSync(serverPath, "utf8");
-    expect(src).toContain('name: "record_tool_note"');
-    expect(src).toMatch(/case "record_tool_note":/);
-    expect(src).toContain("handleRecordToolNote");
+  it("behaviorally advertises the intended schema and dispatches record_tool_note", async () => {
+    serverHarness.handlers.clear();
+    dispatchRecordToolNote.mockClear();
+    const processOn = vi.spyOn(process, "on").mockImplementation(() => process);
+
+    try {
+      const { startServer } = await import("../../server.js");
+      await startServer({ configPaths: [], transport: "stdio" });
+
+      const listTools = serverHarness.handlers.get(ListToolsRequestSchema);
+      const callTool = serverHarness.handlers.get(CallToolRequestSchema);
+      expect(listTools).toBeTypeOf("function");
+      expect(callTool).toBeTypeOf("function");
+
+      const advertised = (await listTools?.()) as {
+        tools: Array<{
+          name: string;
+          description: string;
+          inputSchema: unknown;
+        }>;
+      };
+      expect(
+        advertised.tools.find((tool) => tool.name === "record_tool_note"),
+      ).toMatchObject({
+        description: expect.stringContaining(
+          "Notes are limited to 200 characters",
+        ),
+        inputSchema: {
+          type: "object",
+          properties: {
+            package_id: { type: "string" },
+            tool_id: { type: "string" },
+            note: { type: "string" },
+            remove: { type: "boolean", default: false },
+          },
+          required: ["package_id", "tool_id"],
+        },
+      });
+
+      const args = {
+        package_id: "filesystem",
+        tool_id: "read_file",
+        note: "Use absolute paths.",
+      };
+      const dispatched = await callTool?.(
+        { params: { name: "record_tool_note", arguments: args } },
+        {},
+      );
+      expect(dispatchRecordToolNote).toHaveBeenCalledOnce();
+      expect(dispatchRecordToolNote).toHaveBeenCalledWith(
+        args,
+        expect.anything(),
+      );
+      expect(dispatched).toEqual({
+        content: [{ type: "text", text: "dispatched" }],
+      });
+    } finally {
+      processOn.mockRestore();
+    }
   });
 });

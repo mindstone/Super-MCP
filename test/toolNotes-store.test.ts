@@ -2,27 +2,70 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+
+const loggerMocks = vi.hoisted(() => ({
+  info: vi.fn(),
+  warn: vi.fn(),
+  error: vi.fn(),
+  debug: vi.fn(),
+}));
+
+const lockTestState = vi.hoisted(() => ({
+  compromiseNext: false,
+  contentionNext: false,
+  errnoNext: undefined as string | undefined,
+}));
+
+vi.mock("../src/logging.js", () => ({
+  getLogger: () => loggerMocks,
+}));
+
+vi.mock("proper-lockfile", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("proper-lockfile")>();
+  const lock = actual.default.lock.bind(actual.default);
+  return {
+    default: {
+      ...actual.default,
+      lock: vi.fn(async (file: string, options: Record<string, unknown>) => {
+        if (lockTestState.contentionNext) {
+          lockTestState.contentionNext = false;
+          throw Object.assign(new Error("lock busy"), { code: "ELOCKED" });
+        }
+        if (lockTestState.errnoNext) {
+          const code = lockTestState.errnoNext;
+          lockTestState.errnoNext = undefined;
+          throw Object.assign(new Error("filesystem failure"), { code });
+        }
+        const release = await lock(file, options);
+        if (lockTestState.compromiseNext) {
+          lockTestState.compromiseNext = false;
+          const onCompromised = options.onCompromised as
+            | ((error: Error) => void)
+            | undefined;
+          onCompromised?.(
+            Object.assign(new Error("lock compromised"), { code: "ESTALE" }),
+          );
+        }
+        return release;
+      }),
+    },
+  };
+});
+
 import {
+  MAX_FILE_BYTES,
+  MAX_KEY_COMPONENT_CHARS,
   MAX_NOTES_GLOBAL,
   MAX_NOTES_PER_PACKAGE,
-  MAX_FILE_BYTES,
+  MAX_SCHEMA_HASH_CHARS,
   STORE_VERSION,
   createToolNotesStore,
   makeToolNoteKey,
   normalizeNoteText,
-  isValidLiveEntry,
+  type LiveToolNote,
+  type ToolNoteEntry,
 } from "../src/toolNotes.js";
-
-vi.mock("../src/logging.js", () => ({
-  getLogger: () => ({
-    info: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    debug: vi.fn(),
-  }),
-}));
+import { ERROR_CODES } from "../src/types.js";
 
 function futureIso(days: number, from = new Date()): string {
   return new Date(from.getTime() + days * 24 * 60 * 60 * 1000).toISOString();
@@ -41,14 +84,63 @@ describe("ToolNotesStore", () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "super-mcp-tool-notes-"));
     notesFile = path.join(tempDir, "tool-notes.json");
     now = new Date("2026-08-17T12:00:00.000Z");
+    lockTestState.compromiseNext = false;
+    lockTestState.contentionNext = false;
+    lockTestState.errnoNext = undefined;
+    vi.clearAllMocks();
   });
 
   afterEach(async () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  function store() {
-    return createToolNotesStore(notesFile, () => now);
+  function store(filePath = notesFile) {
+    return createToolNotesStore(filePath, () => now);
+  }
+
+  function liveEntry(note: string, schemaHash = "hash-1"): ToolNoteEntry {
+    return {
+      note,
+      written_at: now.toISOString(),
+      expires_at: futureIso(10, now),
+      schema_hash: schemaHash,
+    };
+  }
+
+  async function writeRaw(
+    content: string,
+    filePath = notesFile,
+  ): Promise<void> {
+    await fs.mkdir(path.dirname(filePath), { recursive: true });
+    await fs.writeFile(filePath, content, { mode: 0o600 });
+  }
+
+  async function readRaw(filePath = notesFile): Promise<string | undefined> {
+    try {
+      return await fs.readFile(filePath, "utf8");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  function findNote(
+    snapshot: readonly LiveToolNote[],
+    packageId: string,
+    toolName: string,
+  ): LiveToolNote | undefined {
+    return snapshot.find(
+      (entry) => entry.packageId === packageId && entry.toolName === toolName,
+    );
+  }
+
+  async function readPersistedNotes(): Promise<Record<string, ToolNoteEntry>> {
+    const raw = await readRaw();
+    expect(raw).toBeDefined();
+    return (JSON.parse(raw ?? "{}") as { notes: Record<string, ToolNoteEntry> })
+      .notes;
   }
 
   it("accepts a 200-character note verbatim", async () => {
@@ -57,218 +149,529 @@ describe("ToolNotesStore", () => {
     expect(normalized.ok).toBe(true);
     if (!normalized.ok) return;
 
-    const s = store();
-    const result = await s.record("filesystem", "read_file", normalized.note, "hash-1");
+    const subject = store();
+    const result = await subject.record(
+      "filesystem",
+      "read_file",
+      normalized.note,
+      "hash-1",
+    );
     expect(result).toEqual({ status: "recorded" });
-    expect(await s.lookup("filesystem", "read_file", "hash-1")).toBe(note);
+    expect(
+      findNote(await subject.readSnapshot(), "filesystem", "read_file")?.note,
+    ).toBe(note);
   });
 
   it("rejects a 201-character note without truncation", async () => {
     const note = "x".repeat(201);
-    const normalized = normalizeNoteText(note);
-    expect(normalized.ok).toBe(false);
+    expect(normalizeNoteText(note).ok).toBe(false);
 
-    const s = store();
-    const result = await s.record("filesystem", "read_file", note, "hash-1");
+    const subject = store();
+    const result = await subject.record(
+      "filesystem",
+      "read_file",
+      note,
+      "hash-1",
+    );
     expect(result.status).toBe("rejected");
-    expect(await s.lookup("filesystem", "read_file", "hash-1")).toBeUndefined();
-    expect(await s.readRawForTests()).toBeUndefined();
+    expect(await subject.readSnapshot()).toEqual([]);
+    expect(await readRaw()).toBeUndefined();
   });
 
-  it("normalizes whitespace and rejects empty notes", async () => {
-    expect(normalizeNoteText("  hello   world  ")).toEqual({ ok: true, note: "hello world" });
+  it("normalizes word-separating whitespace before stripping remaining controls", () => {
+    expect(normalizeNoteText("  hello\n\tworld\u2028again  ")).toEqual({
+      ok: true,
+      note: "hello world again",
+    });
+    expect(normalizeNoteText("safe\u0085text\u202E")).toEqual({
+      ok: true,
+      note: "safetext",
+    });
     expect(normalizeNoteText(" \n\t  ")).toEqual({
       ok: false,
       reason: "note must be non-empty after normalization.",
     });
-
-    const s = store();
-    const normalized = normalizeNoteText("  spaced  note  ");
-    expect(normalized.ok).toBe(true);
-    if (!normalized.ok) return;
-    const result = await s.record("filesystem", "read_file", normalized.note, "hash-1");
-    expect(result).toEqual({ status: "recorded" });
-    expect(await s.lookup("filesystem", "read_file", "hash-1")).toBe("spaced note");
   });
 
   it("never surfaces expired, far-future, or future-written_at entries", async () => {
-    const s = store();
-    const expiredKey = makeToolNoteKey("pkg", "expired");
-    const farFutureKey = makeToolNoteKey("pkg", "far_future");
-    const futureWrittenKey = makeToolNoteKey("pkg", "future_written");
+    const subject = store();
+    await writeRaw(
+      JSON.stringify(
+        {
+          version: STORE_VERSION,
+          notes: {
+            [makeToolNoteKey("pkg", "expired")]: {
+              note: "expired note",
+              written_at: pastIso(40, now),
+              expires_at: pastIso(5, now),
+              schema_hash: "hash-1",
+            },
+            [makeToolNoteKey("pkg", "far_future")]: {
+              note: "far future expiry",
+              written_at: now.toISOString(),
+              expires_at: futureIso(60, now),
+              schema_hash: "hash-1",
+            },
+            [makeToolNoteKey("pkg", "future_written")]: {
+              note: "future written",
+              written_at: futureIso(1, now),
+              expires_at: futureIso(10, now),
+              schema_hash: "hash-1",
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    );
 
-    await s.writeRawForTests(JSON.stringify({
-      version: STORE_VERSION,
-      notes: {
-        [expiredKey]: {
-          note: "expired note",
-          written_at: pastIso(40, now),
-          expires_at: pastIso(5, now),
-          schema_hash: "hash-1",
-        },
-        [farFutureKey]: {
-          note: "far future expiry",
-          written_at: now.toISOString(),
-          expires_at: futureIso(60, now),
-          schema_hash: "hash-1",
-        },
-        [futureWrittenKey]: {
-          note: "future written",
-          written_at: futureIso(1, now),
-          expires_at: futureIso(10, now),
-          schema_hash: "hash-1",
-        },
-      },
-    }, null, 2));
-
-    expect(await s.lookup("pkg", "expired", "hash-1")).toBeUndefined();
-    expect(await s.lookup("pkg", "far_future", "hash-1")).toBeUndefined();
-    expect(await s.lookup("pkg", "future_written", "hash-1")).toBeUndefined();
-    expect(await s.readSnapshot()).toEqual([]);
+    expect(await subject.readSnapshot()).toEqual([]);
+    await vi.waitFor(async () => {
+      expect(await readPersistedNotes()).toEqual({});
+    });
   });
 
   it("keeps colliding delimiter-shaped tuple keys distinct", async () => {
-    const s = store();
-    await s.record("a", "b__c", "note for a/b__c", "hash-a");
-    await s.record("a__b", "c", "note for a__b/c", "hash-b");
+    const subject = store();
+    await subject.record("a", "b__c", "note for a/b__c", "hash-a");
+    await subject.record("a__b", "c", "note for a__b/c", "hash-b");
 
-    expect(await s.lookup("a", "b__c", "hash-a")).toBe("note for a/b__c");
-    expect(await s.lookup("a__b", "c", "hash-b")).toBe("note for a__b/c");
+    const snapshot = await subject.readSnapshot();
+    expect(findNote(snapshot, "a", "b__c")?.note).toBe("note for a/b__c");
+    expect(findNote(snapshot, "a__b", "c")?.note).toBe("note for a__b/c");
     expect(makeToolNoteKey("a", "b__c")).not.toBe(makeToolNoteKey("a__b", "c"));
   });
 
-  it("rejects new keys at capacity without evicting live notes", async () => {
-    const s = store();
-    for (let i = 0; i < MAX_NOTES_GLOBAL; i += 1) {
-      const packageId = `pkg_${Math.floor(i / MAX_NOTES_PER_PACKAGE)}`;
-      const result = await s.record(packageId, `tool_${i}`, `note ${i}`, `hash-${i}`);
+  it("rejects non-canonical, empty, and overlong tuple components", async () => {
+    const subject = store();
+    const alternateKey = '[ "pkg", "tool" ]';
+    await writeRaw(
+      JSON.stringify({
+        version: STORE_VERSION,
+        notes: { [alternateKey]: liveEntry("hidden") },
+      }),
+    );
+
+    expect(await subject.readSnapshot()).toEqual([]);
+    expect((await subject.record("", "tool", "note", "hash-1")).status).toBe(
+      "rejected",
+    );
+    expect((await subject.remove("pkg", "")).status).toBe("rejected");
+    expect(
+      (
+        await subject.record(
+          "p".repeat(MAX_KEY_COMPONENT_CHARS + 1),
+          "tool",
+          "note",
+          "hash-1",
+        )
+      ).status,
+    ).toBe("rejected");
+    await vi.waitFor(async () => {
+      expect(await readPersistedNotes()).toEqual({});
+    });
+  });
+
+  it("bounds schema hashes on mutation and persisted load", async () => {
+    const subject = store();
+    expect(
+      (
+        await subject.record(
+          "pkg",
+          "tool",
+          "note",
+          "h".repeat(MAX_SCHEMA_HASH_CHARS + 1),
+        )
+      ).status,
+    ).toBe("rejected");
+
+    await writeRaw(
+      JSON.stringify({
+        version: STORE_VERSION,
+        notes: {
+          [makeToolNoteKey("pkg", "tool")]: liveEntry(
+            "hidden",
+            "h".repeat(MAX_SCHEMA_HASH_CHARS + 1),
+          ),
+        },
+      }),
+    );
+    expect(await subject.readSnapshot()).toEqual([]);
+  });
+
+  it("rejects new keys at global capacity without evicting live notes", async () => {
+    const subject = store();
+    for (let index = 0; index < MAX_NOTES_GLOBAL; index += 1) {
+      const packageId = `pkg_${Math.floor(index / MAX_NOTES_PER_PACKAGE)}`;
+      const result = await subject.record(
+        packageId,
+        `tool_${index}`,
+        `note ${index}`,
+        `hash-${index}`,
+      );
       expect(result).toEqual({ status: "recorded" });
     }
 
-    const rejected = await s.record("pkg_overflow", "overflow", "one too many", "hash-overflow");
+    const rejected = await subject.record(
+      "pkg_overflow",
+      "overflow",
+      "one too many",
+      "hash-overflow",
+    );
     expect(rejected.status).toBe("rejected");
-    expect(await s.lookup("pkg_0", "tool_0", "hash-0")).toBe("note 0");
-    expect(await s.lookup("pkg_overflow", "overflow", "hash-overflow")).toBeUndefined();
+    const snapshot = await subject.readSnapshot();
+    expect(snapshot).toHaveLength(MAX_NOTES_GLOBAL);
+    expect(findNote(snapshot, "pkg_0", "tool_0")?.note).toBe("note 0");
+    expect(findNote(snapshot, "pkg_overflow", "overflow")).toBeUndefined();
   });
 
-  it("rejects per-package additions at capacity while allowing replacement and deletion", async () => {
-    const s = store();
-    for (let i = 0; i < MAX_NOTES_PER_PACKAGE; i += 1) {
-      const result = await s.record("filesystem", `tool_${i}`, `note ${i}`, `hash-${i}`);
-      expect(result).toEqual({ status: "recorded" });
+  it("allows replacement and deletion at capacity, then permits a freed slot", async () => {
+    const subject = store();
+    for (let index = 0; index < MAX_NOTES_PER_PACKAGE; index += 1) {
+      expect(
+        await subject.record(
+          "filesystem",
+          `tool_${index}`,
+          `note ${index}`,
+          `hash-${index}`,
+        ),
+      ).toEqual({ status: "recorded" });
     }
 
-    const rejected = await s.record("filesystem", "overflow", "blocked", "hash-overflow");
-    expect(rejected.status).toBe("rejected");
+    expect(
+      (
+        await subject.record(
+          "filesystem",
+          "overflow",
+          "blocked",
+          "hash-overflow",
+        )
+      ).status,
+    ).toBe("rejected");
+    expect(
+      await subject.record(
+        "filesystem",
+        "tool_0",
+        "replacement note",
+        "hash-0",
+      ),
+    ).toEqual({ status: "recorded" });
+    expect(await subject.remove("filesystem", "tool_1")).toEqual({
+      status: "removed",
+    });
+    expect(
+      await subject.record(
+        "filesystem",
+        "overflow",
+        "now fits",
+        "hash-overflow",
+      ),
+    ).toEqual({ status: "recorded" });
 
-    const replaced = await s.record("filesystem", "tool_0", "replacement note", "hash-0");
-    expect(replaced).toEqual({ status: "recorded" });
-    expect(await s.lookup("filesystem", "tool_0", "hash-0")).toBe("replacement note");
-
-    const removed = await s.remove("filesystem", "tool_1");
-    expect(removed).toEqual({ status: "removed" });
-
-    const freed = await s.record("filesystem", "overflow", "now fits", "hash-overflow");
-    expect(freed).toEqual({ status: "recorded" });
-    expect(await s.lookup("filesystem", "overflow", "hash-overflow")).toBe("now fits");
+    const snapshot = await subject.readSnapshot();
+    expect(findNote(snapshot, "filesystem", "tool_0")?.note).toBe(
+      "replacement note",
+    );
+    expect(findNote(snapshot, "filesystem", "overflow")?.note).toBe("now fits");
   });
 
-  it("leaves unknown versions byte-untouched and rejects mutations", async () => {
-    const s = store();
-    const unknownPayload = JSON.stringify({ version: 99, notes: {} }, null, 2);
-    await s.writeRawForTests(unknownPayload);
+  it("hides a stable bounded subset of hand-edited over-quota files and compacts it", async () => {
+    const subject = store();
+    const notes: Record<string, ToolNoteEntry> = {};
+    for (let index = 0; index <= MAX_NOTES_PER_PACKAGE; index += 1) {
+      notes[makeToolNoteKey("pkg", `tool_${String(index).padStart(2, "0")}`)] =
+        liveEntry(`note ${index}`);
+    }
+    await writeRaw(JSON.stringify({ version: STORE_VERSION, notes }));
 
-    expect(await s.readSnapshot()).toEqual([]);
-    const recordResult = await s.record("filesystem", "read_file", "should fail", "hash-1");
-    expect(recordResult.status).toBe("rejected");
-    expect(await s.readRawForTests()).toBe(unknownPayload);
+    const snapshot = await subject.readSnapshot();
+    expect(snapshot).toHaveLength(MAX_NOTES_PER_PACKAGE);
+    expect(snapshot.map((entry) => entry.toolName)).toEqual(
+      Array.from(
+        { length: MAX_NOTES_PER_PACKAGE },
+        (_, index) => `tool_${String(index).padStart(2, "0")}`,
+      ),
+    );
+    await vi.waitFor(async () => {
+      expect(Object.keys(await readPersistedNotes())).toHaveLength(
+        MAX_NOTES_PER_PACKAGE,
+      );
+    });
   });
 
-  it("treats malformed JSON as empty for reads and repairs on mutation", async () => {
-    const s = store();
-    await s.writeRawForTests("{ not valid json");
+  it("limits over-quota mutations to replacement and deletion until a slot is free", async () => {
+    const subject = store();
+    const notes: Record<string, ToolNoteEntry> = {};
+    for (let index = 0; index <= MAX_NOTES_PER_PACKAGE; index += 1) {
+      notes[makeToolNoteKey("pkg", `tool_${String(index).padStart(2, "0")}`)] =
+        liveEntry(`note ${index}`);
+    }
+    await writeRaw(JSON.stringify({ version: STORE_VERSION, notes }));
 
-    expect(await s.readSnapshot()).toEqual([]);
-    const result = await s.record("filesystem", "read_file", "fresh note", "hash-1");
-    expect(result).toEqual({ status: "recorded" });
-    expect(await s.lookup("filesystem", "read_file", "hash-1")).toBe("fresh note");
+    expect(
+      (await subject.record("pkg", "new", "blocked", "hash-1")).status,
+    ).toBe("rejected");
+    expect(
+      await subject.record("pkg", "tool_25", "replacement", "hash-1"),
+    ).toEqual({
+      status: "recorded",
+    });
+    expect(await subject.remove("pkg", "tool_00")).toEqual({
+      status: "removed",
+    });
+    expect(
+      (await subject.record("pkg", "new", "still full", "hash-1")).status,
+    ).toBe("rejected");
+    expect(await subject.remove("pkg", "tool_01")).toEqual({
+      status: "removed",
+    });
+    expect(await subject.record("pkg", "new", "now fits", "hash-1")).toEqual({
+      status: "recorded",
+    });
   });
 
-  it("does not parse or overwrite oversized files", async () => {
-    const s = store();
-    const oversized = " ".repeat(MAX_FILE_BYTES + 1);
-    await s.writeRawForTests(oversized);
+  it("caps globally over-quota loaded entries at 200", async () => {
+    const subject = store();
+    const notes: Record<string, ToolNoteEntry> = {};
+    for (let index = 0; index <= MAX_NOTES_GLOBAL; index += 1) {
+      const packageId = `pkg_${Math.floor(index / MAX_NOTES_PER_PACKAGE)}`;
+      notes[
+        makeToolNoteKey(packageId, `tool_${String(index).padStart(3, "0")}`)
+      ] = liveEntry(`note ${index}`);
+    }
+    await writeRaw(JSON.stringify({ version: STORE_VERSION, notes }));
 
-    expect(await s.readSnapshot()).toEqual([]);
-    const result = await s.record("filesystem", "read_file", "blocked", "hash-1");
-    expect(result.status).toBe("rejected");
-    expect(await s.readRawForTests()).toBe(oversized);
+    expect(await subject.readSnapshot()).toHaveLength(MAX_NOTES_GLOBAL);
+    await vi.waitFor(async () => {
+      expect(Object.keys(await readPersistedNotes())).toHaveLength(
+        MAX_NOTES_GLOBAL,
+      );
+    });
+  });
+
+  it("does not delete a concurrent replacement during snapshot-based cleanup", async () => {
+    const subject = store();
+    await subject.record("filesystem", "read_file", "old note", "hash-1");
+    const staleSnapshot = await subject.readSnapshot();
+    await subject.record("filesystem", "read_file", "new note", "hash-1");
+
+    await subject.compactSnapshotEntries(staleSnapshot);
+
+    expect(
+      findNote(await subject.readSnapshot(), "filesystem", "read_file")?.note,
+    ).toBe("new note");
+  });
+
+  it("leaves unknown versions byte-untouched and rejects record and removal", async () => {
+    const subject = store();
+    const unknownPayload = JSON.stringify(
+      {
+        version: 99,
+        notes: { [makeToolNoteKey("pkg", "tool")]: liveEntry("secret") },
+      },
+      null,
+      2,
+    );
+    await writeRaw(unknownPayload);
+
+    expect(await subject.readSnapshot()).toEqual([]);
+    expect(
+      (await subject.record("pkg", "tool", "should fail", "hash-1")).status,
+    ).toBe("rejected");
+    expect(await subject.remove("pkg", "tool")).toMatchObject({
+      status: "rejected",
+    });
+    expect(await readRaw()).toBe(unknownPayload);
+    expect(JSON.stringify(loggerMocks.warn.mock.calls)).not.toContain("secret");
+  });
+
+  it("treats malformed and deeply nested JSON as empty without breaking reads", async () => {
+    const subject = store();
+    await writeRaw("{ not valid json");
+    expect(await subject.readSnapshot()).toEqual([]);
+
+    const deeplyNested = `${"[".repeat(50_000)}${"]".repeat(50_000)}`;
+    await writeRaw(deeplyNested);
+    expect(await subject.readSnapshot()).toEqual([]);
+
+    expect(
+      await subject.record("filesystem", "read_file", "fresh note", "hash-1"),
+    ).toEqual({
+      status: "recorded",
+    });
+    expect(
+      findNote(await subject.readSnapshot(), "filesystem", "read_file")?.note,
+    ).toBe("fresh note");
+  });
+
+  it("makes non-ENOENT read failures total while keeping mutations fail-closed", async () => {
+    await fs.mkdir(notesFile);
+    const subject = store();
+
+    expect(await subject.readSnapshot()).toEqual([]);
+    await expect(
+      subject.record("pkg", "tool", "note", "hash-1"),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.INTERNAL_ERROR,
+    });
+    expect(loggerMocks.warn).toHaveBeenCalledWith(
+      expect.stringContaining("could not be read"),
+      expect.objectContaining({ file_path: notesFile }),
+    );
+  });
+
+  it("does not parse or overwrite oversized files on record or removal", async () => {
+    const subject = store();
+    const oversized = " ".repeat(MAX_FILE_BYTES + 64 * 1024);
+    await writeRaw(oversized);
+
+    expect(await subject.readSnapshot()).toEqual([]);
+    expect(
+      (await subject.record("filesystem", "read_file", "blocked", "hash-1"))
+        .status,
+    ).toBe("rejected");
+    expect(await subject.remove("filesystem", "read_file")).toMatchObject({
+      status: "rejected",
+    });
+    expect(await readRaw()).toBe(oversized);
+  });
+
+  it("rejects serialized updates over the byte ceiling before replacing existing bytes", async () => {
+    const subject = store();
+    const key = makeToolNoteKey("pkg", "existing");
+    const payload = {
+      version: STORE_VERSION,
+      notes: {
+        [key]: {
+          ...liveEntry("existing note"),
+          padding: "",
+        },
+      },
+    };
+    const emptyPaddingBytes = Buffer.byteLength(JSON.stringify(payload));
+    payload.notes[key].padding = "x".repeat(
+      MAX_FILE_BYTES - emptyPaddingBytes - 1,
+    );
+    const original = JSON.stringify(payload);
+    expect(Buffer.byteLength(original)).toBeLessThanOrEqual(MAX_FILE_BYTES);
+    expect(Buffer.byteLength(JSON.stringify(payload, null, 2))).toBeGreaterThan(
+      MAX_FILE_BYTES,
+    );
+    await writeRaw(original);
+
+    const result = await subject.record(
+      "pkg",
+      "new",
+      "crosses threshold",
+      "hash-1",
+    );
+
+    expect(result).toMatchObject({ status: "rejected" });
+    expect(await readRaw()).toBe(original);
+  });
+
+  it("maps contention to retryable rejection and unknown errnos to numeric internal errors", async () => {
+    const subject = store();
+    lockTestState.contentionNext = true;
+    await expect(
+      subject.record("pkg", "tool", "note", "hash-1"),
+    ).resolves.toEqual({
+      status: "rejected",
+      reason: expect.stringContaining("retry"),
+    });
+
+    lockTestState.errnoNext = "EACCES";
+    await expect(
+      subject.record("pkg", "tool", "note", "hash-1"),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.INTERNAL_ERROR,
+    });
+  });
+
+  it("records lock compromise without writing the pending note", async () => {
+    const subject = store();
+    lockTestState.compromiseNext = true;
+
+    const result = await subject.record(
+      "pkg",
+      "tool",
+      "must not persist",
+      "hash-1",
+    );
+
+    expect(result).toEqual({
+      status: "rejected",
+      reason: expect.stringContaining("retry"),
+    });
+    expect(await subject.readSnapshot()).toEqual([]);
+    expect(JSON.stringify(loggerMocks.warn.mock.calls)).not.toContain(
+      "must not persist",
+    );
   });
 
   it("preserves concurrent writes including simultaneous first writes", async () => {
     const sharedFile = path.join(tempDir, "shared.json");
-    const a = createToolNotesStore(sharedFile, () => now);
-    const b = createToolNotesStore(sharedFile, () => now);
+    const first = store(sharedFile);
+    const second = store(sharedFile);
 
     await Promise.all([
-      a.record("filesystem", "read_file", "note A", "hash-a"),
-      b.record("github", "search", "note B", "hash-b"),
+      first.record("filesystem", "read_file", "note A", "hash-a"),
+      second.record("github", "search", "note B", "hash-b"),
     ]);
 
-    const verify = createToolNotesStore(sharedFile, () => now);
-    expect(await verify.lookup("filesystem", "read_file", "hash-a")).toBe("note A");
-    expect(await verify.lookup("github", "search", "hash-b")).toBe("note B");
+    const snapshot = await store(sharedFile).readSnapshot();
+    expect(findNote(snapshot, "filesystem", "read_file")?.note).toBe("note A");
+    expect(findNote(snapshot, "github", "search")?.note).toBe("note B");
   });
 
-  it("writes restrictive file modes where supported", async () => {
+  it("writes restrictive modes on store-created files and nested directories", async () => {
     if (process.platform === "win32") {
       return;
     }
 
-    const s = store();
-    await s.record("filesystem", "read_file", "mode check", "hash-1");
+    const nestedDir = path.join(tempDir, "store-created", "nested");
+    notesFile = path.join(nestedDir, "tool-notes.json");
+    const subject = store();
+    await subject.record("filesystem", "read_file", "mode check", "hash-1");
+
     const fileStat = await fs.stat(notesFile);
-    const dirStat = await fs.stat(tempDir);
+    const dirStat = await fs.stat(nestedDir);
     expect(fileStat.mode & 0o777).toBe(0o600);
     expect(dirStat.mode & 0o777).toBe(0o700);
   });
 
-  it("rejects store writes that bypass handler normalization", async () => {
-    const s = store();
-    const key = makeToolNoteKey("filesystem", "read_file");
-    await s.writeRawForTests(JSON.stringify({
-      version: STORE_VERSION,
-      notes: {
-        [key]: {
-          note: "line one\nline two",
-          written_at: now.toISOString(),
-          expires_at: futureIso(10, now),
-          schema_hash: "hash-1",
+  it("rejects direct-file note text that bypasses handler normalization", async () => {
+    const subject = store();
+    await writeRaw(
+      JSON.stringify({
+        version: STORE_VERSION,
+        notes: {
+          [makeToolNoteKey("filesystem", "newline")]:
+            liveEntry("line one\nline two"),
+          [makeToolNoteKey("filesystem", "separator")]: liveEntry(
+            "line one\u2028line two",
+          ),
         },
-      },
-    }, null, 2));
+      }),
+    );
 
-    expect(await s.lookup("filesystem", "read_file", "hash-1")).toBeUndefined();
-    expect(isValidLiveEntry({
-      note: "line one\nline two",
-      written_at: now.toISOString(),
-      expires_at: futureIso(10, now),
-      schema_hash: "hash-1",
-    }, now)).toBe(false);
-
-    const repaired = await s.record("filesystem", "read_file", "valid note", "hash-1");
-    expect(repaired).toEqual({ status: "recorded" });
-    expect(await s.lookup("filesystem", "read_file", "hash-1")).toBe("valid note");
+    expect(await subject.readSnapshot()).toEqual([]);
+    expect(
+      await subject.record("filesystem", "newline", "valid note", "hash-1"),
+    ).toEqual({ status: "recorded" });
+    expect(
+      findNote(await subject.readSnapshot(), "filesystem", "newline")?.note,
+    ).toBe("valid note");
   });
 });
 
 describe("normalizeNoteText", () => {
-  it("strips control characters before measuring length", () => {
+  it("strips controls before measuring the normalized length", () => {
     const base = "a".repeat(200);
-    const withControl = `${base}\u0007`;
-    expect(normalizeNoteText(withControl)).toEqual({ ok: true, note: base });
-
-    const tooLongAfterStrip = `${"a".repeat(201)}\u0007`;
-    expect(normalizeNoteText(tooLongAfterStrip).ok).toBe(false);
+    expect(normalizeNoteText(`${base}\u0007`)).toEqual({
+      ok: true,
+      note: base,
+    });
+    expect(normalizeNoteText(`${"a".repeat(201)}\u0007`).ok).toBe(false);
   });
 });

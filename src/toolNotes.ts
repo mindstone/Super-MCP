@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import properLockfile from "proper-lockfile";
 import { getLogger } from "./logging.js";
+import { ERROR_CODES } from "./types.js";
 
 const logger = getLogger();
 
@@ -12,9 +13,12 @@ export const NOTE_TTL_DAYS = 30;
 export const MAX_NOTES_PER_PACKAGE = 25;
 export const MAX_NOTES_GLOBAL = 200;
 export const MAX_FILE_BYTES = 512 * 1024;
+export const MAX_KEY_COMPONENT_CHARS = 256;
+export const MAX_SCHEMA_HASH_CHARS = 128;
 export const STORE_VERSION = 1;
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
+const READ_BUFFER_BYTES = MAX_FILE_BYTES + 1;
 
 export interface ToolNoteEntry {
   note: string;
@@ -32,6 +36,8 @@ export interface LiveToolNote {
   packageId: string;
   toolName: string;
   note: string;
+  written_at: string;
+  expires_at: string;
   schema_hash: string;
 }
 
@@ -39,7 +45,18 @@ type ReadState =
   | { kind: "ok"; data: ToolNotesFile }
   | { kind: "empty"; reason: "missing" | "malformed" }
   | { kind: "oversized" }
+  | { kind: "unreadable" }
   | { kind: "unknown_version" };
+
+interface NoteAnalysis {
+  visibleNotes: Record<string, ToolNoteEntry>;
+  needsCompaction: boolean;
+  overQuota: boolean;
+}
+
+interface MutationContext {
+  analysis: NoteAnalysis;
+}
 
 export type RecordNoteResult =
   | { status: "recorded" }
@@ -47,14 +64,23 @@ export type RecordNoteResult =
 
 export type RemoveNoteResult =
   | { status: "removed" }
-  | { status: "not_found" };
+  | { status: "not_found" }
+  | { status: "rejected"; reason: string };
 
 /** Shared tuple key — injective for delimiter-shaped package/tool ids. */
 export function makeToolNoteKey(packageId: string, toolName: string): string {
   return JSON.stringify([packageId, toolName]);
 }
 
-export function parseToolNoteKey(
+function isValidKeyComponent(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_KEY_COMPONENT_CHARS
+  );
+}
+
+function parseCanonicalToolNoteKey(
   key: string,
 ): { packageId: string; toolName: string } | undefined {
   let parsed: unknown;
@@ -67,23 +93,45 @@ export function parseToolNoteKey(
     return undefined;
   }
   const [packageId, toolName] = parsed;
-  if (typeof packageId !== "string" || typeof toolName !== "string") {
+  if (!isValidKeyComponent(packageId) || !isValidKeyComponent(toolName)) {
     return undefined;
   }
-  if (packageId.length === 0 || toolName.length === 0) {
+  if (key !== makeToolNoteKey(packageId, toolName)) {
     return undefined;
   }
   return { packageId, toolName };
 }
 
-function hasControlOrMultiline(text: string): boolean {
-  for (let i = 0; i < text.length; i += 1) {
-    const code = text.charCodeAt(i);
-    if (code < 32 || code === 127) {
+function isDisallowedNoteCodePoint(codePoint: number): boolean {
+  return (
+    codePoint <= 0x1f ||
+    (codePoint >= 0x7f && codePoint <= 0x9f) ||
+    codePoint === 0x2028 ||
+    codePoint === 0x2029 ||
+    (codePoint >= 0x202a && codePoint <= 0x202e) ||
+    (codePoint >= 0x2066 && codePoint <= 0x2069)
+  );
+}
+
+function hasDisallowedNoteText(text: string): boolean {
+  for (const character of text) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint !== undefined && isDisallowedNoteCodePoint(codePoint)) {
       return true;
     }
   }
   return false;
+}
+
+function stripDisallowedNoteText(text: string): string {
+  let stripped = "";
+  for (const character of text) {
+    const codePoint = character.codePointAt(0);
+    if (codePoint === undefined || !isDisallowedNoteCodePoint(codePoint)) {
+      stripped += character;
+    }
+  }
+  return stripped;
 }
 
 function parseIsoTimestamp(value: string): Date | undefined {
@@ -98,7 +146,7 @@ function parseIsoTimestamp(value: string): Date | undefined {
 }
 
 /**
- * Handler-facing normalization: collapse whitespace, strip control chars, trim.
+ * Handler-facing normalization: collapse whitespace, strip remaining controls, trim.
  * Rejects empty results and over-cap text without truncation.
  */
 export function normalizeNoteText(
@@ -107,18 +155,18 @@ export function normalizeNoteText(
   if (typeof raw !== "string") {
     return { ok: false, reason: "note must be a string." };
   }
-  const withoutControl = raw.replace(/[\x00-\x1f\x7f]/g, "");
-  const collapsed = withoutControl.replace(/\s+/g, " ").trim();
-  if (!collapsed) {
+  const whitespaceCollapsed = raw.replace(/\s+/gu, " ");
+  const normalized = stripDisallowedNoteText(whitespaceCollapsed).trim();
+  if (!normalized) {
     return { ok: false, reason: "note must be non-empty after normalization." };
   }
-  if (collapsed.length > NOTE_MAX_CHARS) {
+  if (normalized.length > NOTE_MAX_CHARS) {
     return {
       ok: false,
-      reason: `note exceeds maximum of ${NOTE_MAX_CHARS} characters (${collapsed.length} after normalization).`,
+      reason: `note exceeds maximum of ${NOTE_MAX_CHARS} characters (${normalized.length} after normalization).`,
     };
   }
-  return { ok: true, note: collapsed };
+  return { ok: true, note: normalized };
 }
 
 function isEntryShape(value: unknown): value is ToolNoteEntry {
@@ -134,10 +182,7 @@ function isEntryShape(value: unknown): value is ToolNoteEntry {
   );
 }
 
-function validateEntryTimestamps(
-  entry: ToolNoteEntry,
-  now: Date,
-): boolean {
+function validateEntryTimestamps(entry: ToolNoteEntry, now: Date): boolean {
   const writtenAt = parseIsoTimestamp(entry.written_at);
   const expiresAt = parseIsoTimestamp(entry.expires_at);
   if (!writtenAt || !expiresAt) {
@@ -160,20 +205,38 @@ function validateEntryTimestamps(
 }
 
 /** Store-level validator — guards load, mutation, and hand-edited files. */
-export function isValidLiveEntry(
-  entry: ToolNoteEntry,
-  now: Date,
-): boolean {
+function isValidLiveEntry(entry: ToolNoteEntry, now: Date): boolean {
   if (!entry.note || entry.note.length > NOTE_MAX_CHARS) {
     return false;
   }
-  if (hasControlOrMultiline(entry.note)) {
+  if (hasDisallowedNoteText(entry.note)) {
     return false;
   }
-  if (!entry.schema_hash || typeof entry.schema_hash !== "string") {
+  if (!entry.schema_hash || entry.schema_hash.length > MAX_SCHEMA_HASH_CHARS) {
     return false;
   }
   return validateEntryTimestamps(entry, now);
+}
+
+function entryMatchesSnapshot(
+  entry: ToolNoteEntry,
+  snapshot: LiveToolNote,
+): boolean {
+  return (
+    entry.note === snapshot.note &&
+    entry.written_at === snapshot.written_at &&
+    entry.expires_at === snapshot.expires_at &&
+    entry.schema_hash === snapshot.schema_hash
+  );
+}
+
+function getErrorCode(error: unknown): string | undefined {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return typeof code === "string" ? code : undefined;
+}
+
+function isContentionError(error: unknown): boolean {
+  return getErrorCode(error) === "ELOCKED";
 }
 
 function defaultNotesPath(): string {
@@ -196,10 +259,6 @@ export function createToolNotesStore(
   return new ToolNotesStore(filePath, clock);
 }
 
-export function resetToolNotesStoreForTests(): void {
-  defaultStore = undefined;
-}
-
 export class ToolNotesStore {
   constructor(
     private readonly filePath: string,
@@ -211,41 +270,54 @@ export class ToolNotesStore {
     if (state.kind !== "ok") {
       return [];
     }
-    const now = this.clock();
-    const live: LiveToolNote[] = [];
-    for (const [key, entry] of Object.entries(state.data.notes)) {
-      const parsedKey = parseToolNoteKey(key);
-      if (!parsedKey || !isEntryShape(entry) || !isValidLiveEntry(entry, now)) {
-        continue;
-      }
-      live.push({
-        packageId: parsedKey.packageId,
-        toolName: parsedKey.toolName,
-        note: entry.note,
-        schema_hash: entry.schema_hash,
-      });
+
+    const analysis = this.analyzeNotes(state.data.notes, this.clock());
+    const snapshot = Object.entries(analysis.visibleNotes).map(
+      ([key, entry]) => {
+        const parsedKey = parseCanonicalToolNoteKey(key);
+        if (!parsedKey) {
+          throw new Error("Tool note analysis returned a non-canonical key.");
+        }
+        return {
+          packageId: parsedKey.packageId,
+          toolName: parsedKey.toolName,
+          note: entry.note,
+          written_at: entry.written_at,
+          expires_at: entry.expires_at,
+          schema_hash: entry.schema_hash,
+        };
+      },
+    );
+
+    if (analysis.needsCompaction) {
+      this.scheduleBestEffortCompaction();
     }
-    return live;
+    return snapshot;
   }
 
-  async lookup(
-    packageId: string,
-    toolName: string,
-    schemaHash: string,
-  ): Promise<string | undefined> {
-    const key = makeToolNoteKey(packageId, toolName);
-    const state = await this.readFileState();
-    if (state.kind !== "ok") {
-      return undefined;
-    }
-    const entry = state.data.notes[key];
-    if (!entry || !isEntryShape(entry) || !isValidLiveEntry(entry, this.clock())) {
-      return undefined;
-    }
-    if (entry.schema_hash !== schemaHash) {
-      return undefined;
-    }
-    return entry.note;
+  /**
+   * Re-read under the lock, compact invalid/over-quota entries, and remove only
+   * snapshot entries that are still byte-for-byte unchanged. Stage 2 can use
+   * this for schema-stale cleanup without deleting a concurrent replacement.
+   */
+  async compactSnapshotEntries(
+    entriesToRemove: readonly LiveToolNote[] = [],
+  ): Promise<void> {
+    await this.withLockedMutation(
+      (data, { analysis }) => {
+        let changed = analysis.needsCompaction;
+        for (const snapshot of entriesToRemove) {
+          const key = makeToolNoteKey(snapshot.packageId, snapshot.toolName);
+          const current = data.notes[key];
+          if (current && entryMatchesSnapshot(current, snapshot)) {
+            delete data.notes[key];
+            changed = true;
+          }
+        }
+        return changed ? data : undefined;
+      },
+      { compactOverQuota: true },
+    );
   }
 
   async record(
@@ -254,17 +326,37 @@ export class ToolNotesStore {
     note: string,
     schemaHash: string,
   ): Promise<RecordNoteResult> {
-    if (!note || note.length > NOTE_MAX_CHARS || hasControlOrMultiline(note)) {
+    if (!isValidKeyComponent(packageId) || !isValidKeyComponent(toolName)) {
+      return {
+        status: "rejected",
+        reason: `package and tool identifiers must be 1-${MAX_KEY_COMPONENT_CHARS} characters.`,
+      };
+    }
+    if (!note || note.length > NOTE_MAX_CHARS || hasDisallowedNoteText(note)) {
       return { status: "rejected", reason: "note failed store validation." };
     }
     if (!schemaHash || typeof schemaHash !== "string") {
       return { status: "rejected", reason: "schema_hash is required." };
     }
+    if (schemaHash.length > MAX_SCHEMA_HASH_CHARS) {
+      return {
+        status: "rejected",
+        reason: `schema_hash exceeds maximum of ${MAX_SCHEMA_HASH_CHARS} characters.`,
+      };
+    }
 
     try {
-      await this.withLockedMutation(async (data) => {
+      await this.withLockedMutation(async (data, { analysis }) => {
         const key = makeToolNoteKey(packageId, toolName);
-        const isReplacement = Object.prototype.hasOwnProperty.call(data.notes, key);
+        const isReplacement = Object.prototype.hasOwnProperty.call(
+          data.notes,
+          key,
+        );
+        if (analysis.overQuota && !isReplacement) {
+          throw new QuotaRejectedError(
+            "tool notes file is over capacity; replace or remove an existing note before adding another.",
+          );
+        }
         if (!isReplacement) {
           const quotaError = this.checkQuotaForNewKey(data.notes, packageId);
           if (quotaError) {
@@ -274,7 +366,9 @@ export class ToolNotesStore {
 
         const now = this.clock();
         const writtenAt = now.toISOString();
-        const expiresAt = new Date(now.getTime() + NOTE_TTL_DAYS * MS_PER_DAY).toISOString();
+        const expiresAt = new Date(
+          now.getTime() + NOTE_TTL_DAYS * MS_PER_DAY,
+        ).toISOString();
         const entry: ToolNoteEntry = {
           note,
           written_at: writtenAt,
@@ -294,17 +388,22 @@ export class ToolNotesStore {
       });
       return { status: "recorded" };
     } catch (error) {
-      if (error instanceof QuotaRejectedError || error instanceof ValidationRejectedError) {
-        return { status: "rejected", reason: error.message };
+      const reason = this.getMutationRejectionReason(error);
+      if (reason) {
+        return { status: "rejected", reason };
       }
-      if (error instanceof MutationBlockedError) {
-        return { status: "rejected", reason: error.message };
-      }
-      throw error;
+      this.rethrowProtocolSafe(error);
     }
   }
 
   async remove(packageId: string, toolName: string): Promise<RemoveNoteResult> {
+    if (!isValidKeyComponent(packageId) || !isValidKeyComponent(toolName)) {
+      return {
+        status: "rejected",
+        reason: `package and tool identifiers must be 1-${MAX_KEY_COMPONENT_CHARS} characters.`,
+      };
+    }
+
     const key = makeToolNoteKey(packageId, toolName);
     let removed = false;
     try {
@@ -317,10 +416,11 @@ export class ToolNotesStore {
         return data;
       });
     } catch (error) {
-      if (error instanceof MutationBlockedError) {
-        return { status: "not_found" };
+      const reason = this.getMutationRejectionReason(error);
+      if (reason) {
+        return { status: "rejected", reason };
       }
-      throw error;
+      this.rethrowProtocolSafe(error);
     }
 
     if (removed) {
@@ -333,39 +433,36 @@ export class ToolNotesStore {
     return { status: "not_found" };
   }
 
-  /** Test helper: write raw file bytes without going through the store validator. */
-  async writeRawForTests(content: string): Promise<void> {
-    const stateDir = path.dirname(this.filePath);
-    await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
-    await fs.writeFile(this.filePath, content, { mode: 0o600 });
-  }
-
-  /** Test helper: read on-disk bytes. */
-  async readRawForTests(): Promise<string | undefined> {
-    try {
-      return await fs.readFile(this.filePath, "utf8");
-    } catch (error: any) {
-      if (error?.code === "ENOENT") {
-        return undefined;
-      }
-      throw error;
+  private getMutationRejectionReason(error: unknown): string | undefined {
+    if (
+      error instanceof QuotaRejectedError ||
+      error instanceof ValidationRejectedError ||
+      error instanceof MutationBlockedError
+    ) {
+      return error.message;
     }
+    if (isContentionError(error)) {
+      return "another process is writing tool notes; retry.";
+    }
+    return undefined;
   }
 
-  getFilePath(): string {
-    return this.filePath;
+  private rethrowProtocolSafe(error: unknown): never {
+    if (getErrorCode(error)) {
+      throw new ToolNotesInternalError("Tool notes storage failed.", error);
+    }
+    throw error;
   }
 
   private checkQuotaForNewKey(
     notes: Record<string, ToolNoteEntry>,
     packageId: string,
   ): string | undefined {
-    const now = this.clock();
     let globalCount = 0;
     let packageCount = 0;
-    for (const [key, entry] of Object.entries(notes)) {
-      const parsedKey = parseToolNoteKey(key);
-      if (!parsedKey || !isEntryShape(entry) || !isValidLiveEntry(entry, now)) {
+    for (const key of Object.keys(notes)) {
+      const parsedKey = parseCanonicalToolNoteKey(key);
+      if (!parsedKey) {
         continue;
       }
       globalCount += 1;
@@ -382,38 +479,103 @@ export class ToolNotesStore {
     return undefined;
   }
 
-  private compactNotes(
+  private analyzeNotes(
     notes: Record<string, ToolNoteEntry>,
     now: Date,
-  ): Record<string, ToolNoteEntry> {
-    const compacted: Record<string, ToolNoteEntry> = {};
-    for (const [key, entry] of Object.entries(notes)) {
-      const parsedKey = parseToolNoteKey(key);
+  ): NoteAnalysis {
+    const visibleNotes: Record<string, ToolNoteEntry> = {};
+    const packageCounts = new Map<string, number>();
+    let globalCount = 0;
+    let needsCompaction = false;
+    let overQuota = false;
+
+    const entries = Object.entries(notes).sort(([left], [right]) =>
+      left < right ? -1 : left > right ? 1 : 0,
+    );
+    for (const [key, entry] of entries) {
+      const parsedKey = parseCanonicalToolNoteKey(key);
       if (!parsedKey || !isEntryShape(entry) || !isValidLiveEntry(entry, now)) {
+        needsCompaction = true;
         continue;
       }
-      compacted[key] = entry;
+
+      const packageCount = packageCounts.get(parsedKey.packageId) ?? 0;
+      if (
+        globalCount >= MAX_NOTES_GLOBAL ||
+        packageCount >= MAX_NOTES_PER_PACKAGE
+      ) {
+        needsCompaction = true;
+        overQuota = true;
+        continue;
+      }
+
+      visibleNotes[key] = entry;
+      globalCount += 1;
+      packageCounts.set(parsedKey.packageId, packageCount + 1);
     }
-    return compacted;
+
+    return { visibleNotes, needsCompaction, overQuota };
+  }
+
+  private scheduleBestEffortCompaction(): void {
+    void this.compactSnapshotEntries().catch((error) => {
+      logger.warn(
+        "tool notes compaction failed; read snapshot remains usable",
+        {
+          file_path: this.filePath,
+          error_code: getErrorCode(error),
+          error_name: error instanceof Error ? error.name : typeof error,
+        },
+      );
+    });
   }
 
   private async readFileState(): Promise<ReadState> {
     let raw: Buffer;
     try {
-      raw = await fs.readFile(this.filePath);
-    } catch (error: any) {
-      if (error?.code === "ENOENT") {
+      const handle = await fs.open(this.filePath, "r");
+      try {
+        const buffer = Buffer.allocUnsafe(READ_BUFFER_BYTES);
+        let totalBytesRead = 0;
+        while (totalBytesRead < buffer.byteLength) {
+          const { bytesRead } = await handle.read(
+            buffer,
+            totalBytesRead,
+            buffer.byteLength - totalBytesRead,
+            totalBytesRead,
+          );
+          if (bytesRead === 0) {
+            break;
+          }
+          totalBytesRead += bytesRead;
+        }
+        raw = buffer.subarray(0, totalBytesRead);
+      } finally {
+        await handle.close();
+      }
+    } catch (error) {
+      if (getErrorCode(error) === "ENOENT") {
         return { kind: "empty", reason: "missing" };
       }
-      throw error;
+      logger.warn(
+        "tool notes file could not be read; treating as empty for reads",
+        {
+          file_path: this.filePath,
+          error_code: getErrorCode(error),
+        },
+      );
+      return { kind: "unreadable" };
     }
 
     if (raw.byteLength > MAX_FILE_BYTES) {
-      logger.warn("tool notes file exceeds size limit; treating as empty for reads", {
-        file_path: this.filePath,
-        size_bytes: raw.byteLength,
-        max_bytes: MAX_FILE_BYTES,
-      });
+      logger.warn(
+        "tool notes file exceeds size limit; treating as empty for reads",
+        {
+          file_path: this.filePath,
+          observed_bytes: raw.byteLength,
+          max_bytes: MAX_FILE_BYTES,
+        },
+      );
       return { kind: "oversized" };
     }
 
@@ -421,30 +583,44 @@ export class ToolNotesStore {
     try {
       parsed = JSON.parse(raw.toString("utf8"));
     } catch {
-      logger.warn("tool notes file contains malformed JSON; treating as empty for reads", {
-        file_path: this.filePath,
-      });
+      logger.warn(
+        "tool notes file contains malformed JSON; treating as empty for reads",
+        {
+          file_path: this.filePath,
+        },
+      );
       return { kind: "empty", reason: "malformed" };
     }
 
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-      logger.warn("tool notes file has invalid root shape; treating as empty for reads", {
-        file_path: this.filePath,
-      });
+      logger.warn(
+        "tool notes file has invalid root shape; treating as empty for reads",
+        {
+          file_path: this.filePath,
+        },
+      );
       return { kind: "empty", reason: "malformed" };
     }
 
     const version = (parsed as { version?: unknown }).version;
     if (version !== STORE_VERSION) {
-      logger.warn("tool notes file has unsupported version; reads empty, mutations blocked", {
-        file_path: this.filePath,
-        version,
-      });
+      logger.warn(
+        "tool notes file has unsupported version; reads empty, mutations blocked",
+        {
+          file_path: this.filePath,
+          version: typeof version === "number" ? version : undefined,
+          version_type: typeof version,
+        },
+      );
       return { kind: "unknown_version" };
     }
 
     const notesValue = (parsed as { notes?: unknown }).notes;
-    if (!notesValue || typeof notesValue !== "object" || Array.isArray(notesValue)) {
+    if (
+      !notesValue ||
+      typeof notesValue !== "object" ||
+      Array.isArray(notesValue)
+    ) {
       return {
         kind: "ok",
         data: { version: STORE_VERSION, notes: {} },
@@ -463,52 +639,103 @@ export class ToolNotesStore {
   private async ensureStoreFileExists(): Promise<void> {
     const stateDir = path.dirname(this.filePath);
     await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
-    const initial = JSON.stringify({ version: STORE_VERSION, notes: {} }, null, 2);
+    const initial = JSON.stringify(
+      { version: STORE_VERSION, notes: {} },
+      null,
+      2,
+    );
     try {
       await fs.writeFile(this.filePath, initial, { flag: "wx", mode: 0o600 });
-    } catch (error: any) {
-      if (error?.code === "EEXIST") {
+    } catch (error) {
+      if (getErrorCode(error) === "EEXIST") {
         return;
       }
       throw error;
     }
   }
 
+  private async assertLockHealthy(tracker: { error?: Error }): Promise<void> {
+    if (tracker.error) {
+      throw new MutationBlockedError("tool notes lock was compromised; retry.");
+    }
+    try {
+      await fs.access(`${this.filePath}.lock`);
+    } catch {
+      throw new MutationBlockedError("tool notes lock was compromised; retry.");
+    }
+  }
+
   private async withLockedMutation(
-    mutate: (data: ToolNotesFile) => ToolNotesFile | Promise<ToolNotesFile>,
+    mutate: (
+      data: ToolNotesFile,
+      context: MutationContext,
+    ) => ToolNotesFile | undefined | Promise<ToolNotesFile | undefined>,
+    options: { compactOverQuota?: boolean } = {},
   ): Promise<void> {
     await this.ensureStoreFileExists();
 
+    const tracker: { error?: Error } = {};
     let release: (() => Promise<void>) | undefined;
     try {
       release = await properLockfile.lock(this.filePath, {
         stale: 30_000,
-        retries: { retries: 5, minTimeout: 50, maxTimeout: 200, factor: 1.5, randomize: true },
+        retries: {
+          retries: 5,
+          minTimeout: 50,
+          maxTimeout: 200,
+          factor: 1.5,
+          randomize: true,
+        },
         realpath: false,
+        onCompromised: (error: Error) => {
+          tracker.error = error;
+          logger.warn("tool notes lock was compromised", {
+            file_path: this.filePath,
+            error_code: getErrorCode(error),
+          });
+        },
       });
 
       const state = await this.readFileState();
       if (state.kind === "unknown_version") {
-        throw new MutationBlockedError("tool notes store version is unsupported.");
+        throw new MutationBlockedError(
+          "tool notes store version is unsupported.",
+        );
       }
       if (state.kind === "oversized") {
-        throw new MutationBlockedError("tool notes file exceeds the size limit.");
+        throw new MutationBlockedError(
+          "tool notes file exceeds the size limit.",
+        );
+      }
+      if (state.kind === "unreadable") {
+        throw new ToolNotesInternalError("Tool notes storage is unavailable.");
       }
 
-      const now = this.clock();
-      const base: ToolNotesFile =
+      const analysis =
         state.kind === "ok"
-          ? { version: STORE_VERSION, notes: this.compactNotes(state.data.notes, now) }
-          : { version: STORE_VERSION, notes: {} };
+          ? this.analyzeNotes(state.data.notes, this.clock())
+          : { visibleNotes: {}, needsCompaction: false, overQuota: false };
+      const preserveOverQuota = analysis.overQuota && !options.compactOverQuota;
+      const base: ToolNotesFile = {
+        version: STORE_VERSION,
+        notes:
+          state.kind === "ok" && preserveOverQuota
+            ? { ...state.data.notes }
+            : { ...analysis.visibleNotes },
+      };
 
-      const next = await mutate(base);
+      const next = await mutate(base, { analysis });
+      if (!next) {
+        return;
+      }
+      await this.assertLockHealthy(tracker);
       await this.atomicWrite(next);
     } finally {
       if (release) {
         await release().catch((error) => {
           logger.warn("failed to release tool notes lock", {
             file_path: this.filePath,
-            error: error instanceof Error ? error.message : String(error),
+            error_code: getErrorCode(error),
           });
         });
       }
@@ -516,6 +743,14 @@ export class ToolNotesStore {
   }
 
   private async atomicWrite(data: ToolNotesFile): Promise<void> {
+    const serialized = JSON.stringify(data, null, 2);
+    const serializedBytes = Buffer.byteLength(serialized);
+    if (serializedBytes > MAX_FILE_BYTES) {
+      throw new ValidationRejectedError(
+        `tool notes update would exceed the ${MAX_FILE_BYTES}-byte file limit.`,
+      );
+    }
+
     const stateDir = path.dirname(this.filePath);
     await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
     const tempPath = path.join(
@@ -523,20 +758,25 @@ export class ToolNotesStore {
       `.tool-notes.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
     );
 
-    let wrote = false;
+    let tempCreated = false;
     try {
       const handle = await fs.open(tempPath, "w", 0o600);
+      tempCreated = true;
       try {
-        await handle.writeFile(JSON.stringify(data, null, 2));
+        await handle.writeFile(serialized);
         await handle.sync();
       } finally {
         await handle.close();
       }
-      wrote = true;
       await fs.rename(tempPath, this.filePath);
     } catch (error) {
-      if (wrote || (await fs.access(tempPath).then(() => true, () => false))) {
-        await fs.unlink(tempPath).catch(() => {});
+      if (tempCreated) {
+        await fs.unlink(tempPath).catch((cleanupError) => {
+          logger.warn("failed to clean up tool notes temporary file", {
+            file_path: tempPath,
+            error_code: getErrorCode(cleanupError),
+          });
+        });
       }
       throw error;
     }
@@ -561,5 +801,14 @@ class MutationBlockedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "MutationBlockedError";
+  }
+}
+
+class ToolNotesInternalError extends Error {
+  readonly code = ERROR_CODES.INTERNAL_ERROR;
+
+  constructor(message: string, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "ToolNotesInternalError";
   }
 }
