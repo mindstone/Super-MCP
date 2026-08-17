@@ -47,6 +47,13 @@ export async function handleRecordToolNote(
   });
   const note = input.note;
 
+  if (remove !== undefined && typeof remove !== "boolean") {
+    throw {
+      code: ERROR_CODES.INVALID_PARAMS,
+      message: "remove must be a boolean.",
+    };
+  }
+
   if (
     !package_id ||
     typeof package_id !== "string" ||
@@ -71,14 +78,6 @@ export async function handleRecordToolNote(
     );
   }
 
-  if (tool_id.includes("__")) {
-    throw {
-      code: ERROR_CODES.INVALID_PARAMS,
-      message:
-        "tool_id must be the bare canonical tool name (e.g. 'read_file'), not the combined discovery form 'package__tool'. Split package_id and tool_id: use package_id for the package and tool_id for the bare tool name returned by list_tools.",
-    };
-  }
-
   if (remove === true && Object.prototype.hasOwnProperty.call(input, "note")) {
     return makeResponse(
       {
@@ -89,7 +88,15 @@ export async function handleRecordToolNote(
     );
   }
 
-  await catalog.ensurePackageLoaded(package_id);
+  const cachedTool = await catalog.getTool(package_id, tool_id);
+  if (!cachedTool && tool_id.includes("__")) {
+    throw {
+      code: ERROR_CODES.INVALID_PARAMS,
+      message:
+        "tool_id must be the bare canonical tool name. list_tools returns namespaced IDs; remove only the leading '<package_id>__' prefix and pass the remainder unchanged (for example, 'package__tool__name' becomes 'tool__name').",
+    };
+  }
+
   const packageStatus = catalog.getPackageStatus(package_id);
   if (packageStatus !== "ready") {
     return makeResponse(
@@ -101,7 +108,6 @@ export async function handleRecordToolNote(
     );
   }
 
-  const cachedTool = await catalog.getTool(package_id, tool_id);
   if (!cachedTool) {
     return makeResponse({ status: "not_found" }, true);
   }

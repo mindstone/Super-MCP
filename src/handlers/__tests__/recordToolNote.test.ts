@@ -219,6 +219,38 @@ describe("handleRecordToolNote", () => {
       code: ERROR_CODES.INVALID_PARAMS,
       message: expect.stringContaining("bare canonical tool name"),
     });
+    expect(catalog.getTool).toHaveBeenCalledWith(
+      "filesystem",
+      "filesystem__read_file",
+    );
+  });
+
+  it("records an exact canonical bare tool name containing __", async () => {
+    const embeddedDelimiterCatalog = createMockCatalog({
+      filesystem: {
+        audit__events: { schemaHash: "hash-audit-events" },
+      },
+    });
+
+    const result = await handleRecordToolNote(
+      {
+        package_id: "filesystem",
+        tool_id: "audit__events",
+        note: "Use the narrowest available event filter.",
+      },
+      embeddedDelimiterCatalog,
+      store,
+    );
+
+    expect(parseResponse(result)).toEqual({ status: "recorded" });
+    expect(result.isError).toBe(false);
+    expect(await storedNote("filesystem", "audit__events")).toBe(
+      "Use the narrowest available event filter.",
+    );
+    expect(embeddedDelimiterCatalog.getTool).toHaveBeenCalledWith(
+      "filesystem",
+      "audit__events",
+    );
   });
 
   it("returns not_found when the tool does not exist in the catalog", async () => {
@@ -253,6 +285,59 @@ describe("handleRecordToolNote", () => {
     );
     expect(parseResponse(result).message).toContain("remove: true");
     expect(result.isError).toBe(true);
+  });
+
+  it.each([
+    ["an unrecognized string", "yes"],
+    ["a number", 1],
+    ["an object", {}],
+  ])("rejects %s remove value before recording", async (_label, remove) => {
+    await expect(
+      handleRecordToolNote(
+        {
+          package_id: "filesystem",
+          tool_id: "read_file",
+          note: "This must not be recorded.",
+          remove,
+        } as any,
+        catalog,
+        store,
+      ),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.INVALID_PARAMS,
+      message: expect.stringContaining("remove must be a boolean"),
+    });
+    expect(await storedNote("filesystem", "read_file")).toBeUndefined();
+  });
+
+  it("rejects an invalid remove value without deleting an existing note", async () => {
+    await handleRecordToolNote(
+      {
+        package_id: "filesystem",
+        tool_id: "read_file",
+        note: "Keep this note.",
+      },
+      catalog,
+      store,
+    );
+
+    await expect(
+      handleRecordToolNote(
+        {
+          package_id: "filesystem",
+          tool_id: "read_file",
+          remove: 1,
+        } as any,
+        catalog,
+        store,
+      ),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.INVALID_PARAMS,
+      message: expect.stringContaining("remove must be a boolean"),
+    });
+    expect(await storedNote("filesystem", "read_file")).toBe(
+      "Keep this note.",
+    );
   });
 
   it("passes removal rejection reasons through without claiming not_found", async () => {
@@ -354,7 +439,12 @@ describe("server registration contract", () => {
           type: "object",
           properties: {
             package_id: { type: "string" },
-            tool_id: { type: "string" },
+            tool_id: {
+              type: "string",
+              description: expect.stringContaining(
+                "remove only the leading '<package_id>__' prefix",
+              ),
+            },
             note: { type: "string" },
             remove: { type: "boolean", default: false },
           },

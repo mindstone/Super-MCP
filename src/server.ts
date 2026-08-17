@@ -778,7 +778,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
                 tool_id: {
                   type: "string",
                   description:
-                    "Bare canonical tool name from list_tools (e.g. 'read_file'), not the combined discovery form 'package__tool'.",
+                    "Bare canonical tool name (e.g. 'read_file'). list_tools returns namespaced IDs; remove only the leading '<package_id>__' prefix and pass the remainder unchanged (e.g. 'package__tool__name' becomes 'tool__name').",
                   examples: ["read_file", "search_repositories"],
                 },
                 note: {
