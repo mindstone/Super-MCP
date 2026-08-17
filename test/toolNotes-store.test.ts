@@ -640,6 +640,24 @@ describe("ToolNotesStore", () => {
     );
   });
 
+  it("sizes the read buffer from fstat while retaining the ceiling probe byte", async () => {
+    const raw = JSON.stringify({
+      version: STORE_VERSION,
+      notes: {
+        [makeToolNoteKey("filesystem", "read_file")]: liveEntry("small note"),
+      },
+    });
+    await writeRaw(raw);
+    const allocation = vi.spyOn(Buffer, "allocUnsafe");
+
+    try {
+      expect(await store().readSnapshot()).toHaveLength(1);
+      expect(allocation).toHaveBeenCalledWith(Buffer.byteLength(raw) + 1);
+    } finally {
+      allocation.mockRestore();
+    }
+  });
+
   it("does not parse or overwrite oversized files on record or removal", async () => {
     const subject = store();
     const oversized = " ".repeat(MAX_FILE_BYTES + 64 * 1024);

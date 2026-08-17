@@ -225,6 +225,31 @@ describe("handleRecordToolNote", () => {
     );
   });
 
+  it("rejects package IDs that get_tool_details can never address", async () => {
+    const delimiterCatalog = createMockCatalog({
+      filesystem__archive: {
+        read_file: { schemaHash: "hash-read-file" },
+      },
+    });
+
+    await expect(
+      handleRecordToolNote(
+        {
+          package_id: "filesystem__archive",
+          tool_id: "read_file",
+          note: "This note could never surface.",
+        },
+        delimiterCatalog,
+        store,
+      ),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.INVALID_PARAMS,
+      message: expect.stringContaining("could never be retrieved"),
+    });
+    expect(delimiterCatalog.getTool).not.toHaveBeenCalled();
+    expect(await store.readSnapshot()).toEqual([]);
+  });
+
   it("records an exact canonical bare tool name containing __", async () => {
     const embeddedDelimiterCatalog = createMockCatalog({
       filesystem: {
@@ -268,23 +293,80 @@ describe("handleRecordToolNote", () => {
   });
 
   it.each([
+    ["missing arguments", undefined, "arguments must be an object"],
+    ["null arguments", null, "arguments must be an object"],
+    ["string arguments", "invalid", "arguments must be an object"],
+    ["array arguments", [], "arguments must be an object"],
+    [
+      "a missing package_id",
+      { tool_id: "read_file", note: "note" },
+      "package_id",
+    ],
+    [
+      "a non-string package_id",
+      { package_id: 42, tool_id: "read_file", note: "note" },
+      "package_id",
+    ],
+    [
+      "an empty package_id",
+      { package_id: "  ", tool_id: "read_file", note: "note" },
+      "package_id",
+    ],
+    [
+      "a missing tool_id",
+      { package_id: "filesystem", note: "note" },
+      "tool_id",
+    ],
+    [
+      "a non-string tool_id",
+      { package_id: "filesystem", tool_id: 42, note: "note" },
+      "tool_id",
+    ],
+    [
+      "an empty tool_id",
+      { package_id: "filesystem", tool_id: "  ", note: "note" },
+      "tool_id",
+    ],
+    [
+      "a missing note",
+      { package_id: "filesystem", tool_id: "read_file" },
+      "note is required",
+    ],
+    [
+      "a non-string note",
+      { package_id: "filesystem", tool_id: "read_file", note: 42 },
+      "note must be a string",
+    ],
+  ])("returns invalid params for %s", async (_label, input, message) => {
+    await expect(
+      handleRecordToolNote(input as any, catalog, store),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.INVALID_PARAMS,
+      message: expect.stringContaining(message),
+    });
+  });
+
+  it.each([
     ["text", "still here"],
     ["empty string", ""],
     ["null", null],
     ["non-string", 42],
   ])("rejects remove combined with a present %s note", async (_label, note) => {
-    const result = await handleRecordToolNote(
-      {
-        package_id: "filesystem",
-        tool_id: "read_file",
-        note,
-        remove: true,
-      } as any,
-      catalog,
-      store,
-    );
-    expect(parseResponse(result).message).toContain("remove: true");
-    expect(result.isError).toBe(true);
+    await expect(
+      handleRecordToolNote(
+        {
+          package_id: "filesystem",
+          tool_id: "read_file",
+          note,
+          remove: true,
+        } as any,
+        catalog,
+        store,
+      ),
+    ).rejects.toMatchObject({
+      code: ERROR_CODES.INVALID_PARAMS,
+      message: expect.stringContaining("remove: true"),
+    });
   });
 
   it.each([
@@ -432,8 +514,8 @@ describe("server registration contract", () => {
       expect(
         advertised.tools.find((tool) => tool.name === "record_tool_note"),
       ).toMatchObject({
-        description: expect.stringContaining(
-          "Notes are limited to 200 characters",
+        description: expect.stringMatching(
+          /shown on future matching-schema detail requests for up to 30 days.*Notes are limited to 200 characters/,
         ),
         inputSchema: {
           type: "object",

@@ -33,11 +33,22 @@ function makeResponse(payload: Record<string, unknown>, isError = false) {
   };
 }
 
+function invalidParams(message: string): never {
+  throw {
+    code: ERROR_CODES.INVALID_PARAMS,
+    message,
+  };
+}
+
 export async function handleRecordToolNote(
   input: RecordToolNoteInput,
   catalog: Catalog,
   store?: ToolNotesStore,
 ): Promise<any> {
+  if (!input || typeof input !== "object" || Array.isArray(input)) {
+    invalidParams("record_tool_note arguments must be an object.");
+  }
+
   const notesStore = resolveStore(store);
   const package_id = input.package_id;
   const tool_id = input.tool_id;
@@ -48,53 +59,41 @@ export async function handleRecordToolNote(
   const note = input.note;
 
   if (remove !== undefined && typeof remove !== "boolean") {
-    throw {
-      code: ERROR_CODES.INVALID_PARAMS,
-      message: "remove must be a boolean.",
-    };
+    invalidParams("remove must be a boolean.");
   }
 
-  if (
-    !package_id ||
-    typeof package_id !== "string" ||
-    package_id.trim().length === 0
-  ) {
-    return makeResponse(
-      {
-        status: "error",
-        message: "package_id is required and must be a non-empty string.",
-      },
-      true,
+  if (typeof package_id !== "string" || package_id.trim().length === 0) {
+    invalidParams("package_id is required and must be a non-empty string.");
+  }
+
+  if (package_id.includes("__")) {
+    invalidParams(
+      "package_id cannot contain '__' because get_tool_details uses that delimiter to separate package and tool IDs; a note for this package could never be retrieved.",
     );
   }
 
-  if (!tool_id || typeof tool_id !== "string" || tool_id.trim().length === 0) {
-    return makeResponse(
-      {
-        status: "error",
-        message: "tool_id is required and must be a non-empty string.",
-      },
-      true,
-    );
+  if (typeof tool_id !== "string" || tool_id.trim().length === 0) {
+    invalidParams("tool_id is required and must be a non-empty string.");
   }
 
+  let noteToRecord: string | undefined;
   if (remove === true && Object.prototype.hasOwnProperty.call(input, "note")) {
-    return makeResponse(
-      {
-        status: "error",
-        message: "remove: true cannot be combined with a note.",
-      },
-      true,
-    );
+    invalidParams("remove: true cannot be combined with a note.");
+  } else if (remove !== true) {
+    if (note === undefined || note === null) {
+      invalidParams("note is required unless remove is true.");
+    }
+    if (typeof note !== "string") {
+      invalidParams("note must be a string.");
+    }
+    noteToRecord = note;
   }
 
   const cachedTool = await catalog.getTool(package_id, tool_id);
   if (!cachedTool && tool_id.includes("__")) {
-    throw {
-      code: ERROR_CODES.INVALID_PARAMS,
-      message:
-        "tool_id must be the bare canonical tool name. list_tools returns namespaced IDs; remove only the leading '<package_id>__' prefix and pass the remainder unchanged (for example, 'package__tool__name' becomes 'tool__name').",
-    };
+    invalidParams(
+      "tool_id must be the bare canonical tool name. list_tools returns namespaced IDs; remove only the leading '<package_id>__' prefix and pass the remainder unchanged (for example, 'package__tool__name' becomes 'tool__name').",
+    );
   }
 
   const packageStatus = catalog.getPackageStatus(package_id);
@@ -125,21 +124,11 @@ export async function handleRecordToolNote(
     );
   }
 
-  if (note === undefined || note === null) {
-    return makeResponse(
-      { status: "error", message: "note is required unless remove is true." },
-      true,
-    );
+  if (noteToRecord === undefined) {
+    invalidParams("note is required unless remove is true.");
   }
 
-  if (typeof note !== "string") {
-    return makeResponse(
-      { status: "error", message: "note must be a string." },
-      true,
-    );
-  }
-
-  const normalized = normalizeNoteText(note);
+  const normalized = normalizeNoteText(noteToRecord);
   if (!normalized.ok) {
     logger.warn("record_tool_note rejected note text", {
       package_id,

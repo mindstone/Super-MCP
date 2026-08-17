@@ -39,7 +39,17 @@ Standard JSON-RPC error indicating the request parameters are malformed or missi
 - Missing required parameters in the request
 - Malformed JSON in the request body
 - Wrong parameter types (e.g., string instead of object)
+- Mutually exclusive parameters supplied together
 - Extra unrecognized parameters (in strict mode)
+
+`record_tool_note` uses `-32602` for request-shape errors: missing, empty, or
+wrongly typed `package_id`, `tool_id`, `note`, or `remove` fields; combining a
+note with `remove: true`; a `package_id` containing `__`; and a namespaced
+`tool_id` that does not resolve as an exact bare tool name. Once the request
+shape is valid, domain outcomes remain tool results: `not_found` means the tool
+or note does not exist, while `rejected` carries note-policy or store reasons
+such as the 200-character limit, capacity, an unsupported store version, or a
+retryable lock conflict.
 
 **Solutions:**
 1. Check that all required parameters are present

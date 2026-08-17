@@ -766,7 +766,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           {
             name: "record_tool_note",
             description:
-              "Save or replace one short note for a tool, shown next time its details are requested. Use only for durable lessons not obvious from the schema; never record secrets or transient failures. Notes are limited to 200 characters and expire within 30 days. Use `remove: true` to delete one.",
+              "Save or replace one short note for a tool, shown on future matching-schema detail requests for up to 30 days. Use only for durable lessons not obvious from the schema; never record secrets or transient failures. Notes are limited to 200 characters. Use `remove: true` to delete one.",
             inputSchema: {
               type: "object",
               properties: {

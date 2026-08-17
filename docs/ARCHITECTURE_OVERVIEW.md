@@ -22,7 +22,8 @@ High-level overview of Super-MCP's component architecture and request flow.
 │  (MCP Server)       │  list_tools, get_tool_details,        │
 │                     │  use_tool, search_tools, get_help,     │
 │                     │  authenticate, health_check_all,       │
-│                     │  health_check, restart_package         │
+│                     │  health_check, restart_package,        │
+│                     │  record_tool_note                      │
 ├─────────────────────┼───────────────────────────────────────┤
 │  registry.ts        │  Config loading, package management,   │
 │  (PackageRegistry)  │  client lifecycle, connection caching  │
@@ -45,6 +46,8 @@ High-level overview of Super-MCP's component architecture and request flow.
 | **MCP Server** | `server.ts` | Exposes meta-tools to Claude, routes requests to handlers |
 | **PackageRegistry** | `registry.ts` | Loads config files, manages MCP client instances, handles connection lifecycle |
 | **Catalog** | `catalog.ts` | Discovers tools from connected MCPs, caches schemas, tracks catalog changes via ETags |
+| **Tool Note Handler** | `handlers/recordToolNote.ts` | Validates note recording and removal requests and resolves the exact catalog tool |
+| **Tool Notes Store** | `toolNotes.ts` | Persists bounded, expiring per-tool notes shared by the OS user |
 | **SecurityPolicy** | `security.ts` | Enforces allowlist/blocklist rules, supports regex patterns, hot-reloads on config changes |
 | **MCP Clients** | `clients/` | Transport-specific implementations for STDIO and HTTP connections |
 

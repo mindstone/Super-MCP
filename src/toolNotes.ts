@@ -18,7 +18,6 @@ export const MAX_SCHEMA_HASH_CHARS = 128;
 export const STORE_VERSION = 1;
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
-const READ_BUFFER_BYTES = MAX_FILE_BYTES + 1;
 
 export interface ToolNoteEntry {
   note: string;
@@ -300,22 +299,28 @@ export class ToolNotesStore {
     }
 
     const analysis = this.analyzeNotes(state.data.notes, this.clock());
-    const snapshot = Object.entries(analysis.visibleNotes).map(
-      ([key, entry]) => {
-        const parsedKey = parseCanonicalToolNoteKey(key);
-        if (!parsedKey) {
-          throw new Error("Tool note analysis returned a non-canonical key.");
-        }
-        return {
-          packageId: parsedKey.packageId,
-          toolName: parsedKey.toolName,
-          note: entry.note,
-          written_at: entry.written_at,
-          expires_at: entry.expires_at,
-          schema_hash: entry.schema_hash,
-        };
-      },
-    );
+    const snapshot: LiveToolNote[] = [];
+    for (const [key, entry] of Object.entries(analysis.visibleNotes)) {
+      const parsedKey = parseCanonicalToolNoteKey(key);
+      if (!parsedKey) {
+        logger.warn(
+          "tool notes snapshot skipped a non-canonical key after analysis",
+          {
+            file_path: this.filePath,
+            key_length: key.length,
+          },
+        );
+        continue;
+      }
+      snapshot.push({
+        packageId: parsedKey.packageId,
+        toolName: parsedKey.toolName,
+        note: entry.note,
+        written_at: entry.written_at,
+        expires_at: entry.expires_at,
+        schema_hash: entry.schema_hash,
+      });
+    }
 
     if (analysis.needsCompaction) {
       this.scheduleBestEffortCompaction({
@@ -328,8 +333,7 @@ export class ToolNotesStore {
 
   /**
    * Re-read under the lock and remove only snapshot entries that are still
-   * byte-for-byte unchanged. Stage 2 can use this for schema-stale cleanup
-   * without deleting a concurrent replacement.
+   * byte-for-byte unchanged, without deleting a concurrent replacement.
    */
   async compactSnapshotEntries(
     entriesToRemove: readonly LiveToolNote[] = [],
@@ -669,7 +673,8 @@ export class ToolNotesStore {
     try {
       const handle = await fs.open(this.filePath, "r");
       try {
-        const buffer = Buffer.allocUnsafe(READ_BUFFER_BYTES);
+        const { size } = await handle.stat();
+        const buffer = Buffer.allocUnsafe(Math.min(size, MAX_FILE_BYTES) + 1);
         let totalBytesRead = 0;
         while (totalBytesRead < buffer.byteLength) {
           const { bytesRead } = await handle.read(
