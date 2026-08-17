@@ -431,7 +431,7 @@ describe("handleBulkExport", () => {
 
   it("blocks self-recursion into SuperMCP meta tools before any tool call", async () => {
     const callTool = vi.fn();
-    for (const metaTool of ["bulk_export", "use_tool", "search_tools", "authenticate"]) {
+    for (const metaTool of ["bulk_export", "use_tool", "search_tools", "authenticate", "record_tool_note"]) {
       const result = await handleBulkExport(
         { package_id: PACKAGE_ID, tool_id: metaTool, args: {}, output_file: `recursion-${metaTool}.ndjson` },
         createRegistry(callTool),
