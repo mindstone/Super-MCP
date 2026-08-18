@@ -10,6 +10,10 @@
 // See: docs/plans/260817_chunk9-supermcp-connector/PLAN.md Stage A2.
 // NOTE: `test` (not `src/handlers/__tests__`): vitest.config.ts includes both;
 // the other useTool integration harnesses live here.
+// The capacity/eviction test below loads a FRESH useTool module instance
+// (vi.resetModules + dynamic import) so it starts from an empty
+// validationAttemptMap — module-global state would otherwise couple it to
+// whatever earlier tests in this file left behind (reviewer F2).
 
 import { describe, expect, it, vi } from "vitest";
 import { handleUseTool } from "../src/handlers/useTool.js";
@@ -57,11 +61,29 @@ function createMocks() {
 
 type Mocks = ReturnType<typeof createMocks>;
 
+/**
+ * Load a FRESH useTool module instance (empty module-global
+ * validationAttemptMap). Without this, the eviction test silently depends on
+ * residue left by earlier tests in this file: residue entries sit at the FRONT
+ * of the Map (older than any key this test seeds), so the 498-filler fill would
+// evict them instead of reaching an exact 500, and a key rename / added test /
+// `-t` reordering could silently change the eviction victim (reviewer F2).
+ */
+async function loadFreshUseTool(): Promise<typeof import("../src/handlers/useTool.js")> {
+  vi.resetModules();
+  return import("../src/handlers/useTool.js");
+}
+
 /** Drive one guaranteed arg-validation failure for (packageId, toolId). */
-async function failingCall(packageId: string, toolId: string, mocks: Mocks): Promise<{ code: unknown; message: string }> {
+async function failingCall(
+  packageId: string,
+  toolId: string,
+  mocks: Mocks,
+  useToolImpl: typeof handleUseTool = handleUseTool,
+): Promise<{ code: unknown; message: string }> {
   let caught: unknown;
   try {
-    await handleUseTool(
+    await useToolImpl(
       { package_id: packageId, tool_id: toolId, args: {} },
       mocks.mockRegistry,
       mocks.mockCatalog,
@@ -92,35 +114,40 @@ describe("useTool validationAttemptMap — threshold and bounded LRU", () => {
   });
 
   it("past capacity, evicts ONLY the oldest entry and preserves a recently-touched counter (clear() regression)", async () => {
+    // Fresh module → empty map: self-contained, order-independent. The
+    // statically imported handleUseTool's map may carry residue from the
+    // threshold test above (or any future sibling test).
+    const { handleUseTool: freshUseTool } = await loadFreshUseTool();
     const mocks = createMocks();
 
     // Longest-lived key (`oldest_tool`) is inserted first → LRU victim.
-    await failingCall("LRUPkg", "oldest_tool", mocks);
-    await failingCall("LRUPkg", "oldest_tool", mocks);
+    await failingCall("LRUPkg", "oldest_tool", mocks, freshUseTool);
+    await failingCall("LRUPkg", "oldest_tool", mocks, freshUseTool);
 
     // Recently-touched key (`anchor_tool`) — counter 2 that must survive.
-    await failingCall("LRUPkg", "anchor_tool", mocks);
-    await failingCall("LRUPkg", "anchor_tool", mocks);
+    await failingCall("LRUPkg", "anchor_tool", mocks, freshUseTool);
+    await failingCall("LRUPkg", "anchor_tool", mocks, freshUseTool);
 
-    // Fill to exactly MAX_ATTEMPT_MAP_SIZE (500): +498 distinct keys.
+    // Fill to exactly MAX_ATTEMPT_MAP_SIZE (500): 2 seeded keys + 498 distinct
+    // fillers — no eviction happens during the fill.
     for (let i = 0; i < 498; i++) {
-      await failingCall(`LRUPkgFill${i}`, "fill_tool", mocks);
+      await failingCall(`LRUPkgFill${i}`, "fill_tool", mocks, freshUseTool);
     }
 
     // Touch the anchor at capacity: its 3rd failure must still carry the
     // terminal guidance. Under the old code this increment hit the >=500 cap,
     // clear()ed the whole map, and the anchor restarted at attempt 1 with no
     // guidance — the regression this stage fixes.
-    const anchorThird = await failingCall("LRUPkg", "anchor_tool", mocks);
+    const anchorThird = await failingCall("LRUPkg", "anchor_tool", mocks, freshUseTool);
     expect(anchorThird.message).toContain(STOP_RETRYING_SUBSTRING);
 
     // Overflow one more distinct key: with true LRU only the oldest entry
     // (oldest_tool) is evicted.
-    await failingCall("LRUOverflowPkg", "spill_tool", mocks);
+    await failingCall("LRUOverflowPkg", "spill_tool", mocks, freshUseTool);
 
     // The evicted key restarts from 1 — its 3rd overall failure shows no
     // guidance (counter was evicted with the entry).
-    const oldestThird = await failingCall("LRUPkg", "oldest_tool", mocks);
+    const oldestThird = await failingCall("LRUPkg", "oldest_tool", mocks, freshUseTool);
     expect(oldestThird.message).not.toContain(STOP_RETRYING_SUBSTRING);
   });
 });

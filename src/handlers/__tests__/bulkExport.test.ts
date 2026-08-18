@@ -2,7 +2,8 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { handleBulkExport, BULK_EXPORT_MAX_PAGE_BYTES } from "../bulkExport.js";
+import { handleBulkExport, BULK_EXPORT_MAX_PAGE_BYTES, parseInput } from "../bulkExport.js";
+import { ERROR_CODES, type BulkExportInput } from "../../types.js";
 import { Catalog } from "../../catalog.js";
 import type { PackageRegistry } from "../../registry.js";
 
@@ -605,5 +606,52 @@ describe("handleBulkExport", () => {
     expect(result.status).toBe("failed");
     expect(result.pages).toBe(0);
     expect(result.errors?.[0]).toContain("raw output exceeded 10MB");
+  });
+});
+
+describe("handleBulkExport — missing package_id parse contract (stage review F1)", () => {
+  it("parseInput throws the coded INVALID_PARAMS shape with data.field naming package_id", () => {
+    let caught: unknown;
+    try {
+      parseInput({
+        tool_id: "search_records",
+        args: {},
+        output_file: "out.ndjson",
+      } as BulkExportInput);
+    } catch (error) {
+      caught = error;
+    }
+
+    expect(caught).toMatchObject({
+      code: ERROR_CODES.INVALID_PARAMS,
+      message: "package_id is required unless tool_id is namespaced like 'Package__tool_name'.",
+      data: { field: "package_id" },
+    });
+  });
+
+  it("handleBulkExport converts the coded parse throw into an actionable error response", async () => {
+    const ensurePackageLoaded = vi.fn().mockResolvedValue(undefined);
+    const catalog = {
+      ensurePackageLoaded,
+      getPackageStatus: vi.fn().mockReturnValue("ready"),
+      getPackageError: vi.fn().mockReturnValue(undefined),
+      getTool: vi.fn(),
+    } as unknown as Catalog;
+
+    const result = await handleBulkExport(
+      { tool_id: "search_records", args: {}, output_file: "out.ndjson" } as BulkExportInput,
+      createRegistry(vi.fn()),
+      catalog,
+    );
+
+    // Parse-time rejection happens before any package loading — the fail-fast
+    // contract, mirroring the list_tools A1 guard.
+    expect(ensurePackageLoaded).not.toHaveBeenCalled();
+    expect(result.isError).toBe(true);
+    // toErrorMessage (formatError) must preserve the coded throw's message —
+    // a String(error) fallback would collapse it to "[object Object]".
+    expect(result.content[0].text).toContain(
+      "package_id is required unless tool_id is namespaced like 'Package__tool_name'.",
+    );
   });
 });

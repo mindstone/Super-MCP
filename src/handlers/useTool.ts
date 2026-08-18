@@ -650,6 +650,10 @@ function incrementValidationAttempt(key: string): number {
   // Read the counter BEFORE any mutation: the recency refresh below deletes
   // the key, and reading after the delete would always see undefined and reset
   // the counter to 1 on every access.
+  // Accepted residual: an idle key evicted at capacity restarts its counter at
+  // 1 (a widely-interleaved caller gets up to ~2 extra attempts) — do NOT "fix"
+  // this by exempting keys from eviction; that would unbound the map and
+  // re-arm the 260806 retry loop.
   const current = validationAttemptMap.get(key) ?? 0;
   if (validationAttemptMap.has(key)) {
     // Refresh recency on access: delete + re-set moves the key to the end of
