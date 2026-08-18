@@ -7,9 +7,14 @@ import { Catalog } from "../catalog.js";
 import { getLogger } from "../logging.js";
 import { PackageRegistry } from "../registry.js";
 import { getSecurityPolicy } from "../security.js";
-import { BulkExportInput, BulkExportOutput, ERROR_CODES } from "../types.js";
-import { coerceStringifiedJson, coerceStringifiedNumber } from "../utils/normalizeInput.js";
-import { formatError } from "../utils/formatError.js";
+import { BulkExportInput, BulkExportOutput } from "../types.js";
+import {
+  coerceStringifiedJson,
+  coerceStringifiedNumber,
+  isMissingPackageId,
+  packageIdRequiredMessage,
+  PACKAGE_DISCOVERY_HINT,
+} from "../utils/normalizeInput.js";
 
 const logger = getLogger();
 
@@ -144,11 +149,8 @@ interface RunBulkExportParams {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
-// Delegates to the shared formatError so coded handler errors (plain
-// { code, message, data } objects, e.g. the INVALID_PARAMS package_id
-// contract in parseNamespacedTool) keep their actionable message when
-// converted to an error response instead of collapsing to "[object Object]".
-const toErrorMessage = formatError;
+const toErrorMessage = (error: unknown): string =>
+  error instanceof Error ? error.message : String(error);
 
 function truncateErrorDiagnostic(message: string): string {
   if (message.length <= BULK_EXPORT_ERROR_DIAGNOSTIC_CHARS) {
@@ -269,22 +271,20 @@ function parseNamespacedTool(packageId: string | undefined, toolId: string): { p
     };
   }
 
-  if (!packageId) {
-    // Coded contract (stage-review F1): same INVALID_PARAMS shape as the
-    // list_tools A1 guard — no prose-only signalling. handleBulkExport
-    // converts this to an error response via toErrorMessage, which preserves
-    // the message.
-    throw {
-      code: ERROR_CODES.INVALID_PARAMS,
-      message: "package_id is required unless tool_id is namespaced like 'Package__tool_name'.",
-      data: { field: "package_id" },
-    };
+  if (typeof packageId !== "string" || isMissingPackageId(packageId)) {
+    // Shared validation (residue-chunk9 item 3, origin 260811#R4): catches the
+    // stringified "undefined"/"null" shapes the old falsy check missed, and
+    // points the caller at the discovery tool instead of a bare "required".
+    throw new Error(
+      `${packageIdRequiredMessage("bulk_export", packageId)} ` +
+        `Alternatively, pass a namespaced tool_id like 'Package__tool_name'.`,
+    );
   }
 
   return { packageId, toolId };
 }
 
-export function parseInput(input: BulkExportInput): ParsedBulkExportInput {
+function parseInput(input: BulkExportInput): ParsedBulkExportInput {
   const normalizedArgs = coerceStringifiedJson<Record<string, unknown>>(input.args, "object", {
     handler: "bulk_export",
     field: "args",
@@ -792,7 +792,10 @@ function validateSecurityPolicy(packageId: string, toolId: string, registry: Pac
 
   const packageConfig = registry.getPackage(packageId);
   if (!packageConfig) {
-    return `Package not found: ${packageId}`;
+    // bulk_export returns error responses rather than throwing coded JSON-RPC
+    // errors, so no server-level advice gets appended here — the discovery hint
+    // must be in the message itself (residue-chunk9 item 3).
+    return `Package not found: ${packageId}. ${PACKAGE_DISCOVERY_HINT}`;
   }
 
   if (securityPolicy.isAdminDisabled(packageConfig.catalogId, toolId)) {

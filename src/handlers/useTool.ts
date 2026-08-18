@@ -23,6 +23,7 @@ import {
   canonicalKeyNormalize,
   coerceArgsToSchema,
   formatAutoRepairBreadcrumb,
+  requirePackageId,
   type AutoRepairBreadcrumb,
 } from "../utils/normalizeInput.js";
 import { materializeOutput, extractImageContentBlocks, SUPPORTED_IMAGE_MIME_TYPES } from "./materializeOutput.js";
@@ -1372,6 +1373,16 @@ export async function handleUseTool(
       };
     }
   }
+
+  // A package_id that none of the fallbacks above could materialize used to
+  // fall through to "Package not found: undefined" / "Package 'undefined' is
+  // unavailable" — opaque to the model (residue-chunk9 item 3, origin
+  // 260811#R4). Fail fast with discovery guidance instead. This MUST stay
+  // below the namespaced-tool_id (case 1) and R5 bare-tool-name resolvers —
+  // those are supported no-package_id call shapes — and above the alias /
+  // security lookups that assume a usable id. (parseUseToolInput deliberately
+  // does not enforce package_id for the same reason.)
+  package_id = requirePackageId(package_id, { handler: "use_tool" });
 
   // R2 — bare package-alias resolver. When the agent passes the base server
   // name (e.g. "GoogleWorkspace") instead of a multi-instance package id

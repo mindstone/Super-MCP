@@ -2,7 +2,10 @@ import { ListToolsInput, ListToolsOutput, ERROR_CODES, ToolInfo } from "../types
 import { Catalog } from "../catalog.js";
 import { PackageRegistry } from "../registry.js";
 import { computeSecurityAnnotation, extractRawToolId } from "./annotateToolSecurity.js";
-import { coerceStringifiedNumber } from "../utils/normalizeInput.js";
+import {
+  coerceStringifiedNumber,
+  requirePackageId,
+} from "../utils/normalizeInput.js";
 
 export async function handleListTools(
   input: ListToolsInput,
@@ -21,17 +24,12 @@ export async function handleListTools(
   // See: anthropics/claude-code#25865
   page_size = coerceStringifiedNumber(page_size, { handler: "list_tools", field: "page_size" }) as typeof page_size;
 
-  // Required-parameter pre-validation: list_tools cannot operate without a
-  // package_id. Guarding up front turns the misleading "Package 'undefined' is
-  // unavailable" (ensurePackageLoaded falling through to the status branch)
-  // into an actionable contract error naming the absent field.
-  if (typeof package_id !== "string" || package_id.trim().length === 0) {
-    throw {
-      code: ERROR_CODES.INVALID_PARAMS,
-      message: "Missing required parameter: package_id",
-      data: { field: "package_id" },
-    };
-  }
+  // Fail fast on a package_id that never usefully arrived (missing/empty/
+  // "undefined") instead of letting it flow into the catalog and surface as an
+  // opaque "Package 'undefined' is unavailable: …". Shared helper keeps the
+  // message (and its list_tool_packages guidance) identical across handlers.
+  // Residue-chunk9 item 3, origin 260811_degenerate-output-handling#R4.
+  package_id = requirePackageId(package_id, { handler: "list_tools" });
 
   if (detail !== "lite" && detail !== "full") {
     throw {

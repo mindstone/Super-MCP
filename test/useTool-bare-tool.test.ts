@@ -9,6 +9,7 @@ import { handleUseTool } from "../src/handlers/useTool.js";
 import { PackageRegistry } from "../src/registry.js";
 import { Catalog } from "../src/catalog.js";
 import type { PackageConfig } from "../src/types.js";
+import { ERROR_CODES } from "../src/types.js";
 import { ValidationResult } from "../src/validator.js";
 
 function makePackageConfig(id: string, name = id): PackageConfig {
@@ -139,7 +140,11 @@ describe("useTool R5 — bare tool-name resolver", () => {
     });
   });
 
-  it("falls through to PACKAGE_NOT_FOUND when bare tool matches no loaded packages", async () => {
+  it("rejects with actionable INVALID_PARAMS when bare tool matches no loaded packages", async () => {
+    // residue-chunk9 item 3 (origin 260811#R4): a package_id no fallback could
+    // materialize used to fall through to "Package not found: undefined"
+    // (PACKAGE_NOT_FOUND) — opaque to the model. Now it fails fast with the
+    // shared package_id validation naming the discovery tool.
     const { mockRegistry, mockCatalog, mockValidator } = createMocks({
       packages: [makePackageConfig("Slack-mindstone")],
       toolMatches: [],
@@ -156,7 +161,8 @@ describe("useTool R5 — bare tool-name resolver", () => {
       mockCatalog,
       mockValidator,
     )).rejects.toMatchObject({
-      message: expect.stringContaining("Package not found:"),
+      code: ERROR_CODES.INVALID_PARAMS,
+      message: expect.stringContaining("list_tool_packages"),
     });
   });
 });

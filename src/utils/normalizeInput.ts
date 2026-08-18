@@ -9,6 +9,7 @@
  */
 
 import { getLogger } from "../logging.js";
+import { ERROR_CODES } from "../types.js";
 import {
   getAliasesForTool,
   RESERVED_TOP_LEVEL_KEYS,
@@ -96,6 +97,78 @@ export function coerceStringifiedNumber(
 
   logger.warn("Coerced stringified number (upstream model bug)", context);
   return parsed;
+}
+
+/* ------------------------------------------------------------------------- *
+ * package_id presence validation (residue-chunk9 item 3, origin
+ * 260811_degenerate-output-handling#R4 / diagnosis-B F3).
+ *
+ * When a model calls a package-scoped meta-tool with a missing/empty/
+ * `"undefined"` package_id, the handlers used to fall through to opaque errors
+ * like "Package 'undefined' is unavailable: …" that taught the caller nothing.
+ * These helpers give every handler ONE definition of "the package_id never
+ * arrived" and ONE recovery message that names the discovery tool, so the
+ * model can self-correct in a single step.
+ *
+ * Deliberately INVALID_PARAMS (-32602), the code these handlers already use
+ * for malformed envelope input — NOT ARG_VALIDATION_FAILED (-33003), which is
+ * the tool-argument repair-ticket machinery (and, on the host side,
+ * substring-classified + retry-counted; see handlers/useToolInput.ts).
+ * ------------------------------------------------------------------------- */
+
+/** Recovery clause shared by every package-scoped error message below. */
+export const PACKAGE_DISCOVERY_HINT =
+  "Call 'list_tool_packages()' to see available packages.";
+
+function describeReceivedValue(value: unknown): string {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (value === null || value === undefined || typeof value !== "object") {
+    return String(value);
+  }
+  return Array.isArray(value) ? "array" : "object";
+}
+
+/**
+ * True when `packageId` cannot name a package: missing, non-string,
+ * empty/whitespace-only, or the stringified JS `undefined`/`null` the model
+ * sometimes sends when it meant to omit the argument entirely (the exact
+ * shape behind the original "Package 'undefined' is unavailable" reports).
+ */
+export function isMissingPackageId(packageId: unknown): boolean {
+  if (typeof packageId !== "string") return true;
+  const trimmed = packageId.trim();
+  return trimmed === "" || trimmed === "undefined" || trimmed === "null";
+}
+
+/** Actionable message for a package_id that never usefully arrived. */
+export function packageIdRequiredMessage(toolName: string, received: unknown): string {
+  return `"package_id" is required for ${toolName} (received ${describeReceivedValue(received)}). ${PACKAGE_DISCOVERY_HINT}`;
+}
+
+/**
+ * Validate the `package_id` envelope field of a package-scoped meta-tool call.
+ * Throws INVALID_PARAMS (-32602) with a message naming the discovery tool;
+ * returns the trimmed package_id. Callers that resolve a package_id through
+ * fallbacks (use_tool's namespaced/bare-tool_id resolvers) must call this only
+ * AFTER those fallbacks, so the supported no-package_id call shapes keep
+ * working.
+ */
+export function requirePackageId(
+  packageId: unknown,
+  context: { handler: string },
+): string {
+  if (isMissingPackageId(packageId)) {
+    throw {
+      code: ERROR_CODES.INVALID_PARAMS,
+      message: packageIdRequiredMessage(context.handler, packageId),
+      data: {
+        field: "package_id",
+        handler: context.handler,
+        received: describeReceivedValue(packageId),
+      },
+    };
+  }
+  return (packageId as string).trim();
 }
 
 /**
