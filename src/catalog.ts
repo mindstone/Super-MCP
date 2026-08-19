@@ -34,7 +34,7 @@ function isLocalhostUrl(url?: string): boolean {
   } catch { return false; }
 }
 
-interface CachedTool {
+export interface CachedTool {
   packageId: string;
   tool: any;
   summary?: string;
@@ -51,7 +51,55 @@ interface PackageToolCache {
   lastError?: string;
 }
 
-export class Catalog {
+/** Read-only, synchronous view of an already-observed catalog snapshot. */
+export interface CatalogView {
+  countTools(packageId: string): number;
+  computePackageEmbeddingHash(packageId: string): string;
+  findToolByName(toolId: string): Array<{ packageId: string; toolId: string }>;
+  paginate(
+    packageId: string,
+    pageSize?: number,
+    pageToken?: string | null,
+  ): { items: CachedTool[]; next: string | null };
+  etag(): string;
+  getPackageEtag(packageId: string): string;
+  getPackageStatus(packageId: string): CatalogStatus | 'unknown';
+  getPackageError(packageId: string): string | undefined;
+  getCacheStats(): { packageCount: number; totalTools: number };
+  getPackageForResourceUri(uri: string): string | undefined;
+  getKnownResourcePrefixes(): string[];
+}
+
+/** Package facts required to shape catalog responses without connecting. */
+export type CatalogPackageMetadata = Pick<
+  PackageConfig,
+  'id' | 'name' | 'description' | 'transport' | 'visibility' | 'catalogId'
+>;
+
+export interface PackageMetadataView {
+  getPackage(packageId: string): CatalogPackageMetadata | undefined;
+  getPackages(): CatalogPackageMetadata[];
+}
+
+/** Mutation methods are deliberately excluded from CatalogView. */
+export interface CatalogWriter {
+  refreshPackage(packageId: string): Promise<void>;
+  ensurePackageLoaded(packageId: string): Promise<void>;
+  clear(): void;
+  clearPackage(packageId: string): void;
+  registerResourceUris(packageId: string, tools: unknown[]): void;
+  clearResourceUrisForPackage(packageId: string): void;
+}
+
+/**
+ * Queue-only scheduling seam. Implementations append work and return without
+ * synchronously entering refresh or connection code.
+ */
+export interface CatalogRefreshScheduler {
+  scheduleRefresh(packageId: string): void;
+}
+
+export class Catalog implements CatalogView {
   private cache: Map<string, PackageToolCache> = new Map();
   private registry: PackageRegistry;
   private globalEtag: string = "";

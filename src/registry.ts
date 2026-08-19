@@ -1,6 +1,17 @@
 import * as fs from "fs/promises";
 import * as path from "path";
-import { SuperMcpConfig, PackageConfig, McpClient, StandardServerConfig, ExtendedServerConfig, SkippedPackage, ValidationResult } from "./types.js";
+import {
+  SuperMcpConfig,
+  PackageConfig,
+  McpClient,
+  StandardServerConfig,
+  ExtendedServerConfig,
+  SkippedPackage,
+  ValidationResult,
+  type ConnectOutcome,
+  type PermanentConnectFailureClass,
+  type TransientConnectFailureClass,
+} from "./types.js";
 import { StdioMcpClient } from "./clients/stdioClient.js";
 import { HttpMcpClient } from "./clients/httpClient.js";
 import { SimpleOAuthProvider } from "./auth/providers/simple.js";
@@ -73,6 +84,67 @@ function isPermanentConnectFailure(error: unknown): boolean {
   }
 
   return false;
+}
+
+function classifyPermanentConnectFailure(error: unknown): PermanentConnectFailureClass {
+  const code = error instanceof Error
+    ? (error as Error & { code?: unknown }).code
+    : undefined;
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  if (code === "ENOENT" || message.includes("command not found") || message.includes("enoent")) {
+    return "executable_not_found";
+  }
+  if (code === "EACCES" || message.includes("permission denied") || message.includes("eacces")) {
+    return "permission_denied";
+  }
+  return "unknown";
+}
+
+function classifyTransientConnectFailure(error: unknown): TransientConnectFailureClass {
+  const code = error instanceof Error
+    ? (error as Error & { code?: unknown }).code
+    : undefined;
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  if (code === "ETIMEDOUT" || message.includes("timed out") || message.includes("timeout")) {
+    return "timeout";
+  }
+  if (code === "ECONNREFUSED" || message.includes("econnrefused") || message.includes("connection refused")) {
+    return "connection_refused";
+  }
+  if (code === "ECONNRESET" || message.includes("econnreset") || message.includes("connection reset")) {
+    return "connection_reset";
+  }
+  if (error instanceof Error) return "transport_error";
+  return "unknown";
+}
+
+function isAuthConnectFailure(config: PackageConfig, error: unknown): boolean {
+  return config.transport === "http" && error instanceof Error && (
+    error.message.includes("Unauthorized") ||
+    error.message.includes("401") ||
+    error.message.includes("invalid_token") ||
+    error.message.includes("authorization") ||
+    error.name === "UnauthorizedError"
+  );
+}
+
+function clientFromConnectOutcome(outcome: ConnectOutcome | McpClient): McpClient | undefined {
+  // The non-outcome branch supports tests that replace the private method.
+  if (!("kind" in outcome)) return outcome;
+  if (outcome.kind === "connected" || outcome.kind === "auth_required") {
+    return outcome.client;
+  }
+  return undefined;
+}
+
+function errorFromConnectOutcome(outcome: ConnectOutcome): unknown {
+  if (outcome.kind === "transient_failure" || outcome.kind === "permanent_failure") {
+    return outcome.error;
+  }
+  if (outcome.kind === "setup_incomplete") {
+    return new Error(`Package setup is incomplete: ${outcome.reason}`);
+  }
+  return new Error("Unexpected successful connect outcome");
 }
 
 function preserveFirstAttemptDiagnostics(
@@ -1224,13 +1296,16 @@ export class PackageRegistry {
   ): Promise<McpClient> {
     let firstClient: McpClient | undefined;
     try {
-      return await this.createAndConnectClient(
+      const outcome = await this.createAndConnectClient(
         packageId,
         config,
         (client) => {
           firstClient = client;
         },
       );
+      const connectedClient = clientFromConnectOutcome(outcome);
+      if (connectedClient) return connectedClient;
+      throw errorFromConnectOutcome(outcome);
     } catch (firstError) {
       if (firstClient) {
         try {
@@ -1268,7 +1343,9 @@ export class PackageRegistry {
       });
 
       try {
-        const client = await this.createAndConnectClient(packageId, config);
+        const outcome = await this.createAndConnectClient(packageId, config);
+        const client = clientFromConnectOutcome(outcome);
+        if (!client) throw errorFromConnectOutcome(outcome);
         this.connectRetryRecoveredCounts.set(
           packageId,
           (this.connectRetryRecoveredCounts.get(packageId) ?? 0) + 1,
@@ -1289,7 +1366,11 @@ export class PackageRegistry {
     packageId: string,
     config: PackageConfig,
     onClientCreated?: (client: McpClient) => void,
-  ): Promise<McpClient> {
+  ): Promise<ConnectOutcome> {
+    if (config.setupStatus?.state === "blocked") {
+      return { kind: "setup_incomplete", reason: config.setupStatus.reason };
+    }
+
     let client: McpClient;
     
     if (config.transport === "stdio") {
@@ -1313,28 +1394,32 @@ export class PackageRegistry {
       // Connect the client
       await client.connect();
     } catch (error) {
-      // Handle auth errors gracefully for HTTP clients
-      if (config.transport === "http" && error instanceof Error && 
-          (error.message.includes("Unauthorized") || 
-           error.message.includes("401") ||
-           error.message.includes("invalid_token") ||
-           error.message.includes("authorization") ||
-           error.name === "UnauthorizedError")) {
+      // Preserve the current caller-visible auth behavior while returning a
+      // typed outcome for the Stage 4 catalog writer.
+      if (isAuthConnectFailure(config, error)) {
         logger.info("Package requires authentication", {
           package_id: packageId,
           message: `Use 'authenticate(package_id: "${packageId}")' to sign in`,
           oauth_enabled: config.oauth === true,
         });
-        // Return the unconnected client - it will report as needing auth
-        // The HttpMcpClient's healthCheck will return "needs_auth"
-        return client;
-      } else {
-        // For non-auth errors and stdio errors, throw as normal
-        throw error;
+        return { kind: "auth_required", client, error };
       }
+
+      if (isPermanentConnectFailure(error)) {
+        return {
+          kind: "permanent_failure",
+          failureClass: classifyPermanentConnectFailure(error),
+          error,
+        };
+      }
+      return {
+        kind: "transient_failure",
+        failureClass: classifyTransientConnectFailure(error),
+        error,
+      };
     }
     
-    return client;
+    return { kind: "connected", client };
   }
 
   /**

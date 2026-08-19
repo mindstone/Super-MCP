@@ -13,7 +13,7 @@ export interface PackageSetupStatus {
   reason: SetupIncompleteReason;
 }
 
-export type CatalogStatus = 'ready' | 'auth_required' | 'setup_incomplete' | 'error';
+export type CatalogStatus = 'connecting' | 'ready' | 'auth_required' | 'setup_incomplete' | 'error';
 
 export interface StandardServerConfig {
   command?: string;
@@ -379,6 +379,31 @@ export interface McpClient {
   supportsResources?(): boolean;
   hasPendingRequests?(): boolean;
 }
+
+/** Stable categories used by the refresher's bounded retry policy. */
+export type TransientConnectFailureClass =
+  | 'timeout'
+  | 'connection_refused'
+  | 'connection_reset'
+  | 'transport_error'
+  | 'unknown';
+
+export type PermanentConnectFailureClass =
+  | 'executable_not_found'
+  | 'permission_denied'
+  | 'invalid_configuration'
+  | 'unknown';
+
+/**
+ * The complete result vocabulary for one upstream connection attempt.
+ * Stage 4 consumes this outcome to drive catalog status and retry scheduling.
+ */
+export type ConnectOutcome =
+  | { kind: 'connected'; client: McpClient }
+  | { kind: 'auth_required'; client: McpClient; error: unknown }
+  | { kind: 'setup_incomplete'; reason: SetupIncompleteReason }
+  | { kind: 'transient_failure'; failureClass: TransientConnectFailureClass; error: unknown }
+  | { kind: 'permanent_failure'; failureClass: PermanentConnectFailureClass; error: unknown };
 
 export interface AuthManager {
   beginAuth(packageId: string, config: AuthConfig): Promise<BeginAuthOutput>;
