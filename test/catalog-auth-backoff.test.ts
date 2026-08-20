@@ -3,6 +3,7 @@ import { Catalog } from "../src/catalog.js";
 import { PackageRegistry } from "../src/registry.js";
 import type {
   McpClient,
+  ConnectOutcome,
   PackageConfig,
   TransientConnectFailureClass,
 } from "../src/types.js";
@@ -80,7 +81,27 @@ describe("CatalogRefresher auth recovery and backoff", () => {
     vi.useRealTimers();
   });
 
-  it.fails("R7: auth retries are half-open or event-driven and remain single-flight through registry healthCheck", async () => {
+  it("passive callers reuse a cached auth-required client instead of reconnecting", async () => {
+    const registry = new PackageRegistry({ packages: [PACKAGE] });
+    const authClient = mcpClient({ health: "needs_auth" });
+    const registryInternals = registry as unknown as {
+      clients: Map<string, McpClient>;
+      createAndConnectClient(
+        packageId: string,
+        config: PackageConfig,
+      ): Promise<ConnectOutcome | McpClient>;
+    };
+    registryInternals.clients.set(PACKAGE.id, authClient);
+    const connectAttempt = vi.spyOn(registryInternals, "createAndConnectClient");
+
+    await expect(registry.getClient(PACKAGE.id)).resolves.toBe(authClient);
+
+    expect(connectAttempt).not.toHaveBeenCalled();
+    expect(authClient.close).not.toHaveBeenCalled();
+    expect(registryInternals.clients.get(PACKAGE.id)).toBe(authClient);
+  });
+
+  it("R7: auth retries are half-open or event-driven and remain single-flight through registry healthCheck", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-19T00:00:00.000Z"));
     const { CatalogRefresher } = await loadRefresherModule();
@@ -92,8 +113,17 @@ describe("CatalogRefresher auth recovery and backoff", () => {
       tools: [{ name: "list_events", inputSchema: { type: "object" } }],
     });
     let recover = false;
-    const getClient = vi.spyOn(registry, "getClient").mockImplementation(async () =>
-      recover ? recoveredClient : authClient);
+    const registryInternals = registry as unknown as {
+      clients: Map<string, McpClient>;
+      createAndConnectClient(
+        packageId: string,
+        config: PackageConfig,
+        onClientCreated?: (client: McpClient) => void,
+      ): Promise<ConnectOutcome | McpClient>;
+    };
+    const connectAttempt = vi.spyOn(registryInternals, "createAndConnectClient")
+      .mockImplementation(async () => recover ? recoveredClient : authClient);
+    registryInternals.clients.set(PACKAGE.id, authClient);
     (catalog as unknown as { cache: Map<string, unknown> }).cache.set(PACKAGE.id, {
       packageId: PACKAGE.id,
       tools: [],
@@ -110,18 +140,25 @@ describe("CatalogRefresher auth recovery and backoff", () => {
     });
     refresher.start();
 
+    const authState = (catalog as unknown as {
+      cache: Map<string, Record<string, unknown>>;
+    }).cache.get(PACKAGE.id)!;
+    expect(authState.nextRetryAt).toBeNull();
+    expect(authState.nextAuthProbeAt).toBe(Date.now() + 1_000);
+
     expect(refresher.scheduleRefresh(PACKAGE.id)).toBeUndefined();
     await vi.advanceTimersByTimeAsync(999);
     await flushMicrotasks();
-    expect(getClient).not.toHaveBeenCalled();
+    expect(connectAttempt).not.toHaveBeenCalled();
 
     recover = true;
     await vi.advanceTimersByTimeAsync(1);
     await flushMicrotasks();
-    expect(getClient).toHaveBeenCalledTimes(1);
+    expect(connectAttempt).toHaveBeenCalledTimes(1);
+    expect(authClient.close).toHaveBeenCalledOnce();
     expect(catalog.getPackageStatus(PACKAGE.id)).toBe("ready");
 
-    getClient.mockClear();
+    connectAttempt.mockClear();
     recover = false;
     (catalog as unknown as { cache: Map<string, Record<string, unknown>> })
       .cache.get(PACKAGE.id)!.status = "auth_required";
@@ -130,12 +167,12 @@ describe("CatalogRefresher auth recovery and backoff", () => {
     refresher.notify(PACKAGE.id, "authentication");
     await vi.advanceTimersByTimeAsync(0);
     await flushMicrotasks();
-    expect(getClient).toHaveBeenCalledTimes(1);
+    expect(connectAttempt).toHaveBeenCalledTimes(1);
 
     await refresher.dispose();
   });
 
-  it.fails("R8a: every transient class has capped jittered backoff and becomes eligible within 36 minutes", async () => {
+  it("R8a: every transient class has capped jittered backoff and becomes eligible within 36 minutes", async () => {
     const {
       TRANSIENT_CONNECT_FAILURE_CLASSES,
       calculateRetryDelayMs,

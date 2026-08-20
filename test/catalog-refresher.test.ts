@@ -92,7 +92,7 @@ describe("CatalogRefresher lifecycle", () => {
     vi.restoreAllMocks();
   });
 
-  it.fails("R8b: executes retry timers, single-flights concurrent refreshes, and disposes safely in flight", async () => {
+  it("R8b: executes retry timers, single-flights concurrent refreshes, and disposes safely in flight", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-19T00:00:00.000Z"));
     const CatalogRefresher = await loadCatalogRefresher();
@@ -137,7 +137,7 @@ describe("CatalogRefresher lifecycle", () => {
     expect(callCount).toBe(2);
   });
 
-  it.fails("R15: a healthy package reaches ready while the warm-sweep budget is saturated by hung packages", async () => {
+  it("R15: a healthy package reaches ready while the warm-sweep budget is saturated by hung packages", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-19T00:00:00.000Z"));
     const CatalogRefresher = await loadCatalogRefresher();
@@ -156,11 +156,20 @@ describe("CatalogRefresher lifecycle", () => {
     });
 
     refresher.start();
+    const readiness = (refresher as unknown as {
+      whenCurrentGenerationReady(): Promise<void>;
+    }).whenCurrentGenerationReady();
     await vi.advanceTimersByTimeAsync(250);
     await flushMicrotasks();
 
     expect(catalog.getPackageStatus(healthy.id)).toBe("ready");
     expect(catalog.countTools(healthy.id)).toBe(1);
+    expect(catalog.isSnapshotComplete()).toBe(true);
+    expect(catalog.listDegraded().map((entry) => entry.packageId)).toEqual([
+      hungA.id,
+      hungB.id,
+    ]);
+    await expect(readiness).resolves.toBeUndefined();
     await refresher.dispose();
   });
 });

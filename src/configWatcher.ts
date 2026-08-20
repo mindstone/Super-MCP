@@ -15,9 +15,14 @@ export class ConfigWatcher {
   private configPaths: string[];
   private allResolvedPaths: Set<string> = new Set();
   private debounceTimer: NodeJS.Timeout | null = null;
+  private onConfigurationChange?: () => void | Promise<void>;
 
-  constructor(configPaths: string[]) {
+  constructor(
+    configPaths: string[],
+    onConfigurationChange?: () => void | Promise<void>,
+  ) {
     this.configPaths = configPaths;
+    this.onConfigurationChange = onConfigurationChange;
   }
 
   async start(): Promise<void> {
@@ -77,6 +82,13 @@ export class ConfigWatcher {
     this.debounceTimer = setTimeout(async () => {
       this.debounceTimer = null;
       await this.reloadSecurityConfig();
+      try {
+        await this.onConfigurationChange?.();
+      } catch (error) {
+        logger.error("Failed to publish configuration change", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
     }, DEBOUNCE_MS);
   }
 

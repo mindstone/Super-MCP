@@ -1,11 +1,16 @@
 import crypto from "node:crypto";
-import { ToolInfo, PackageConfig, CatalogStatus } from "./types.js";
+import {
+  ToolInfo,
+  PackageConfig,
+  CatalogStatus,
+  type TransientConnectFailureClass,
+} from "./types.js";
 import { PackageRegistry } from "./registry.js";
 import { argsSkeleton, summarizePackage, createSchemaHash } from "./summarize.js";
 import { getLogger } from "./logging.js";
 
 const logger = getLogger();
-const ERROR_RETRY_INTERVAL_MS = 60_000;
+const LEGACY_ERROR_RETRY_INTERVAL_MS = 60_000;
 
 /** Detect ECONNREFUSED errors, including Node.js fetch wrappers (.cause) and registry wrappers (.originalError). */
 function isConnectionRefusedError(error: unknown): boolean {
@@ -49,6 +54,81 @@ interface PackageToolCache {
   etag: string;
   status: CatalogStatus;
   lastError?: string;
+  consecutiveFailures: number;
+  nextRetryAt: number | null;
+  refreshInFlight: boolean;
+  lastGoodAt: number | null;
+  generation: number;
+  nextAuthProbeAt: number | null;
+  failureClass?: TransientConnectFailureClass | "permanent";
+  packageIdentity: string;
+}
+
+export interface CatalogRetryHint {
+  retryAt: number | null;
+  retryInMs: number | null;
+  schedule: "transient_backoff" | "auth_probe" | "event_driven" | "none";
+}
+
+export interface DegradedCatalogPackage {
+  packageId: string;
+  status: Exclude<CatalogStatus, "ready">;
+  lastError?: string;
+  retryHint: CatalogRetryHint;
+  retainedToolCount: number;
+  generation: number;
+}
+
+export interface CatalogRefreshRequest {
+  forceReconnect?: boolean;
+  reason?: "passive" | "explicit" | "authentication" | "restart" | "configuration";
+}
+
+export interface CatalogRefreshController extends CatalogRefreshScheduler {
+  refreshNow(packageId: string, request?: CatalogRefreshRequest): Promise<void>;
+}
+
+export interface CatalogFailureState {
+  status: "auth_required" | "setup_incomplete" | "error";
+  lastError?: string;
+  failureClass?: TransientConnectFailureClass | "permanent";
+  nextRetryAt: number | null;
+  nextAuthProbeAt: number | null;
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(canonicalize);
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, entry]) => entry !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, canonicalize(entry)]),
+    );
+  }
+  return value;
+}
+
+function digest(value: unknown): string {
+  return `sha256:${crypto
+    .createHash("sha256")
+    .update(JSON.stringify(canonicalize(value)))
+    .digest("hex")}`;
+}
+
+function packageIdentity(pkg: PackageConfig | undefined, packageId: string): string {
+  if (!pkg) return digest({ id: packageId, removed: true });
+  return digest({
+    id: pkg.id,
+    transport: pkg.transport,
+    transportType: pkg.transportType,
+    command: pkg.command,
+    args: pkg.args,
+    cwd: pkg.cwd,
+    baseUrl: pkg.base_url,
+  });
 }
 
 /** Read-only, synchronous view of an already-observed catalog snapshot. */
@@ -65,6 +145,9 @@ export interface CatalogView {
   getPackageEtag(packageId: string): string;
   getPackageStatus(packageId: string): CatalogStatus | 'unknown';
   getPackageError(packageId: string): string | undefined;
+  getRetryHint(packageId: string, now?: number): CatalogRetryHint;
+  listDegraded(now?: number): DegradedCatalogPackage[];
+  isSnapshotComplete(): boolean;
   getCacheStats(): { packageCount: number; totalTools: number };
   getPackageForResourceUri(uri: string): string | undefined;
   getKnownResourcePrefixes(): string[];
@@ -84,7 +167,7 @@ export interface PackageMetadataView {
 /** Mutation methods are deliberately excluded from CatalogView. */
 export interface CatalogWriter {
   refreshPackage(packageId: string): Promise<void>;
-  ensurePackageLoaded(packageId: string): Promise<void>;
+  ensurePackageLoaded(packageId: string, request?: CatalogRefreshRequest): Promise<void>;
   clear(): void;
   clearPackage(packageId: string): void;
   registerResourceUris(packageId: string, tools: unknown[]): void;
@@ -104,6 +187,8 @@ export class Catalog implements CatalogView {
   private registry: PackageRegistry;
   private globalEtag: string = "";
   private resourceUriToPackage: Map<string, string> = new Map();
+  private configurationGeneration = 1;
+  private refreshController: CatalogRefreshController | null = null;
 
   constructor(registry: PackageRegistry) {
     this.registry = registry;
@@ -111,121 +196,257 @@ export class Catalog implements CatalogView {
   }
 
   private updateGlobalEtag(): void {
-    const timestamp = Date.now().toString();
-    const cacheKeys = Array.from(this.cache.keys()).sort().join(",");
-    this.globalEtag = `sha256:${Buffer.from(timestamp + cacheKeys).toString('hex').slice(0, 16)}`;
+    const packages = Array.from(this.cache.values())
+      .map((cached) => ({
+        packageId: cached.packageId,
+        contentEtag: cached.etag,
+        status: cached.status,
+        lastError: cached.lastError ?? null,
+        generation: cached.generation,
+      }))
+      .sort((left, right) => left.packageId.localeCompare(right.packageId));
+    this.globalEtag = digest({
+      generation: this.configurationGeneration,
+      snapshotComplete: this.isSnapshotComplete(),
+      packages,
+    });
   }
 
-  async refreshPackage(packageId: string): Promise<void> {
-    logger.debug("Refreshing package catalog", { package_id: packageId });
+  setRefreshController(controller: CatalogRefreshController | null): void {
+    this.refreshController = controller;
+  }
 
-    const setupStatus = this.registry.getPackage(packageId)?.setupStatus;
-    if (setupStatus?.state === "blocked") {
-      this.clearResourceUrisForPackage(packageId);
+  getConfigurationGeneration(): number {
+    return this.configurationGeneration;
+  }
+
+  beginRefresh(packageId: string): number {
+    const existing = this.cache.get(packageId);
+    const generation = this.configurationGeneration;
+    if (existing) {
+      existing.refreshInFlight = true;
+      existing.generation = generation;
+      if (existing.status === "connecting") {
+        existing.lastUpdated = Date.now();
+      }
+    } else {
       this.cache.set(packageId, {
         packageId,
         tools: [],
         lastUpdated: Date.now(),
-        etag: `setup-incomplete-${Date.now()}`,
+        etag: digest([]),
+        status: "connecting",
+        lastError: undefined,
+        consecutiveFailures: 0,
+        nextRetryAt: null,
+        refreshInFlight: true,
+        lastGoodAt: null,
+        generation,
+        nextAuthProbeAt: null,
+        packageIdentity: packageIdentity(this.registry.getPackage(packageId), packageId),
+      });
+    }
+    this.updateGlobalEtag();
+    return generation;
+  }
+
+  finishRefreshWithoutChange(packageId: string, generation: number): void {
+    const cached = this.cache.get(packageId);
+    if (!cached || cached.generation !== generation) return;
+    cached.refreshInFlight = false;
+    this.updateGlobalEtag();
+  }
+
+  commitReady(
+    packageId: string,
+    tools: unknown[],
+    generation: number,
+  ): boolean {
+    if (generation !== this.configurationGeneration) return false;
+
+    const cachedTools: CachedTool[] = tools.map((toolValue) => {
+      const tool = toolValue as Record<string, any>;
+      return {
+        packageId,
+        tool,
+        summary: tool.description || `${tool.name} tool`,
+        argsSkeleton: argsSkeleton(tool.inputSchema),
+        schemaHash: createSchemaHash(tool.inputSchema),
+      };
+    });
+    const now = Date.now();
+    const packageEtag = digest(cachedTools);
+
+    this.clearResourceUrisForPackage(packageId);
+    this.registerResourceUris(packageId, tools);
+    this.cache.set(packageId, {
+      packageId,
+      tools: cachedTools,
+      lastUpdated: now,
+      etag: packageEtag,
+      status: "ready",
+      lastError: undefined,
+      consecutiveFailures: 0,
+      nextRetryAt: null,
+      refreshInFlight: false,
+      lastGoodAt: now,
+      generation,
+      nextAuthProbeAt: null,
+      packageIdentity: packageIdentity(this.registry.getPackage(packageId), packageId),
+    });
+    this.updateGlobalEtag();
+
+    logger.debug("Package catalog refreshed", {
+      package_id: packageId,
+      tool_count: tools.length,
+      etag: packageEtag,
+      generation,
+    });
+    return true;
+  }
+
+  commitFailure(
+    packageId: string,
+    generation: number,
+    failure: CatalogFailureState,
+  ): boolean {
+    if (generation !== this.configurationGeneration) return false;
+
+    const existing = this.cache.get(packageId);
+    const retainedTools = existing?.tools ?? [];
+    const lastGoodAt = existing?.lastGoodAt ?? null;
+    this.cache.set(packageId, {
+      packageId,
+      tools: retainedTools,
+      lastUpdated: Date.now(),
+      etag: existing?.etag ?? digest([]),
+      status: failure.status,
+      lastError: failure.lastError,
+      consecutiveFailures: (existing?.consecutiveFailures ?? 0) + 1,
+      nextRetryAt: failure.nextRetryAt,
+      refreshInFlight: false,
+      lastGoodAt,
+      generation,
+      nextAuthProbeAt: failure.nextAuthProbeAt,
+      failureClass: failure.failureClass,
+      packageIdentity: packageIdentity(this.registry.getPackage(packageId), packageId),
+    });
+    this.updateGlobalEtag();
+
+    logger.error("Failed to refresh package catalog", {
+      package_id: packageId,
+      status: failure.status,
+      error: failure.lastError,
+      retained_tool_count: retainedTools.length,
+      generation,
+      next_retry_at: failure.nextRetryAt,
+      next_auth_probe_at: failure.nextAuthProbeAt,
+    });
+    return true;
+  }
+
+  getConsecutiveFailures(packageId: string): number {
+    return this.cache.get(packageId)?.consecutiveFailures ?? 0;
+  }
+
+  getRefreshInFlight(packageId: string): boolean {
+    return this.cache.get(packageId)?.refreshInFlight ?? false;
+  }
+
+  setRetrySchedule(
+    packageId: string,
+    schedule: { nextRetryAt?: number | null; nextAuthProbeAt?: number | null },
+  ): void {
+    const cached = this.cache.get(packageId);
+    if (!cached) return;
+    if (schedule.nextRetryAt !== undefined) cached.nextRetryAt = schedule.nextRetryAt;
+    if (schedule.nextAuthProbeAt !== undefined) {
+      cached.nextAuthProbeAt = schedule.nextAuthProbeAt;
+    }
+  }
+
+  async refreshPackage(packageId: string): Promise<void> {
+    if (this.refreshController) {
+      await this.refreshController.refreshNow(packageId, { reason: "passive" });
+      return;
+    }
+
+    const generation = this.beginRefresh(packageId);
+    const setupStatus = this.registry.getPackage(packageId)?.setupStatus;
+    if (setupStatus?.state === "blocked") {
+      this.commitFailure(packageId, generation, {
         status: "setup_incomplete",
         lastError: setupStatus.reason,
-      });
-      this.updateGlobalEtag();
-      logger.info("Package setup is incomplete, refusing to load tools", {
-        package_id: packageId,
-        reason: setupStatus.reason,
+        failureClass: "permanent",
+        nextRetryAt: null,
+        nextAuthProbeAt: null,
       });
       return;
     }
 
     try {
       const client = await this.registry.getClient(packageId);
+      const health = await client.healthCheck?.();
+      if (health === "needs_auth") {
+        this.commitFailure(packageId, generation, {
+          status: "auth_required",
+          nextRetryAt: null,
+          nextAuthProbeAt: null,
+        });
+        return;
+      }
       const tools = await client.listTools();
-
-      const cachedTools: CachedTool[] = tools.map(tool => ({
-        packageId,
-        tool,
-        summary: tool.description || `${tool.name} tool`,
-        argsSkeleton: argsSkeleton(tool.inputSchema),
-        schemaHash: createSchemaHash(tool.inputSchema),
-      }));
-
-      const packageEtag = `sha256:${Buffer.from(JSON.stringify(cachedTools)).toString('hex').slice(0, 16)}`;
-
-      // Clear stale resource URI mappings before re-registering
-      this.clearResourceUrisForPackage(packageId);
-      this.registerResourceUris(packageId, tools);
-
-      this.cache.set(packageId, {
-        packageId,
-        tools: cachedTools,
-        lastUpdated: Date.now(),
-        etag: packageEtag,
-        status: "ready",
-        lastError: undefined,
-      });
-
-      this.updateGlobalEtag();
-
-      logger.debug("Package catalog refreshed", {
-        package_id: packageId,
-        tool_count: tools.length,
-        etag: packageEtag,
-      });
+      this.commitReady(packageId, tools, generation);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      logger.error("Failed to refresh package catalog", {
-        package_id: packageId,
-        error: message,
+      const categorized = this.categorizeError(packageId, error);
+      this.commitFailure(packageId, generation, {
+        ...categorized,
+        nextRetryAt: null,
+        nextAuthProbeAt: null,
       });
-
-      const { status, etag, lastError } = this.categorizeError(packageId, error);
-
-      // Clear stale resource URI mappings — package is no longer healthy
-      this.clearResourceUrisForPackage(packageId);
-
-      this.cache.set(packageId, {
-        packageId,
-        tools: [],
-        lastUpdated: Date.now(),
-        etag,
-        status,
-        lastError,
-      });
-
-      this.updateGlobalEtag();
     }
   }
 
-  async ensurePackageLoaded(packageId: string): Promise<void> {
+  async ensurePackageLoaded(
+    packageId: string,
+    request: CatalogRefreshRequest = { reason: "passive" },
+  ): Promise<void> {
     const cached = this.cache.get(packageId);
+    if (this.refreshController) {
+      const needsRefresh =
+        !cached ||
+        request.forceReconnect === true ||
+        (cached.status !== "ready" && this.isRetryDue(cached, Date.now()));
+      if (needsRefresh) {
+        await this.refreshController.refreshNow(packageId, request);
+      }
+      return;
+    }
+
     if (!cached) {
       await this.refreshPackage(packageId);
       return;
     }
-
-    const needsRetry =
-      cached.status !== "ready" && Date.now() - cached.lastUpdated > ERROR_RETRY_INTERVAL_MS;
-
-    if (needsRetry) {
-      await this.refreshPackage(packageId);
-    }
+    const needsLegacyRetry =
+      cached.status !== "ready" &&
+      Date.now() - cached.lastUpdated > LEGACY_ERROR_RETRY_INTERVAL_MS;
+    if (needsLegacyRetry) await this.refreshPackage(packageId);
   }
 
   async getPackageTools(packageId: string): Promise<CachedTool[]> {
     await this.ensurePackageLoaded(packageId);
     const cached = this.cache.get(packageId);
-    return cached?.tools || [];
+    return cached?.status === "ready" ? cached.tools : [];
   }
 
   countTools(packageId: string): number {
     const cached = this.cache.get(packageId);
-    return cached?.tools.length || 0;
+    return cached?.status === "ready" ? cached.tools.length : 0;
   }
 
   computePackageEmbeddingHash(packageId: string): string {
     const cached = this.cache.get(packageId);
-    if (!cached || cached.status !== "ready" || cached.tools.length === 0) {
+    if (!cached || cached.tools.length === 0) {
       return "";
     }
 
@@ -259,7 +480,8 @@ export class Catalog implements CatalogView {
   async getTool(packageId: string, toolId: string): Promise<CachedTool | undefined> {
     await this.ensurePackageLoaded(packageId);
     const cached = this.cache.get(packageId);
-    return cached?.tools.find(t => t.tool.name === toolId);
+    if (cached?.status !== "ready") return undefined;
+    return cached.tools.find(t => t.tool.name === toolId);
   }
 
   async getToolSchema(packageId: string, toolId: string): Promise<any> {
@@ -299,7 +521,7 @@ export class Catalog implements CatalogView {
     pageToken?: string | null
   ): { items: CachedTool[]; next: string | null } {
     const cached = this.cache.get(packageId);
-    if (!cached) {
+    if (!cached || cached.status !== "ready") {
       return { items: [], next: null };
     }
 
@@ -342,24 +564,34 @@ export class Catalog implements CatalogView {
 
   async buildPackageSummary(packageConfig: PackageConfig): Promise<string> {
     try {
-      const tools = await this.getPackageTools(packageConfig.id);
-      
-      // If no tools loaded (e.g., needs auth), return a descriptive message
-      if (tools.length === 0) {
-        const cached = this.cache.get(packageConfig.id);
+      await this.ensurePackageLoaded(packageConfig.id);
+      const cached = this.cache.get(packageConfig.id);
+      if (cached?.status !== "ready") {
+        const retained = Boolean(cached?.tools.length);
         if (cached?.status === "auth_required") {
-          return `${packageConfig.transport} MCP package (authentication required)`;
+          return retained
+            ? `${packageConfig.transport} MCP package (degraded — showing last-known-good tools; authentication required)`
+            : `${packageConfig.transport} MCP package (authentication required)`;
         }
         if (cached?.status === "setup_incomplete") {
-          return `${packageConfig.transport} MCP package (setup incomplete)`;
+          return retained
+            ? `${packageConfig.transport} MCP package (degraded — showing last-known-good tools; setup incomplete)`
+            : `${packageConfig.transport} MCP package (setup incomplete)`;
         }
         if (cached?.status === "error") {
           const reason = cached.lastError ? `: ${cached.lastError}` : "";
-          return `${packageConfig.transport} MCP package (unavailable${reason})`;
+          return retained
+            ? `${packageConfig.transport} MCP package (degraded — showing last-known-good tools; unavailable${reason})`
+            : `${packageConfig.transport} MCP package (unavailable${reason})`;
         }
+        return `${packageConfig.transport} MCP package (connecting)`;
+      }
+
+      const tools = cached.tools;
+      if (tools.length === 0) {
         return `${packageConfig.transport} MCP package (no tools available)`;
       }
-      
+
       const toolsForSummary = tools.map(ct => ct.tool);
       return summarizePackage(packageConfig, toolsForSummary);
     } catch (error) {
@@ -409,9 +641,94 @@ export class Catalog implements CatalogView {
 
   clearPackage(packageId: string): void {
     logger.debug("Clearing package cache", { package_id: packageId });
-    this.clearResourceUrisForPackage(packageId);
-    this.cache.delete(packageId);
+    const pkg = this.registry.getPackage(packageId);
+    const existing = this.cache.get(packageId);
+    const identity = packageIdentity(pkg, packageId);
+    if (pkg) {
+      const retain = existing !== undefined && existing.packageIdentity === identity;
+      if (!retain) this.clearResourceUrisForPackage(packageId);
+      this.cache.set(packageId, {
+        packageId,
+        tools: retain ? existing.tools : [],
+        lastUpdated: Date.now(),
+        etag: retain ? existing.etag : digest([]),
+        status: "connecting",
+        lastError: undefined,
+        consecutiveFailures: retain ? existing.consecutiveFailures : 0,
+        nextRetryAt: null,
+        refreshInFlight: false,
+        lastGoodAt: retain ? existing.lastGoodAt : null,
+        generation: this.configurationGeneration,
+        nextAuthProbeAt: null,
+        packageIdentity: identity,
+      });
+    } else {
+      this.clearResourceUrisForPackage(packageId);
+      this.cache.delete(packageId);
+    }
     this.updateGlobalEtag();
+  }
+
+  setConfigurationGeneration(
+    generation: number,
+    changedPackageIds: readonly string[],
+  ): void {
+    if (generation <= this.configurationGeneration) return;
+    const changed = new Set(changedPackageIds);
+    const configured = new Set(this.registry.getPackages().map((pkg) => pkg.id));
+
+    for (const [packageId, cached] of this.cache.entries()) {
+      if (!configured.has(packageId)) {
+        this.clearResourceUrisForPackage(packageId);
+        this.cache.delete(packageId);
+        continue;
+      }
+      if (changed.has(packageId)) {
+        this.clearResourceUrisForPackage(packageId);
+        const pkg = this.registry.getPackage(packageId);
+        this.cache.set(packageId, {
+          packageId,
+          tools: [],
+          lastUpdated: Date.now(),
+          etag: digest([]),
+          status: "connecting",
+          lastError: undefined,
+          consecutiveFailures: 0,
+          nextRetryAt: null,
+          refreshInFlight: false,
+          lastGoodAt: null,
+          generation,
+          nextAuthProbeAt: null,
+          packageIdentity: packageIdentity(pkg, packageId),
+        });
+      } else {
+        cached.generation = generation;
+      }
+    }
+
+    this.configurationGeneration = generation;
+    this.updateGlobalEtag();
+    logger.info("Catalog configuration generation advanced", {
+      generation,
+      changed_packages: Array.from(changed).sort(),
+    });
+  }
+
+  reconcileConfiguration(): { generation: number; changedPackageIds: string[] } {
+    const configuredPackages = this.registry.getPackages();
+    const configuredIds = new Set(configuredPackages.map((pkg) => pkg.id));
+    const changedPackageIds = configuredPackages
+      .filter((pkg) => {
+        const cached = this.cache.get(pkg.id);
+        return cached === undefined || cached.packageIdentity !== packageIdentity(pkg, pkg.id);
+      })
+      .map((pkg) => pkg.id);
+    for (const packageId of this.cache.keys()) {
+      if (!configuredIds.has(packageId)) changedPackageIds.push(packageId);
+    }
+    const generation = this.configurationGeneration + 1;
+    this.setConfigurationGeneration(generation, changedPackageIds);
+    return { generation, changedPackageIds };
   }
 
   getPackageStatus(packageId: string): CatalogStatus | "unknown" {
@@ -421,6 +738,57 @@ export class Catalog implements CatalogView {
 
   getPackageError(packageId: string): string | undefined {
     return this.cache.get(packageId)?.lastError;
+  }
+
+  getRetryHint(packageId: string, now: number = Date.now()): CatalogRetryHint {
+    const cached = this.cache.get(packageId);
+    if (!cached) {
+      return { retryAt: now, retryInMs: 0, schedule: "transient_backoff" };
+    }
+    if (cached.status === "auth_required") {
+      const retryAt = cached.nextAuthProbeAt ?? null;
+      return {
+        retryAt,
+        retryInMs: retryAt === null ? null : Math.max(0, retryAt - now),
+        schedule: retryAt === null ? "event_driven" : "auth_probe",
+      };
+    }
+    if (cached.status === "error") {
+      const retryAt = cached.nextRetryAt ?? null;
+      return {
+        retryAt,
+        retryInMs: retryAt === null ? null : Math.max(0, retryAt - now),
+        schedule: retryAt === null ? "none" : "transient_backoff",
+      };
+    }
+    return { retryAt: null, retryInMs: null, schedule: "none" };
+  }
+
+  listDegraded(now: number = Date.now()): DegradedCatalogPackage[] {
+    return Array.from(this.cache.values())
+      .filter((cached): cached is PackageToolCache & {
+        status: Exclude<CatalogStatus, "ready">;
+      } => cached.status !== "ready")
+      .map((cached) => ({
+        packageId: cached.packageId,
+        status: cached.status,
+        lastError: cached.lastError,
+        retryHint: this.getRetryHint(cached.packageId, now),
+        retainedToolCount: cached.tools.length,
+        generation: cached.generation,
+      }))
+      .sort((left, right) => left.packageId.localeCompare(right.packageId));
+  }
+
+  isSnapshotComplete(): boolean {
+    return this.registry.getPackages().every((pkg) => {
+      const cached = this.cache.get(pkg.id);
+      return Boolean(
+        cached &&
+        cached.generation === this.configurationGeneration &&
+        cached.status !== "connecting",
+      );
+    });
   }
 
   getCacheStats(): { packageCount: number; totalTools: number } {
@@ -435,19 +803,17 @@ export class Catalog implements CatalogView {
     };
   }
 
-  private categorizeError(packageId: string, error: unknown): {
-    status: CatalogStatus;
-    etag: string;
+  categorizeError(packageId: string, error: unknown): {
+    status: "auth_required" | "error";
     lastError?: string;
   } {
     const message = error instanceof Error ? error.message : String(error);
     if (this.isAuthError(error)) {
-      logger.info("Package requires authentication, caching empty tools", {
+      logger.info("Package requires authentication, retaining last-known-good catalog", {
         package_id: packageId,
       });
       return {
         status: "auth_required",
-        etag: `auth-pending-${Date.now()}`,
       };
     }
 
@@ -458,17 +824,25 @@ export class Catalog implements CatalogView {
         ? `${pkg.name} isn't running. Open ${pkg.name} on your computer and try again.`
         : "A local app isn't running. Check that the required app is open on your computer and try again.";
       return {
-        status: "error" as CatalogStatus,
-        etag: `error-${Date.now()}`,
+        status: "error",
         lastError: friendlyMessage,
       };
     }
 
     return {
       status: "error",
-      etag: `error-${Date.now()}`,
       lastError: message,
     };
+  }
+
+  private isRetryDue(cached: PackageToolCache, now: number): boolean {
+    if (cached.status === "auth_required") {
+      return cached.nextAuthProbeAt !== null && cached.nextAuthProbeAt <= now;
+    }
+    if (cached.status === "error") {
+      return cached.nextRetryAt !== null && cached.nextRetryAt <= now;
+    }
+    return cached.status === "connecting";
   }
 
   private isAuthError(error: unknown): boolean {
@@ -492,8 +866,9 @@ export class Catalog implements CatalogView {
    * Register resource URIs from tool metadata.
    * Called when loading tools for a package to build the uri -> package mapping.
    */
-  registerResourceUris(packageId: string, tools: any[]): void {
-    for (const tool of tools) {
+  registerResourceUris(packageId: string, tools: unknown[]): void {
+    for (const toolValue of tools) {
+      const tool = toolValue as { _meta?: { ui?: { resourceUri?: unknown } } };
       const resourceUri = tool._meta?.ui?.resourceUri;
       if (resourceUri && typeof resourceUri === "string") {
         const prefix = this.extractUriPrefix(resourceUri);
@@ -518,6 +893,13 @@ export class Catalog implements CatalogView {
     if (!prefix) return undefined;
     
     const packageId = this.resourceUriToPackage.get(prefix);
+    const cached = packageId ? this.cache.get(packageId) : undefined;
+    if (
+      cached &&
+      (cached.status !== "ready" || cached.generation !== this.configurationGeneration)
+    ) {
+      return undefined;
+    }
     if (packageId) {
       logger.debug("Found package for resource URI", {
         uri,
@@ -532,7 +914,15 @@ export class Catalog implements CatalogView {
    * Get all known resource URI prefixes for error messages.
    */
   getKnownResourcePrefixes(): string[] {
-    return Array.from(this.resourceUriToPackage.keys());
+    return Array.from(this.resourceUriToPackage.entries())
+      .filter(([, packageId]) => {
+        const cached = this.cache.get(packageId);
+        return !cached || (
+          cached.status === "ready" &&
+          cached.generation === this.configurationGeneration
+        );
+      })
+      .map(([prefix]) => prefix);
   }
 
   /**

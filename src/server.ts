@@ -8,6 +8,7 @@ import PQueue from "p-queue";
 import { ERROR_CODES } from "./types.js";
 import { PackageRegistry } from "./registry.js";
 import { Catalog } from "./catalog.js";
+import { CatalogRefresher } from "./catalogRefresher.js";
 import { getValidator } from "./validator.js";
 import { getLogger } from "./logging.js";
 import { registerSuperMcpHealthRoute } from "./health.js";
@@ -415,9 +416,13 @@ export async function startServer(options: {
     const registry = await PackageRegistry.fromConfigFiles(paths);
     registry.startIdleReaper();
     const catalog = new Catalog(registry);
+    const catalogRefresher = new CatalogRefresher(catalog, registry);
+    catalogRefresher.start();
     const validator = getValidator();
     
-    const configWatcher = new ConfigWatcher(paths);
+    const configWatcher = new ConfigWatcher(paths, () => {
+      catalogRefresher.configurationChanged();
+    });
     await configWatcher.start();
 
     function createMcpServer(): Server {
@@ -860,13 +865,13 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
             return await handleHealthCheckPackage(args as any, registry, catalog);
 
           case "authenticate":
-            return await handleAuthenticate(args as any, registry, catalog);
+            return await handleAuthenticate(args as any, registry, catalog, catalogRefresher);
 
           case "get_help":
             return await handleGetHelp(args as any, registry);
 
           case "restart_package":
-            return await handleRestartPackage(args as any, registry, catalog);
+            return await handleRestartPackage(args as any, registry, catalog, catalogRefresher);
 
           case "search_tools":
             return await handleSearchTools(args as any, registry, catalog);
@@ -1068,6 +1073,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           await drainRefreshesForShutdown();
           clearInterval(gcInterval);
           await configWatcher.stop();
+          await catalogRefresher.dispose();
           httpServer.close(() => {
             logger.info("HTTP server closed");
           });
@@ -1134,6 +1140,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           // FM6: drain in-flight refresh-token rotation before teardown/exit.
           await drainRefreshesForShutdown();
           await configWatcher.stop();
+          await catalogRefresher.dispose();
           await registry.closeAll();
         } catch (error) {
           logger.error("Error during stdio shutdown teardown; exiting anyway", {

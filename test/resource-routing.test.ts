@@ -57,7 +57,7 @@ function registryStub(getClient: () => Promise<McpClient>): PackageRegistry {
 }
 
 describe("resource routing from catalog snapshots", () => {
-  it.fails("R14: retained URI ownership never routes while degraded or across a configuration generation", async () => {
+  it("R14: retained URI ownership never routes while degraded or across a configuration generation", async () => {
     let currentClient = client({ tools: [TOOL] });
     const registry = registryStub(async () => currentClient);
     const catalog = new Catalog(registry);

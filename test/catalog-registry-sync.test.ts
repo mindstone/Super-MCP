@@ -199,6 +199,35 @@ describe('Catalog-Registry sync: restart_package handler', () => {
 
     expect(catalog.clearPackage).not.toHaveBeenCalled();
   });
+
+  it('awaits the bounded catalog refresh before returning restart success', async () => {
+    const catalog = createMockCatalog({ 'test-pkg': 'error' });
+    const registry = createMockRegistry();
+    let releaseRefresh!: () => void;
+    const refreshNow = vi.fn(() => new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    }));
+    let settled = false;
+
+    const resultPromise = handleRestartPackage(
+      { package_id: 'test-pkg' },
+      registry,
+      catalog,
+      { refreshNow, scheduleRefresh: vi.fn() },
+    ).then((result) => {
+      settled = true;
+      return result;
+    });
+    for (let index = 0; index < 8; index += 1) await Promise.resolve();
+
+    expect(settled).toBe(false);
+    expect(refreshNow).toHaveBeenCalledWith('test-pkg', {
+      forceReconnect: true,
+      reason: 'restart',
+    });
+    releaseRefresh();
+    await expect(resultPromise).resolves.toMatchObject({ isError: false });
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -300,6 +329,41 @@ describe('Catalog-Registry sync: authenticate handler', () => {
     expect(parsed.status).not.toBe('already_authenticated');
     expect(parsed.status).not.toBe('authenticated');
     expect(catalog.clearPackage).not.toHaveBeenCalled();
+  });
+
+  it('awaits the bounded catalog refresh after successful authentication', async () => {
+    const catalog = createMockCatalog({ 'test-pkg': 'error' });
+    const client = createMockClient({
+      healthCheck: vi.fn().mockResolvedValue('ok'),
+      listTools: vi.fn().mockResolvedValue([{ name: 'tool1' }]),
+    });
+    const registry = createMockRegistry({
+      getClient: vi.fn().mockResolvedValue(client),
+    });
+    let releaseRefresh!: () => void;
+    const refreshNow = vi.fn(() => new Promise<void>((resolve) => {
+      releaseRefresh = resolve;
+    }));
+    let settled = false;
+
+    const resultPromise = handleAuthenticate(
+      { package_id: 'test-pkg' },
+      registry,
+      catalog,
+      { refreshNow, scheduleRefresh: vi.fn() },
+    ).then((result) => {
+      settled = true;
+      return result;
+    });
+    for (let index = 0; index < 8; index += 1) await Promise.resolve();
+
+    expect(settled).toBe(false);
+    expect(refreshNow).toHaveBeenCalledWith('test-pkg', {
+      forceReconnect: true,
+      reason: 'authentication',
+    });
+    releaseRefresh();
+    await expect(resultPromise).resolves.toMatchObject({ isError: false });
   });
 });
 

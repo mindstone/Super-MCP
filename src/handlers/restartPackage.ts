@@ -1,5 +1,5 @@
 import { PackageRegistry } from "../registry.js";
-import { Catalog } from "../catalog.js";
+import { Catalog, type CatalogRefreshController } from "../catalog.js";
 import { getLogger } from "../logging.js";
 
 const logger = getLogger();
@@ -7,7 +7,8 @@ const logger = getLogger();
 export async function handleRestartPackage(
   input: { package_id: string },
   registry: PackageRegistry,
-  catalog: Catalog
+  catalog: Catalog,
+  catalogRefresher?: CatalogRefreshController,
 ): Promise<any> {
   const { package_id } = input;
 
@@ -33,6 +34,10 @@ export async function handleRestartPackage(
   // Clear catalog cache so next list_tools re-fetches fresh state
   if (result.success) {
     catalog.clearPackage(package_id);
+    await catalogRefresher?.refreshNow(package_id, {
+      forceReconnect: true,
+      reason: "restart",
+    });
   }
 
   return {

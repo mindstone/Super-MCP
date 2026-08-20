@@ -1,5 +1,5 @@
 import { PackageRegistry } from "../registry.js";
-import { Catalog } from "../catalog.js";
+import { Catalog, type CatalogRefreshController } from "../catalog.js";
 import { getLogger } from "../logging.js";
 import { checkPortAvailable, findAvailablePortFromCandidates, getOAuthCallbackPortCandidates, getOAuthCallbackRetryCandidates } from "../utils/portFinder.js";
 import { SimpleOAuthProvider } from "../auth/providers/simple.js";
@@ -114,7 +114,7 @@ function requiredArgsForMessage(tool: AuthDelegationToolCandidate): string[] {
   return required.filter((arg): arg is string => typeof arg === "string");
 }
 
-export async function handleAuthenticate(
+async function handleAuthenticateCore(
   input: { package_id: string; wait_for_completion?: boolean; force?: boolean },
   registry: PackageRegistry,
   catalog: Catalog
@@ -1084,4 +1084,45 @@ export async function handleAuthenticate(
       isError: false,
     };
   }
+}
+
+function isSuccessfulAuthenticationResult(result: unknown): boolean {
+  if (!result || typeof result !== "object") return false;
+  const response = result as {
+    isError?: unknown;
+    content?: Array<{ text?: unknown }>;
+  };
+  if (response.isError === true) return false;
+  const text = response.content?.[0]?.text;
+  if (typeof text !== "string") return true;
+  try {
+    const parsed = JSON.parse(text) as { status?: unknown };
+    if (typeof parsed.status !== "string") return true;
+    return ["success", "authenticated", "already_authenticated"].includes(parsed.status);
+  } catch {
+    return true;
+  }
+}
+
+export async function handleAuthenticate(
+  input: { package_id: string; wait_for_completion?: boolean; force?: boolean },
+  registry: PackageRegistry,
+  catalog: Catalog,
+  catalogRefresher?: CatalogRefreshController,
+): Promise<any> {
+  const result = await handleAuthenticateCore(input, registry, catalog);
+  if (isSuccessfulAuthenticationResult(result)) {
+    const lifecycleRegistry = registry as PackageRegistry & {
+      notifyAuthOutcome?: (
+        packageId: string,
+        outcome: "auth_required" | "authenticated",
+      ) => void;
+    };
+    lifecycleRegistry.notifyAuthOutcome?.(input.package_id, "authenticated");
+    await catalogRefresher?.refreshNow(input.package_id, {
+      forceReconnect: true,
+      reason: "authentication",
+    });
+  }
+  return result;
 }

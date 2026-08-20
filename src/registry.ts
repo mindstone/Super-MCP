@@ -34,6 +34,41 @@ const MAX_ERROR_CAUSE_NODES = 8;
 // real worst-case reconnect leg (REGISTRY_CONNECT_ATTEMPTS × CONNECT_TIMEOUT_MS).
 // If the retry structure changes, this constant must move with it.
 export const REGISTRY_CONNECT_ATTEMPTS = 2;
+const DEFAULT_REGISTRY_CONNECT_TIMEOUT_MS = 30_000;
+
+export type RegistryLifecycleEvent =
+  | { type: "client_created"; packageId: string }
+  | {
+      type: "client_evicted";
+      packageId: string;
+      reason: "unhealthy" | "explicit" | "restart" | "idle" | "shutdown";
+    }
+  | {
+      type: "auth_outcome";
+      packageId: string;
+      outcome: "auth_required" | "authenticated";
+    };
+
+function registryConnectTimeoutMs(): number {
+  const raw = process.env.SUPER_MCP_CONNECT_TIMEOUT_MS;
+  if (raw === undefined) return DEFAULT_REGISTRY_CONNECT_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    logger.warn("Invalid SUPER_MCP_CONNECT_TIMEOUT_MS value, using default", {
+      value: raw,
+      default_ms: DEFAULT_REGISTRY_CONNECT_TIMEOUT_MS,
+    });
+    return DEFAULT_REGISTRY_CONNECT_TIMEOUT_MS;
+  }
+  return parsed;
+}
+
+function connectTimeoutError(packageId: string, timeoutMs: number): Error & { code: "ETIMEDOUT" } {
+  return Object.assign(
+    new Error(`MCP client connect timed out after ${timeoutMs}ms for package '${packageId}'`),
+    { code: "ETIMEDOUT" as const },
+  );
+}
 
 function isPermanentConnectFailure(error: unknown): boolean {
   try {
@@ -314,6 +349,8 @@ export class PackageRegistry {
   private lastActivity: Map<string, number> = new Map();
   private reaperInterval: ReturnType<typeof setInterval> | null = null;
   private reaperTimeoutMs: number = 300_000; // 5 minutes default
+  private lifecycleListeners = new Set<(event: RegistryLifecycleEvent) => void>();
+  private authRequiredPackages = new Set<string>();
 
   // ── Stage 4b lifecycle counters ────────────────────────────────────
   // Cumulative per-package counters backing GET /stats.
@@ -360,6 +397,34 @@ export class PackageRegistry {
   constructor(config: SuperMcpConfig) {
     this.config = config;
     this.packages = this.normalizeConfig(config);
+  }
+
+  subscribeLifecycle(listener: (event: RegistryLifecycleEvent) => void): () => void {
+    this.lifecycleListeners.add(listener);
+    return () => this.lifecycleListeners.delete(listener);
+  }
+
+  notifyAuthOutcome(packageId: string, outcome: "auth_required" | "authenticated"): void {
+    if (outcome === "auth_required") {
+      this.authRequiredPackages.add(packageId);
+    } else {
+      this.authRequiredPackages.delete(packageId);
+    }
+    this.emitLifecycle({ type: "auth_outcome", packageId, outcome });
+  }
+
+  private emitLifecycle(event: RegistryLifecycleEvent): void {
+    for (const listener of this.lifecycleListeners) {
+      try {
+        listener(event);
+      } catch (error) {
+        logger.warn("Package registry lifecycle listener failed", {
+          event_type: event.type,
+          package_id: event.packageId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
   }
 
   private normalizeConfig(config: SuperMcpConfig): PackageConfig[] {
@@ -988,6 +1053,91 @@ export class PackageRegistry {
     return [...this.skippedPackages];
   }
 
+  async evictClient(
+    packageId: string,
+    reason: "unhealthy" | "explicit" | "restart" | "idle" | "shutdown" = "explicit",
+  ): Promise<void> {
+    const client = this.clients.get(packageId);
+    if (!client) return;
+    if (!this.clients.delete(packageId)) return;
+    if (reason === "unhealthy") {
+      this.evictionCounts.set(
+        packageId,
+        (this.evictionCounts.get(packageId) ?? 0) + 1,
+      );
+    }
+    try {
+      await client.close();
+    } catch (error) {
+      logger.warn("Failed to close evicted MCP client", {
+        package_id: packageId,
+        reason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      this.lastActivity.delete(packageId);
+      this.emitLifecycle({ type: "client_evicted", packageId, reason });
+    }
+  }
+
+  async connectForCatalog(
+    packageId: string,
+    options: { forceReconnect?: boolean } = {},
+  ): Promise<ConnectOutcome> {
+    const config = this.getPackage(packageId);
+    if (!config) {
+      return {
+        kind: "permanent_failure",
+        failureClass: "invalid_configuration",
+        error: new Error(`Package '${packageId}' not found in configuration`),
+      };
+    }
+    if (config.setupStatus?.state === "blocked") {
+      return { kind: "setup_incomplete", reason: config.setupStatus.reason };
+    }
+    if (options.forceReconnect) {
+      await this.evictClient(packageId, "explicit");
+    }
+
+    try {
+      const client = await this.getClient(packageId);
+      const health = await client.healthCheck?.();
+      if (health === "needs_auth") {
+        const error = new Error(`Authentication required for MCP package '${packageId}'`);
+        this.notifyAuthOutcome(packageId, "auth_required");
+        return { kind: "auth_required", client, error };
+      }
+      if (health === "error") {
+        return {
+          kind: "transient_failure",
+          failureClass: "transport_error",
+          error: new Error(`MCP package '${packageId}' failed its health check`),
+        };
+      }
+      return { kind: "connected", client };
+    } catch (error) {
+      if (isAuthConnectFailure(config, error)) {
+        const client = this.clients.get(packageId);
+        if (client) {
+          this.notifyAuthOutcome(packageId, "auth_required");
+          return { kind: "auth_required", client, error };
+        }
+      }
+      if (isPermanentConnectFailure(error)) {
+        return {
+          kind: "permanent_failure",
+          failureClass: classifyPermanentConnectFailure(error),
+          error,
+        };
+      }
+      return {
+        kind: "transient_failure",
+        failureClass: classifyTransientConnectFailure(error),
+        error,
+      };
+    }
+  }
+
   async getClient(packageId: string): Promise<McpClient> {
     const configuredPackage = this.getPackage(packageId);
     if (configuredPackage?.setupStatus?.state === "blocked") {
@@ -1003,11 +1153,18 @@ export class PackageRegistry {
       if (client.healthCheck) {
         const health = await client.healthCheck();
         if (health === "ok") {
+          if (this.authRequiredPackages.has(packageId)) {
+            this.notifyAuthOutcome(packageId, "authenticated");
+          }
           // Update activity for stdio clients
           const config = this.getPackage(packageId);
           if (config?.transport === "stdio") {
             this.lastActivity.set(packageId, Date.now());
           }
+          return client;
+        }
+        if (health === "needs_auth") {
+          this.notifyAuthOutcome(packageId, "auth_required");
           return client;
         }
         // Client exists but not healthy, remove it.
@@ -1021,10 +1178,23 @@ export class PackageRegistry {
         // the first concurrent caller bumps the counter.
         const deleted = this.clients.delete(packageId);
         if (deleted) {
+          try {
+            await client.close();
+          } catch (error) {
+            logger.warn("Failed to close unhealthy MCP client", {
+              package_id: packageId,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
           this.evictionCounts.set(
             packageId,
             (this.evictionCounts.get(packageId) ?? 0) + 1,
           );
+          this.emitLifecycle({
+            type: "client_evicted",
+            packageId,
+            reason: "unhealthy",
+          });
         }
         client = undefined;
       } else {
@@ -1067,6 +1237,7 @@ export class PackageRegistry {
     try {
       client = await clientPromise;
       this.clients.set(packageId, client);
+      this.emitLifecycle({ type: "client_created", packageId });
       // Stage 4b: increment per-package spawn counter exactly once per
       // successful `createAndConnectClient()` completion (initial create path).
       // The healthCheck-ok revive branch above does NOT increment — no new
@@ -1277,6 +1448,7 @@ export class PackageRegistry {
 
       this.clients.delete(packageId);
       this.lastActivity.delete(packageId);
+      this.emitLifecycle({ type: "client_evicted", packageId, reason: "idle" });
       // Stage 4b: count this idle-reaper closure.
       this.reapCounts.set(packageId, (this.reapCounts.get(packageId) ?? 0) + 1);
       reaped.push(packageId);
@@ -1391,8 +1563,35 @@ export class PackageRegistry {
     onClientCreated?.(client);
 
     try {
-      // Connect the client
-      await client.connect();
+      const timeoutMs = registryConnectTimeoutMs();
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+      let timedOut = false;
+      const connectPromise = client.connect();
+      connectPromise.then(
+        async () => {
+          if (!timedOut) return;
+          try {
+            await client.close();
+          } catch (cleanupError) {
+            logger.warn("Failed to close MCP client after late connect completion", {
+              package_id: packageId,
+              error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+            });
+          }
+        },
+        () => undefined,
+      );
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true;
+          reject(connectTimeoutError(packageId, timeoutMs));
+        }, timeoutMs);
+      });
+      try {
+        await Promise.race([connectPromise, timeoutPromise]);
+      } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+      }
     } catch (error) {
       // Preserve the current caller-visible auth behavior while returning a
       // typed outcome for the Stage 4 catalog writer.
@@ -1402,7 +1601,17 @@ export class PackageRegistry {
           message: `Use 'authenticate(package_id: "${packageId}")' to sign in`,
           oauth_enabled: config.oauth === true,
         });
+        this.notifyAuthOutcome(packageId, "auth_required");
         return { kind: "auth_required", client, error };
+      }
+
+      try {
+        await client.close();
+      } catch (cleanupError) {
+        logger.warn("Failed to close MCP client after connect failure", {
+          package_id: packageId,
+          error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+        });
       }
 
       if (isPermanentConnectFailure(error)) {
@@ -1501,6 +1710,7 @@ export class PackageRegistry {
         });
       }
       this.clients.delete(packageId);
+      this.emitLifecycle({ type: "client_evicted", packageId, reason: "restart" });
     }
 
     this.lastActivity.delete(packageId);
@@ -1555,6 +1765,7 @@ export class PackageRegistry {
     await Promise.allSettled(closePromises);
     this.clients.clear();
     this.lastActivity.clear();
+    this.authRequiredPackages.clear();
 
     logger.info("All clients closed");
   }
@@ -1614,24 +1825,32 @@ export class PackageRegistry {
     });
   }
 
-  async healthCheck(packageId: string): Promise<"ok" | "error" | "unavailable"> {
+  async healthCheckWithClient(packageId: string): Promise<{
+    health: "ok" | "error" | "unavailable";
+    client?: McpClient;
+    error?: unknown;
+  }> {
     try {
       const client = await this.getClient(packageId);
       if ("healthCheck" in client && typeof client.healthCheck === "function") {
         const result = await client.healthCheck();
         // Map "needs_auth" to "unavailable" for the registry level
         if (result === "needs_auth") {
-          return "unavailable";
+          return { health: "unavailable", client };
         }
-        return result;
+        return { health: result, client };
       }
-      return "ok";
+      return { health: "ok", client };
     } catch (error) {
       logger.debug("Health check failed", {
         package_id: packageId,
         error: error instanceof Error ? error.message : String(error),
       });
-      return "unavailable";
+      return { health: "unavailable", error };
     }
+  }
+
+  async healthCheck(packageId: string): Promise<"ok" | "error" | "unavailable"> {
+    return (await this.healthCheckWithClient(packageId)).health;
   }
 }

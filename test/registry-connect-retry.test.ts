@@ -1,6 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PackageRegistry } from "../src/registry.js";
-import type { McpClient, PackageConfig, SuperMcpConfig } from "../src/types.js";
+import { HttpMcpClient } from "../src/clients/httpClient.js";
+import { StdioMcpClient } from "../src/clients/stdioClient.js";
+import type {
+  ConnectOutcome,
+  McpClient,
+  PackageConfig,
+  SuperMcpConfig,
+} from "../src/types.js";
 
 const { loggerMock } = vi.hoisted(() => ({
   loggerMock: {
@@ -21,7 +28,7 @@ type RegistryInternals = {
     packageId: string,
     config: PackageConfig,
     onClientCreated?: (client: McpClient) => void,
-  ) => Promise<McpClient>;
+  ) => Promise<ConnectOutcome | McpClient>;
 };
 
 function createRegistry(packageId = "GoogleWorkspace-acme"): PackageRegistry {
@@ -71,7 +78,55 @@ describe("PackageRegistry connect retry", () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
   });
+
+  it.each(["stdio", "http"] as const)(
+    "bounds %s connects, closes the timed-out client, and ignores late completion",
+    async (transport) => {
+      vi.useFakeTimers();
+      vi.stubEnv("SUPER_MCP_CONNECT_TIMEOUT_MS", "10");
+      const packageId = `timeout-${transport}`;
+      const config: PackageConfig = transport === "stdio"
+        ? {
+            id: packageId,
+            name: packageId,
+            transport,
+            command: "node",
+            args: ["server.js"],
+            visibility: "default",
+          }
+        : {
+            id: packageId,
+            name: packageId,
+            transport,
+            base_url: "https://timeout.example.test/mcp",
+            visibility: "default",
+          };
+      const registry = new PackageRegistry({ packages: [config] });
+      const connectAttempt = deferred<void>();
+      const prototype = transport === "stdio"
+        ? StdioMcpClient.prototype
+        : HttpMcpClient.prototype;
+      vi.spyOn(prototype, "connect").mockReturnValue(connectAttempt.promise);
+      const close = vi.spyOn(prototype, "close").mockResolvedValue(undefined);
+      const internals = registry as unknown as RegistryInternals;
+
+      const outcomePromise = internals.createAndConnectClient(packageId, config);
+      await vi.advanceTimersByTimeAsync(10);
+      await expect(outcomePromise).resolves.toMatchObject({
+        kind: "transient_failure",
+        failureClass: "timeout",
+      });
+      expect(close).toHaveBeenCalled();
+
+      connectAttempt.resolve(undefined);
+      await Promise.resolve();
+      expect((registry as unknown as { clients: Map<string, McpClient> }).clients.has(packageId))
+        .toBe(false);
+    },
+  );
 
   it("retries one failed connect and cleans the per-package single-flight", async () => {
     const packageId = "GoogleWorkspace-acme";

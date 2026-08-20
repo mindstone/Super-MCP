@@ -60,7 +60,14 @@ export async function handleHealthCheckAll(
     packages,
     async (pkg: PackageConfig) => {
       try {
-        const health = await registry.healthCheck(pkg.id);
+        const healthResult = typeof registry.healthCheckWithClient === "function"
+          ? await registry.healthCheckWithClient(pkg.id)
+          : {
+              health: await registry.healthCheck(pkg.id),
+              client: await registry.getClient(pkg.id),
+            };
+        if (healthResult.error) throw healthResult.error;
+        const { health } = healthResult;
 
         // Sync catalog if registry reports healthy but catalog has stale error
         const catalogStatus = catalog.getPackageStatus(pkg.id);
@@ -68,7 +75,8 @@ export async function handleHealthCheckAll(
           catalog.clearPackage(pkg.id);
         }
 
-        const client = await registry.getClient(pkg.id);
+        const client = healthResult.client;
+        if (!client) throw new Error(`Package '${pkg.id}' is unavailable`);
         const requiresAuth = client.requiresAuth ? await client.requiresAuth() : false;
         const isAuthenticated = requiresAuth && client.isAuthenticated ? await client.isAuthenticated() : true;
 

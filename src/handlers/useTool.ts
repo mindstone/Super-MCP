@@ -1463,7 +1463,10 @@ export async function handleUseTool(
     };
   }
 
-  await catalog.ensurePackageLoaded(package_id);
+  await catalog.ensurePackageLoaded(package_id, {
+    forceReconnect: catalog.getPackageStatus(package_id) !== "ready",
+    reason: "explicit",
+  });
   const packageStatus = catalog.getPackageStatus(package_id);
   if (packageStatus === "auth_required") {
     throw {
