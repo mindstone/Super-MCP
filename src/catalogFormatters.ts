@@ -22,7 +22,7 @@ export interface DiscoveryPackageState {
 export interface UnavailableCatalogPackage {
   package_id: string;
   status: Exclude<CatalogStatus, "ready">;
-  reason?: string;
+  reason: string;
   retry_in_ms: number | null;
   next_retry_at: number | null;
 }
@@ -67,7 +67,7 @@ export function listUnavailablePackages(
     return [{
       package_id: pkg.id,
       status: state.catalogStatus,
-      reason: state.reason,
+      reason: state.reason ?? "Package is unavailable.",
       retry_in_ms: state.retryInMs,
       next_retry_at: state.nextRetryAt,
     }];

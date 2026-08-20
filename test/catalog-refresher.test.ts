@@ -137,7 +137,7 @@ describe("CatalogRefresher lifecycle", () => {
     expect(callCount).toBe(2);
   });
 
-  it("R15: a healthy package reaches ready while the warm-sweep budget is saturated by hung packages", async () => {
+  it("R15: a healthy package eventually reaches ready after bounded hung attempts time out", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-19T00:00:00.000Z"));
     const CatalogRefresher = await loadCatalogRefresher();
