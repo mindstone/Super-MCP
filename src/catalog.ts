@@ -761,6 +761,13 @@ export class Catalog implements CatalogView {
         schedule: retryAt === null ? "none" : "transient_backoff",
       };
     }
+    if (cached.status === "connecting") {
+      return {
+        retryAt: now,
+        retryInMs: 0,
+        schedule: "transient_backoff",
+      };
+    }
     return { retryAt: null, retryInMs: null, schedule: "none" };
   }
 

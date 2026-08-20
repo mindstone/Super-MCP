@@ -84,6 +84,12 @@ function classifyTransientFailure(error: unknown): TransientConnectFailureClass 
 interface QueuedRefresh {
   forceReconnect: boolean;
   reason: NonNullable<CatalogRefreshRequest["reason"]> | "half_open" | "registry" | "startup";
+  waiters: Array<() => void>;
+}
+
+interface InFlightRefresh {
+  promise: Promise<void>;
+  forceReconnect: boolean;
 }
 
 interface CatalogRegistrySeam {
@@ -113,8 +119,7 @@ export class CatalogRefresher {
   private readonly now: () => number;
   private readonly random: () => number;
   private readonly queue = new Map<string, QueuedRefresh>();
-  private readonly inFlight = new Map<string, Promise<void>>();
-  private readonly waiters = new Map<string, Array<() => void>>();
+  private readonly inFlight = new Map<string, InFlightRefresh>();
   private activeCount = 0;
   private started = false;
   private disposed = false;
@@ -124,6 +129,7 @@ export class CatalogRefresher {
   private readinessGeneration: number;
   private readinessPromise: Promise<void>;
   private resolveReadiness: () => void = () => undefined;
+  private readinessResolved = false;
 
   constructor(
     catalog: Catalog,
@@ -179,20 +185,12 @@ export class CatalogRefresher {
 
   scheduleRefresh(packageId: string): void {
     if (this.disposed) return;
-    const status = this.catalog.getPackageStatus(packageId);
-    if (status === "ready") return;
-    if (status === "auth_required") {
-      this.ensureAuthProbeScheduled(packageId);
+    const refresh = this.getDueRefresh(packageId);
+    if (!refresh) {
       this.armWakeTimer();
       return;
     }
-
-    const retryHint = this.catalog.getRetryHint(packageId, this.now());
-    if (retryHint.retryAt !== null && retryHint.retryAt > this.now()) {
-      this.armWakeTimer();
-      return;
-    }
-    this.enqueue(packageId, { forceReconnect: false, reason: "passive" });
+    this.enqueue(packageId, refresh);
     this.drainQueue();
   }
 
@@ -201,32 +199,27 @@ export class CatalogRefresher {
     request: CatalogRefreshRequest = { reason: "passive" },
   ): Promise<void> {
     if (this.disposed || !this.registry.getPackage(packageId)) return Promise.resolve();
-    const running = this.inFlight.get(packageId);
-    if (running) return running;
-
     const forceByIntent = request.reason === "authentication" ||
       request.reason === "restart" ||
       request.reason === "configuration";
-    if (!forceByIntent && request.forceReconnect !== true) {
-      const status = this.catalog.getPackageStatus(packageId);
-      if (status === "ready") return Promise.resolve();
-      const retryHint = this.catalog.getRetryHint(packageId, this.now());
-      if (retryHint.retryAt === null || retryHint.retryAt > this.now()) {
-        return Promise.resolve();
-      }
+    const forceReconnect = request.forceReconnect === true || forceByIntent;
+    const running = this.inFlight.get(packageId);
+    if (running) {
+      if (!forceReconnect || running.forceReconnect) return running.promise;
+      return this.enqueueAndWait(packageId, {
+        forceReconnect: true,
+        reason: request.reason ?? "explicit",
+      });
     }
 
-    const promise = new Promise<void>((resolve) => {
-      const packageWaiters = this.waiters.get(packageId) ?? [];
-      packageWaiters.push(resolve);
-      this.waiters.set(packageId, packageWaiters);
-    });
-    this.enqueue(packageId, {
-      forceReconnect: request.forceReconnect === true || forceByIntent,
-      reason: request.reason ?? "passive",
-    });
-    this.drainQueue();
-    return promise;
+    const refresh = forceReconnect
+      ? {
+          forceReconnect: true,
+          reason: request.reason ?? "explicit",
+        }
+      : this.getDueRefresh(packageId, request.reason ?? "passive");
+    if (!refresh) return Promise.resolve();
+    return this.enqueueAndWait(packageId, refresh);
   }
 
   notify(
@@ -234,22 +227,34 @@ export class CatalogRefresher {
     reason: "authentication" | "configuration" | "restart" | "explicit" | "registry",
   ): void {
     if (this.disposed || !this.registry.getPackage(packageId)) return;
-    if (this.inFlight.has(packageId)) return;
     if (reason === "configuration") {
       this.configurationChanged();
       return;
     }
-    this.enqueue(packageId, { forceReconnect: true, reason });
+    const forceReconnect = reason !== "registry";
+    const running = this.inFlight.get(packageId);
+    if (running && (!forceReconnect || running.forceReconnect)) return;
+    this.enqueue(packageId, { forceReconnect, reason });
     this.drainQueue();
   }
 
   configurationChanged(): void {
     if (this.disposed) return;
+    const interruptedPackageIds = new Set(this.inFlight.keys());
+    for (const pkg of this.registry.getPackages()) {
+      if (this.catalog.getPackageStatus(pkg.id) === "connecting") {
+        interruptedPackageIds.add(pkg.id);
+      }
+    }
     const { changedPackageIds } = this.catalog.reconcileConfiguration();
     this.resetReadinessForCurrentGeneration();
-    for (const packageId of changedPackageIds) {
+    const changed = new Set(changedPackageIds);
+    for (const packageId of [...changed, ...interruptedPackageIds]) {
       if (this.registry.getPackage(packageId)) {
-        this.enqueue(packageId, { forceReconnect: true, reason: "configuration" });
+        this.enqueue(packageId, {
+          forceReconnect: changed.has(packageId),
+          reason: "configuration",
+        });
       }
     }
     this.drainQueue();
@@ -282,36 +287,73 @@ export class CatalogRefresher {
       clearTimeout(this.wakeTimer);
       this.wakeTimer = null;
     }
+    for (const refresh of this.queue.values()) {
+      for (const resolve of refresh.waiters) resolve();
+    }
     this.queue.clear();
     for (const disposeAttempt of this.disposeAttempts) disposeAttempt();
     this.disposeAttempts.clear();
     this.resolveReadiness();
-    this.resolveAllWaiters();
     logger.info("Catalog refresher disposed", {
       refreshes_in_flight: this.inFlight.size,
     });
   }
 
-  private enqueue(packageId: string, refresh: QueuedRefresh): void {
+  private enqueue(
+    packageId: string,
+    refresh: Omit<QueuedRefresh, "waiters">,
+    waiter?: () => void,
+  ): void {
     if (this.disposed || !this.registry.getPackage(packageId)) return;
     const queued = this.queue.get(packageId);
     this.queue.set(packageId, {
       forceReconnect: Boolean(queued?.forceReconnect || refresh.forceReconnect),
-      reason: refresh.reason,
+      reason: refresh.forceReconnect || !queued ? refresh.reason : queued.reason,
+      waiters: [...(queued?.waiters ?? []), ...(waiter ? [waiter] : [])],
     });
+  }
+
+  private enqueueAndWait(
+    packageId: string,
+    refresh: Omit<QueuedRefresh, "waiters">,
+  ): Promise<void> {
+    const promise = new Promise<void>((resolve) => {
+      this.enqueue(packageId, refresh, resolve);
+    });
+    this.drainQueue();
+    return promise;
+  }
+
+  private getDueRefresh(
+    packageId: string,
+    reason: NonNullable<CatalogRefreshRequest["reason"]> = "passive",
+  ): Omit<QueuedRefresh, "waiters"> | null {
+    const status = this.catalog.getPackageStatus(packageId);
+    if (status === "ready") return null;
+    if (status === "auth_required") this.ensureAuthProbeScheduled(packageId);
+
+    const now = this.now();
+    const retryHint = this.catalog.getRetryHint(packageId, now);
+    if (retryHint.retryAt === null || retryHint.retryAt > now) return null;
+    return {
+      forceReconnect: status === "auth_required",
+      reason: status === "auth_required" ? "half_open" : reason,
+    };
   }
 
   private drainQueue(): void {
     if (!this.started || this.disposed) return;
     while (this.activeCount < this.concurrency && this.queue.size > 0) {
-      const next = this.queue.entries().next().value as [string, QueuedRefresh] | undefined;
+      const next = Array.from(this.queue.entries()).find(
+        ([packageId]) => !this.inFlight.has(packageId),
+      );
       if (!next) break;
       const [packageId, refresh] = next;
       this.queue.delete(packageId);
-      if (this.inFlight.has(packageId)) continue;
 
       this.activeCount += 1;
-      const refreshPromise = this.runRefresh(packageId, refresh)
+      const refreshPromise = Promise.resolve()
+        .then(() => this.runRefresh(packageId, refresh))
         .catch((error: unknown) => {
           logger.error("Unexpected catalog refresher failure", {
             package_id: packageId,
@@ -321,12 +363,15 @@ export class CatalogRefresher {
         .finally(() => {
           this.activeCount -= 1;
           this.inFlight.delete(packageId);
-          this.resolvePackageWaiters(packageId);
+          for (const resolve of refresh.waiters) resolve();
           this.updateReadiness();
           this.armWakeTimer();
           this.drainQueue();
         });
-      this.inFlight.set(packageId, refreshPromise);
+      this.inFlight.set(packageId, {
+        promise: refreshPromise,
+        forceReconnect: refresh.forceReconnect,
+      });
     }
   }
 
@@ -522,6 +567,7 @@ export class CatalogRefresher {
     const now = this.now();
     let nextWakeAt: number | null = null;
     for (const pkg of this.registry.getPackages()) {
+      if (this.inFlight.has(pkg.id) || this.queue.has(pkg.id)) continue;
       const hint = this.catalog.getRetryHint(pkg.id, now);
       if (hint.retryAt === null) continue;
       if (nextWakeAt === null || hint.retryAt < nextWakeAt) nextWakeAt = hint.retryAt;
@@ -539,6 +585,7 @@ export class CatalogRefresher {
     if (this.disposed) return;
     const now = this.now();
     for (const pkg of this.registry.getPackages()) {
+      if (this.inFlight.has(pkg.id) || this.queue.has(pkg.id)) continue;
       const status = this.catalog.getPackageStatus(pkg.id);
       const hint = this.catalog.getRetryHint(pkg.id, now);
       if (hint.retryAt === null || hint.retryAt > now) continue;
@@ -558,12 +605,17 @@ export class CatalogRefresher {
       event.type === "client_evicted" &&
       (event.reason === "idle" || event.reason === "restart" || event.reason === "shutdown")
     ) return;
-    this.notify(event.packageId, event.type === "auth_outcome" ? "authentication" : "registry");
+    this.notify(event.packageId, "registry");
   }
 
   private createReadinessPromise(): Promise<void> {
+    this.readinessResolved = false;
     return new Promise<void>((resolve) => {
-      this.resolveReadiness = resolve;
+      this.resolveReadiness = () => {
+        if (this.readinessResolved) return;
+        this.readinessResolved = true;
+        resolve();
+      };
     });
   }
 
@@ -577,16 +629,10 @@ export class CatalogRefresher {
 
   private updateReadiness(): void {
     this.resetReadinessForCurrentGeneration();
-    if (this.catalog.isSnapshotComplete()) this.resolveReadiness();
-  }
-
-  private resolvePackageWaiters(packageId: string): void {
-    const waiters = this.waiters.get(packageId) ?? [];
-    this.waiters.delete(packageId);
-    for (const resolve of waiters) resolve();
-  }
-
-  private resolveAllWaiters(): void {
-    for (const packageId of this.waiters.keys()) this.resolvePackageWaiters(packageId);
+    if (this.catalog.isSnapshotComplete()) {
+      this.resolveReadiness();
+    } else if (this.readinessResolved) {
+      this.readinessPromise = this.createReadinessPromise();
+    }
   }
 }

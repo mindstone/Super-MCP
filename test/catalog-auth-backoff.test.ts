@@ -101,7 +101,7 @@ describe("CatalogRefresher auth recovery and backoff", () => {
     expect(registryInternals.clients.get(PACKAGE.id)).toBe(authClient);
   });
 
-  it("R7: auth retries are half-open or event-driven and remain single-flight through registry healthCheck", async () => {
+  it("R7: auth retries stay closed through 999ms, probe at the 1000ms boundary, and remain event-driven", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-08-19T00:00:00.000Z"));
     const { CatalogRefresher } = await loadRefresherModule();

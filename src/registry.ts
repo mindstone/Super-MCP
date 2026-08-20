@@ -351,6 +351,8 @@ export class PackageRegistry {
   private reaperTimeoutMs: number = 300_000; // 5 minutes default
   private lifecycleListeners = new Set<(event: RegistryLifecycleEvent) => void>();
   private authRequiredPackages = new Set<string>();
+  private evictionPromises = new Map<string, Promise<void>>();
+  private leaseDrainWaiters = new Map<string, Array<() => void>>();
 
   // ── Stage 4b lifecycle counters ────────────────────────────────────
   // Cumulative per-package counters backing GET /stats.
@@ -386,11 +388,11 @@ export class PackageRegistry {
   private reestablishCounts: Map<string, number> = new Map();
 
   // ── Stage 6: per-package active-use lease (idle-reaper exclusion) ────
-  // Counts in-flight `callTool` brackets per package. Acquired synchronously
-  // BEFORE the first `await` in `callTool` and released in its `finally`, so a
-  // client that is actively being used can never be reaped mid-flight by
-  // `sweepIdleClients` — closing the TOCTOU window that previously rejected an
-  // in-flight request with `McpError(ConnectionClosed)` = -32000.
+  // Counts in-flight `callTool` brackets per package. Admission begins before
+  // `getClient`; the no-eviction fast path increments synchronously, while a
+  // pending forced eviction finishes before a new use is admitted. The lease is
+  // released in `finally`, so refresh eviction and the idle reaper cannot close
+  // a client mid-flight with `McpError(ConnectionClosed)` = -32000.
   // Invariant: leased (count > 0) ⇒ not reaped.
   private activeLeases: Map<string, number> = new Map();
 
@@ -1057,27 +1059,40 @@ export class PackageRegistry {
     packageId: string,
     reason: "unhealthy" | "explicit" | "restart" | "idle" | "shutdown" = "explicit",
   ): Promise<void> {
-    const client = this.clients.get(packageId);
-    if (!client) return;
-    if (!this.clients.delete(packageId)) return;
-    if (reason === "unhealthy") {
-      this.evictionCounts.set(
-        packageId,
-        (this.evictionCounts.get(packageId) ?? 0) + 1,
-      );
-    }
-    try {
-      await client.close();
-    } catch (error) {
-      logger.warn("Failed to close evicted MCP client", {
-        package_id: packageId,
-        reason,
-        error: error instanceof Error ? error.message : String(error),
-      });
-    } finally {
-      this.lastActivity.delete(packageId);
-      this.emitLifecycle({ type: "client_evicted", packageId, reason });
-    }
+    const previousEviction = this.evictionPromises.get(packageId);
+    let eviction!: Promise<void>;
+    eviction = (async () => {
+      if (previousEviction) await previousEviction;
+      await this.waitForActiveLeases(packageId);
+
+      const client = this.clients.get(packageId);
+      if (!client) return;
+      if (!this.clients.delete(packageId)) return;
+      if (reason === "unhealthy") {
+        this.evictionCounts.set(
+          packageId,
+          (this.evictionCounts.get(packageId) ?? 0) + 1,
+        );
+      }
+      try {
+        await client.close();
+      } catch (error) {
+        logger.warn("Failed to close evicted MCP client", {
+          package_id: packageId,
+          reason,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      } finally {
+        this.lastActivity.delete(packageId);
+        this.emitLifecycle({ type: "client_evicted", packageId, reason });
+      }
+    })().finally(() => {
+      if (this.evictionPromises.get(packageId) === eviction) {
+        this.evictionPromises.delete(packageId);
+      }
+    });
+    this.evictionPromises.set(packageId, eviction);
+    await eviction;
   }
 
   async connectForCatalog(
@@ -1280,13 +1295,30 @@ export class PackageRegistry {
   }
   
   /**
-   * Stage 6: acquire an active-use lease on a package. MUST be called
-   * synchronously (before any `await`) to close the reaper race. Idempotent
-   * re-entry is supported via the counter (nested/concurrent calls each hold
-   * their own ref).
+   * Stage 6: acquire an active-use lease on a package before `getClient`.
+   * Pending forced evictions have priority; otherwise the count is incremented
+   * synchronously before this async method returns. Re-entry is supported via
+   * the counter (nested/concurrent calls each hold their own ref).
    */
-  private acquireLease(packageId: string): void {
-    this.activeLeases.set(packageId, (this.activeLeases.get(packageId) ?? 0) + 1);
+  private async acquireLease(packageId: string): Promise<void> {
+    while (true) {
+      const eviction = this.evictionPromises.get(packageId);
+      if (eviction) {
+        await eviction;
+        continue;
+      }
+      this.activeLeases.set(packageId, (this.activeLeases.get(packageId) ?? 0) + 1);
+      return;
+    }
+  }
+
+  private waitForActiveLeases(packageId: string): Promise<void> {
+    if ((this.activeLeases.get(packageId) ?? 0) === 0) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      const waiters = this.leaseDrainWaiters.get(packageId) ?? [];
+      waiters.push(resolve);
+      this.leaseDrainWaiters.set(packageId, waiters);
+    });
   }
 
   /**
@@ -1297,6 +1329,9 @@ export class PackageRegistry {
     const next = (this.activeLeases.get(packageId) ?? 0) - 1;
     if (next <= 0) {
       this.activeLeases.delete(packageId);
+      const waiters = this.leaseDrainWaiters.get(packageId) ?? [];
+      this.leaseDrainWaiters.delete(packageId);
+      for (const resolve of waiters) resolve();
     } else {
       this.activeLeases.set(packageId, next);
     }
@@ -1319,7 +1354,7 @@ export class PackageRegistry {
    * in-flight close propagates -32000 to the caller unchanged.
    */
   async callTool(packageId: string, toolId: string, args: any): Promise<any> {
-    this.acquireLease(packageId);
+    await this.acquireLease(packageId);
     try {
       let client = await this.getClient(packageId);
       // Pre-send liveness re-check: the lease blocks the reaper, but the client
