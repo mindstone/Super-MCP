@@ -63,26 +63,25 @@ function makeTool(name: string, opts: {
  */
 function createMockCatalog(tools: ReturnType<typeof makeTool>[]): Catalog {
   return {
-    ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
     getPackageStatus: vi.fn().mockReturnValue('ready'),
     getPackageError: vi.fn().mockReturnValue(undefined),
-    buildToolInfos: vi.fn().mockImplementation((_pkgId: string, options: any = {}) => {
-      const { summarize = true, include_schemas = true, include_descriptions = false } = options;
-
-      return Promise.resolve(
-        tools.map(t => ({
-          package_id: t.package_id,
-          tool_id: t.tool_id,
-          name: t.name,
-          description: include_descriptions ? t.description : undefined,
-          summary: summarize ? t.summary : undefined,
-          args_skeleton: summarize ? t.args_skeleton : undefined,
-          schema_hash: t.schema_hash,
-          schema: include_schemas ? t.schema : undefined,
-          ...(t.annotations ? { annotations: t.annotations } : {}),
-        }))
-      );
+    getRetryHint: vi.fn().mockReturnValue({
+      retryAt: null,
+      retryInMs: null,
+      schedule: 'none',
     }),
+    getPackageTools: vi.fn().mockReturnValue(tools.map(t => ({
+      packageId: t.package_id,
+      tool: {
+        name: t.tool_id.replace(`${t.package_id}__`, ''),
+        description: t.description,
+        inputSchema: t.schema,
+        annotations: t.annotations,
+      },
+      summary: t.summary,
+      argsSkeleton: t.args_skeleton,
+      schemaHash: t.schema_hash,
+    }))),
   } as unknown as Catalog;
 }
 
@@ -158,12 +157,7 @@ describe('handleListTools — detail parameter', () => {
       expect(tool.schema_hash).toBeTruthy();
     }
 
-    // Verify buildToolInfos was called with summarize=false, include_schemas=false, include_descriptions=true
-    expect(catalog.buildToolInfos).toHaveBeenCalledWith('test-pkg', {
-      summarize: false,
-      include_schemas: false,
-      include_descriptions: true,
-    });
+    expect(catalog.getPackageTools).toHaveBeenCalledWith('test-pkg');
   });
 
   // -----------------------------------------------------------------------
@@ -189,12 +183,7 @@ describe('handleListTools — detail parameter', () => {
       expect(tool.summary).toBeTruthy();
     }
 
-    // Verify buildToolInfos was called with summarize=true, include_schemas=true, include_descriptions=true
-    expect(catalog.buildToolInfos).toHaveBeenCalledWith('test-pkg', {
-      summarize: true,
-      include_schemas: true,
-      include_descriptions: true,
-    });
+    expect(catalog.getPackageTools).toHaveBeenCalledWith('test-pkg');
   });
 
   // -----------------------------------------------------------------------
@@ -219,11 +208,7 @@ describe('handleListTools — detail parameter', () => {
       expect(tool.description).toBeTruthy();
     }
 
-    expect(catalog.buildToolInfos).toHaveBeenCalledWith('test-pkg', {
-      summarize: false,
-      include_schemas: false,
-      include_descriptions: true,
-    });
+    expect(catalog.getPackageTools).toHaveBeenCalledWith('test-pkg');
   });
 
   it('detail: "full" returns full tool info', async () => {
@@ -243,11 +228,7 @@ describe('handleListTools — detail parameter', () => {
       expect(tool.schema).toBeDefined();
     }
 
-    expect(catalog.buildToolInfos).toHaveBeenCalledWith('test-pkg', {
-      summarize: true,
-      include_schemas: true,
-      include_descriptions: true,
-    });
+    expect(catalog.getPackageTools).toHaveBeenCalledWith('test-pkg');
   });
 
   // -----------------------------------------------------------------------
@@ -267,8 +248,8 @@ describe('handleListTools — detail parameter', () => {
       message: expect.stringContaining('Invalid detail value: "medium"'),
     });
 
-    // Should fail before calling buildToolInfos
-    expect(catalog.buildToolInfos).not.toHaveBeenCalled();
+    // Should fail before reading the catalog snapshot.
+    expect(catalog.getPackageTools).not.toHaveBeenCalled();
   });
 
   // -----------------------------------------------------------------------
@@ -362,11 +343,7 @@ describe('handleListTools — detail parameter', () => {
       expect(tool.description).toBeTruthy();
     }
 
-    expect(catalog.buildToolInfos).toHaveBeenCalledWith('test-pkg', {
-      summarize: false,
-      include_schemas: false,
-      include_descriptions: true,
-    });
+    expect(catalog.getPackageTools).toHaveBeenCalledWith('test-pkg');
   });
 
   it('emits full tool info when detail: "full" is explicitly requested', async () => {
@@ -388,11 +365,7 @@ describe('handleListTools — detail parameter', () => {
       expect(tool.description).toBeTruthy();
     }
 
-    expect(catalog.buildToolInfos).toHaveBeenCalledWith('test-pkg', {
-      summarize: true,
-      include_schemas: true,
-      include_descriptions: true,
-    });
+    expect(catalog.getPackageTools).toHaveBeenCalledWith('test-pkg');
   });
 
   // -----------------------------------------------------------------------

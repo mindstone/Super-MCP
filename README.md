@@ -32,6 +32,14 @@ Super MCP Router allows you to configure multiple MCP servers (both local stdio 
 - `health_check` - Check the status of a specific package
 - `restart_package` - Hot-reload a package's credentials without restarting Super-MCP
 
+### Discovery snapshots
+
+Discovery is a read of Super MCP's latest health-gated catalog snapshot. The passive discovery tools—`list_tool_packages`, `list_tools`, `get_tool_details`, `search_tools`, and package help from `get_help`—do not wait for packages to connect. Unreachable or unauthenticated packages are reported with their catalog status and retry information instead of delaying every other package.
+
+The catalog REST routes follow the same rule. `GET /api/tools` returns immediately by default; a cold-start consumer may opt into a bounded wait with `wait_for_snapshot_ms`, for example `GET /api/tools?wait_for_snapshot_ms=500`. If the current configuration generation is still not ready when that budget ends, the response remains explicitly incomplete (`snapshot_complete: false`) and includes `degraded_packages`—an empty snapshot is never presented as a successful complete catalog.
+
+Tool execution remains explicit. `use_tool`, `read_resource`, and `bulk_export` may establish a bounded package connection when doing the requested work; their catalog lookups themselves only consult the snapshot.
+
 ## Documentation
 
 For detailed guides, see the `docs/` directory:
@@ -459,7 +467,7 @@ npm run build
 - **Mixed Transports**: Combine stdio and HTTP MCPs seamlessly
 - **HTTP Transport Support**: Both HTTP+SSE (legacy) and Streamable HTTP (recommended)
 - **OAuth Support**: Browser-based OAuth flow with persistent token storage
-- **Tool Discovery**: Automatic tool enumeration and caching
+- **Tool Discovery**: Background refresh with fast, health-gated snapshot reads
 - **Validation**: Schema validation for all tool arguments
 - **Error Handling**: Comprehensive error codes and messages with contextual help
 - **Improved Authentication**: Clear error messages guiding users to authenticate when needed
@@ -475,7 +483,9 @@ src/
 ├── cli.ts              # CLI entry point
 ├── server.ts           # MCP server with meta-tools
 ├── registry.ts         # Config loading & package management
-├── catalog.ts          # Tool caching & discovery
+├── catalog.ts          # Snapshot state and health-gated catalog reads
+├── catalogRefresher.ts # Bounded background connection and refresh ownership
+├── catalogFormatters.ts# Pure catalog response formatting
 ├── security.ts         # Security policy (allowlist/blocklist)
 ├── configWatcher.ts    # Config hot-reload for security
 ├── summarize.ts        # Tool summaries & arg skeletons

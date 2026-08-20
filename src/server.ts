@@ -4,11 +4,15 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import crypto from "node:crypto";
 import express from "express";
-import PQueue from "p-queue";
 import { ERROR_CODES } from "./types.js";
 import { PackageRegistry } from "./registry.js";
 import { Catalog } from "./catalog.js";
 import { CatalogRefresher } from "./catalogRefresher.js";
+import {
+  buildToolInfos,
+  getDiscoveryPackageState,
+  listUnavailablePackages,
+} from "./catalogFormatters.js";
 import { getValidator } from "./validator.js";
 import { getLogger } from "./logging.js";
 import { registerSuperMcpHealthRoute } from "./health.js";
@@ -33,6 +37,10 @@ import {
 } from "./handlers/index.js";
 import { formatError } from "./utils/formatError.js";
 import { startWatchdog, type WatchdogHandle } from "./ownerWatchdog.js";
+import {
+  startDiscoveryWatchdog,
+  withDiscoveryWatchdog,
+} from "./discoveryWatchdog.js";
 import {
   beginTokenRefreshShutdown,
   drainInFlightTokenRefreshes,
@@ -69,6 +77,7 @@ async function drainRefreshesForShutdown(): Promise<void> {
 }
 
 const logger = getLogger();
+const MAX_SNAPSHOT_WAIT_MS = 120_000;
 
 type ToolCatalogEntry = {
   package_id: string;
@@ -170,16 +179,56 @@ function selectPackages(registry: PackageRegistry, requestedPackageIds: string[]
   return packages.filter((pkg) => requestedSet.has(pkg.id));
 }
 
+function parseSnapshotWaitMs(value: unknown): number | null {
+  if (value === undefined) return null;
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) return null;
+  return Math.min(parsed, MAX_SNAPSHOT_WAIT_MS);
+}
+
+async function waitForCurrentSnapshot(
+  requestedWaitMs: number | null,
+  catalog: Catalog,
+  catalogRefresher?: Pick<CatalogRefresher, "whenCurrentGenerationReady">,
+): Promise<void> {
+  if (
+    requestedWaitMs === null ||
+    requestedWaitMs === 0 ||
+    catalog.isSnapshotComplete() ||
+    !catalogRefresher
+  ) {
+    return;
+  }
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  try {
+    await Promise.race([
+      catalogRefresher.whenCurrentGenerationReady(),
+      new Promise<void>((resolve) => {
+        timeoutHandle = setTimeout(resolve, requestedWaitMs);
+        timeoutHandle.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
 export function registerHttpApiRoutes(
   app: express.Express,
   options: {
     registry: PackageRegistry;
     catalog: Catalog;
+    catalogRefresher?: Pick<
+      CatalogRefresher,
+      "scheduleRefresh" | "whenCurrentGenerationReady"
+    >;
     dnsRebindingGuard: express.RequestHandler;
     healthOwnerId?: string;
   }
 ): void {
-  const { registry, catalog, dnsRebindingGuard, healthOwnerId } = options;
+  const { registry, catalog, catalogRefresher, dnsRebindingGuard, healthOwnerId } = options;
 
   registerSuperMcpHealthRoute(app, healthOwnerId);
 
@@ -212,31 +261,17 @@ export function registerHttpApiRoutes(
   });
 
   app.get("/api/tools/manifest", async (_req, res) => {
+    const stopWatchdog = startDiscoveryWatchdog("GET /api/tools/manifest");
     try {
       const packages = registry.getPackages();
-      const queue = new PQueue({ concurrency: 5 });
-
-      await Promise.all(
-        packages.map((pkg) =>
-          queue.add(async () => {
-            try {
-              await catalog.ensurePackageLoaded(pkg.id);
-            } catch (pkgError) {
-              logger.warn("Failed to load package for manifest", {
-                package_id: pkg.id,
-                error: pkgError instanceof Error ? pkgError.message : String(pkgError),
-              });
-            }
-          })
-        )
-      );
+      for (const pkg of packages) catalogRefresher?.scheduleRefresh(pkg.id);
 
       const packageEntries: ManifestPackageEntry[] = packages.map((pkg) => ({
         package_id: pkg.id,
         package_name: pkg.name || pkg.id,
         tool_count: catalog.countTools(pkg.id),
         embedding_hash: catalog.computePackageEmbeddingHash(pkg.id),
-        status: catalog.getPackageStatus(pkg.id),
+        status: getDiscoveryPackageState(catalog, pkg.id).catalogStatus,
       }));
 
       const securityPolicy = getSecurityPolicy();
@@ -247,19 +282,30 @@ export function registerHttpApiRoutes(
         security_hash: securityHash,
         package_count: packages.length,
         generated_at: new Date().toISOString(),
+        snapshot_complete: catalog.isSnapshotComplete(),
+        degraded_packages: listUnavailablePackages(packages, catalog),
       });
     } catch (error) {
       logger.error("Failed to build tool manifest", {
         error: formatError(error),
       });
       res.status(500).json({ error: "Failed to build tool manifest" });
+    } finally {
+      stopWatchdog();
     }
   });
 
   app.get("/api/tools", async (req, res) => {
+    const stopWatchdog = startDiscoveryWatchdog("GET /api/tools");
     try {
       const requestedPackageIds = parseRequestedPackageIds(req.query.packages);
       const packages = selectPackages(registry, requestedPackageIds);
+      for (const pkg of packages) catalogRefresher?.scheduleRefresh(pkg.id);
+      await waitForCurrentSnapshot(
+        parseSnapshotWaitMs(req.query.wait_for_snapshot_ms),
+        catalog,
+        catalogRefresher,
+      );
 
       if (requestedPackageIds) {
         logger.debug("Selective tool fetch", {
@@ -269,40 +315,25 @@ export function registerHttpApiRoutes(
         });
       }
 
-      const queue = new PQueue({ concurrency: 5 });
+      const results = packages.map((pkg): ToolCatalogEntry[] => {
+        const tools = buildToolInfos(pkg.id, catalog.getPackageTools(pkg.id), {
+          summarize: true,
+          include_schemas: true,
+          include_descriptions: true,
+        });
 
-      const results = await Promise.all(
-        packages.map((pkg) =>
-          queue.add(async (): Promise<ToolCatalogEntry[]> => {
-            try {
-              await catalog.ensurePackageLoaded(pkg.id);
-              const tools = await catalog.buildToolInfos(pkg.id, {
-                summarize: true,
-                include_schemas: true,
-                include_descriptions: true,
-              });
-
-              return tools.map((tool) => ({
-                package_id: pkg.id,
-                package_name: pkg.name || pkg.id,
-                tool_id: tool.tool_id,
-                name: tool.name,
-                description: tool.description || tool.summary || "",
-                summary: tool.summary,
-                input_schema: tool.schema,
-                ...(tool.annotations ? { annotations: tool.annotations } : {}),
-                ...computeSecurityAnnotation(pkg.id, pkg.catalogId, extractRawToolId(tool.tool_id)),
-              }));
-            } catch (pkgError) {
-              logger.warn("Failed to load tools for package", {
-                package_id: pkg.id,
-                error: pkgError instanceof Error ? pkgError.message : String(pkgError),
-              });
-              return [];
-            }
-          })
-        )
-      );
+        return tools.map((tool) => ({
+          package_id: pkg.id,
+          package_name: pkg.name || pkg.id,
+          tool_id: tool.tool_id,
+          name: tool.name,
+          description: tool.description || tool.summary || "",
+          summary: tool.summary,
+          input_schema: tool.schema,
+          ...(tool.annotations ? { annotations: tool.annotations } : {}),
+          ...computeSecurityAnnotation(pkg.id, pkg.catalogId, extractRawToolId(tool.tool_id)),
+        }));
+      });
 
       const allTools = results.flat().filter((tool): tool is ToolCatalogEntry => tool !== undefined);
 
@@ -333,12 +364,16 @@ export function registerHttpApiRoutes(
         user_disabled_count: userDisabledSummary.totalDisabled,
         admin_disabled_count: adminDisabledSummary.totalDisabled,
         generated_at: new Date().toISOString(),
+        snapshot_complete: catalog.isSnapshotComplete(),
+        degraded_packages: listUnavailablePackages(packages, catalog),
       });
     } catch (error) {
       logger.error("Failed to build tool catalog", {
         error: formatError(error),
       });
       res.status(500).json({ error: "Failed to build tool catalog" });
+    } finally {
+      stopWatchdog();
     }
   });
 
@@ -368,7 +403,7 @@ export function registerHttpApiRoutes(
           start_count: 1,
           restart_count: 0,
         },
-        children: registry.getChildStats(),
+        children: registry.getChildStats(catalog),
         generated_at: new Date().toISOString(),
       });
     } catch (error) {
@@ -844,13 +879,16 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       try {
         switch (name) {
           case "list_tool_packages":
-            return await handleListToolPackages(args as any, registry, catalog);
+            return await withDiscoveryWatchdog("list_tool_packages", () =>
+              handleListToolPackages(args as any, registry, catalog, catalogRefresher));
 
           case "list_tools":
-            return await handleListTools(args as any, catalog, validator, registry);
+            return await withDiscoveryWatchdog("list_tools", () =>
+              handleListTools(args as any, catalog, validator, registry, catalogRefresher));
 
           case "get_tool_details":
-            return await handleGetToolDetails(args as any, catalog, registry);
+            return await withDiscoveryWatchdog("get_tool_details", () =>
+              handleGetToolDetails(args as any, catalog, registry, catalogRefresher));
 
           case "use_tool":
             return await handleUseTool(args as any, registry, catalog, validator);
@@ -868,13 +906,15 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
             return await handleAuthenticate(args as any, registry, catalog, catalogRefresher);
 
           case "get_help":
-            return await handleGetHelp(args as any, registry);
+            return await withDiscoveryWatchdog("get_help", () =>
+              handleGetHelp(args as any, registry, catalog, catalogRefresher));
 
           case "restart_package":
             return await handleRestartPackage(args as any, registry, catalog, catalogRefresher);
 
           case "search_tools":
-            return await handleSearchTools(args as any, registry, catalog);
+            return await withDiscoveryWatchdog("search_tools", () =>
+              handleSearchTools(args as any, registry, catalog, catalogRefresher));
 
           case "record_tool_note":
             return await handleRecordToolNote(args as any, catalog);
@@ -960,7 +1000,13 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       app.use('/mcp', dnsRebindingGuard);
 
       app.use(express.json());
-      registerHttpApiRoutes(app, { registry, catalog, dnsRebindingGuard, healthOwnerId });
+      registerHttpApiRoutes(app, {
+        registry,
+        catalog,
+        catalogRefresher,
+        dnsRebindingGuard,
+        healthOwnerId,
+      });
 
       interface SessionEntry {
         server: Server;

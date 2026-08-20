@@ -11,6 +11,7 @@ import {
   type ConnectOutcome,
   type PermanentConnectFailureClass,
   type TransientConnectFailureClass,
+  type CatalogStatus,
 } from "./types.js";
 import { StdioMcpClient } from "./clients/stdioClient.js";
 import { HttpMcpClient } from "./clients/httpClient.js";
@@ -338,6 +339,19 @@ export interface ChildStatsEntry {
   connect_retry_skipped_permanent_count: number;
   /** Cumulative pre-send liveness re-establishes in `callTool` (closed-transport recovery). */
   reestablish_count: number;
+  catalog_status: CatalogStatus;
+  consecutive_failures: number;
+  next_retry_at: number | null;
+  last_error_class: string | null;
+}
+
+export interface ChildCatalogStatsView {
+  getPackageDiagnostics(packageId: string): {
+    status: CatalogStatus | "unknown";
+    consecutiveFailures: number;
+    nextRetryAt: number | null;
+    lastErrorClass: string | null;
+  };
 }
 
 export class PackageRegistry {
@@ -1819,11 +1833,12 @@ export class PackageRegistry {
    * tick. Per-child CPU/RSS is NOT reported here (plan §Stage 4b: Node's
    * `process.resourceUsage()` is self-only and cannot query children).
    */
-  getChildStats(): ChildStatsEntry[] {
+  getChildStats(catalog?: ChildCatalogStatsView): ChildStatsEntry[] {
     const now = Date.now();
     return this.packages.map((pkg) => {
       const client = this.clients.get(pkg.id);
       const lastActivity = this.lastActivity.get(pkg.id) ?? null;
+      const catalogDiagnostics = catalog?.getPackageDiagnostics(pkg.id);
 
       // Best-effort PID extraction without narrowing the `McpClient`
       // interface. Only `StdioMcpClient` has `transport.pid` (available after
@@ -1856,6 +1871,12 @@ export class PackageRegistry {
         connect_retry_skipped_permanent_count:
           this.connectRetrySkippedPermanentCounts.get(pkg.id) ?? 0,
         reestablish_count: this.reestablishCounts.get(pkg.id) ?? 0,
+        catalog_status: catalogDiagnostics?.status === "unknown"
+          ? "connecting"
+          : catalogDiagnostics?.status ?? "connecting",
+        consecutive_failures: catalogDiagnostics?.consecutiveFailures ?? 0,
+        next_retry_at: catalogDiagnostics?.nextRetryAt ?? null,
+        last_error_class: catalogDiagnostics?.lastErrorClass ?? null,
       };
     });
   }

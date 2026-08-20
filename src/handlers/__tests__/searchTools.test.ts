@@ -1,30 +1,38 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Catalog } from "../../catalog.js";
 import type { PackageRegistry } from "../../registry.js";
-import type { ToolInfo } from "../../types.js";
 
-type Deferred = {
-  promise: Promise<void>;
-  resolve: () => void;
-};
-
-function createDeferred(): Deferred {
-  let resolve!: () => void;
-  const promise = new Promise<void>((res) => {
-    resolve = res;
-  });
-  return { promise, resolve };
+function createCachedTool(packageId: string, toolName = "tool") {
+  return {
+    packageId,
+    tool: {
+      name: toolName,
+      description: `${packageId} ${toolName}`,
+      inputSchema: { type: "object", properties: {} },
+    },
+    summary: `${packageId} ${toolName} summary`,
+    argsSkeleton: {},
+    schemaHash: `${packageId}-${toolName}-schema`,
+  };
 }
 
-function createTool(toolId: string): ToolInfo {
+function createCatalogStub(options: {
+  etag: () => string;
+  getPackageTools?: (packageId: string) => ReturnType<typeof createCachedTool>[];
+  statuses?: Record<string, "ready" | "error">;
+}): Catalog {
   return {
-    package_id: "unused",
-    tool_id: toolId,
-    name: toolId,
-    summary: `${toolId} summary`,
-    schema_hash: `${toolId}-schema`,
-    schema: { type: "object", properties: {} },
-  };
+    etag: vi.fn(options.etag),
+    getPackageStatus: vi.fn((packageId: string) => options.statuses?.[packageId] ?? "ready"),
+    getPackageError: vi.fn().mockReturnValue(undefined),
+    getRetryHint: vi.fn((packageId: string) =>
+      options.statuses?.[packageId] === "error"
+        ? { retryAt: null, retryInMs: null, schedule: "none" }
+        : { retryAt: null, retryInMs: null, schedule: "none" }),
+    getPackageTools: vi.fn(options.getPackageTools ?? ((packageId: string) => [
+      createCachedTool(packageId),
+    ])),
+  } as unknown as Catalog;
 }
 
 function createRegistry(packageIds: string[]): PackageRegistry {
@@ -110,34 +118,14 @@ describe("search_tools BM25 cache and build coordination", () => {
     const { handleSearchTools } = await import("../searchTools.js");
     const registry = createRegistry(["pkg-a", "pkg-b"]);
 
-    const firstBuildEntered = createDeferred();
-    const releaseBuild = createDeferred();
-    let gateOpen = false;
-
-    const ensurePackageLoaded = vi.fn(async () => {
-      if (!gateOpen) {
-        gateOpen = true;
-        firstBuildEntered.resolve();
-        await releaseBuild.promise;
-      }
-    });
-    const buildToolInfos = vi.fn(async (packageId: string) => [createTool(`${packageId}__tool`)]);
-
-    const catalog = {
-      etag: vi.fn(() => "etag-1"),
-      ensurePackageLoaded,
-      buildToolInfos,
-    } as unknown as Catalog;
+    const catalog = createCatalogStub({ etag: () => "etag-1" });
 
     const searches = Array.from({ length: 4 }, () =>
       handleSearchTools({ query: "calendar", limit: 3 }, registry, catalog)
     );
-    await firstBuildEntered.promise;
-    releaseBuild.resolve();
     await Promise.all(searches);
 
-    expect(ensurePackageLoaded).toHaveBeenCalledTimes(2);
-    expect(buildToolInfos).toHaveBeenCalledTimes(2);
+    expect(catalog.getPackageTools).toHaveBeenCalledTimes(2);
     expect(bm25Factory).toHaveBeenCalledTimes(1);
   });
 
@@ -146,23 +134,19 @@ describe("search_tools BM25 cache and build coordination", () => {
     const registry = createRegistry(["pkg-a"]);
 
     let currentEtag = "etag-before-build";
-    const ensurePackageLoaded = vi.fn(async () => {});
-    const buildToolInfos = vi.fn(async (packageId: string) => {
+    const getPackageTools = vi.fn((packageId: string) => {
       currentEtag = "etag-after-build";
-      return [createTool(`${packageId}__tool`)];
+      return [createCachedTool(packageId)];
+    });
+    const catalog = createCatalogStub({
+      etag: () => currentEtag,
+      getPackageTools,
     });
 
-    const catalog = {
-      etag: vi.fn(() => currentEtag),
-      ensurePackageLoaded,
-      buildToolInfos,
-    } as unknown as Catalog;
-
     await handleSearchTools({ query: "tool", limit: 2 }, registry, catalog);
     await handleSearchTools({ query: "tool", limit: 2 }, registry, catalog);
 
-    expect(ensurePackageLoaded).toHaveBeenCalledTimes(1);
-    expect(buildToolInfos).toHaveBeenCalledTimes(1);
+    expect(getPackageTools).toHaveBeenCalledTimes(1);
     expect(bm25Factory).toHaveBeenCalledTimes(1);
   });
 
@@ -170,50 +154,26 @@ describe("search_tools BM25 cache and build coordination", () => {
     const { handleSearchTools, invalidateSearchCache } = await import("../searchTools.js");
     const registry = createRegistry(["pkg-a"]);
 
-    const buildEntered = createDeferred();
-    const releaseBuild = createDeferred();
-
-    const ensurePackageLoaded = vi.fn(async () => {
-      buildEntered.resolve();
-      await releaseBuild.promise;
-    });
-    const buildToolInfos = vi.fn(async (packageId: string) => [createTool(`${packageId}__tool`)]);
-
-    const catalog = {
-      etag: vi.fn(() => "stable-etag"),
-      ensurePackageLoaded,
-      buildToolInfos,
-    } as unknown as Catalog;
+    const catalog = createCatalogStub({ etag: () => "stable-etag" });
 
     const firstBuild = handleSearchTools({ query: "tool", limit: 2 }, registry, catalog);
-    await buildEntered.promise;
     invalidateSearchCache();
-    releaseBuild.resolve();
     await firstBuild;
 
     await handleSearchTools({ query: "tool", limit: 2 }, registry, catalog);
 
-    expect(ensurePackageLoaded).toHaveBeenCalledTimes(2);
-    expect(buildToolInfos).toHaveBeenCalledTimes(2);
+    expect(catalog.getPackageTools).toHaveBeenCalledTimes(2);
     expect(bm25Factory).toHaveBeenCalledTimes(2);
   });
 
-  it("keeps successful packages indexed when one package load fails", async () => {
+  it("keeps ready packages indexed when another package is degraded", async () => {
     const { handleSearchTools } = await import("../searchTools.js");
     const registry = createRegistry(["pkg-ok", "pkg-fail"]);
 
-    const ensurePackageLoaded = vi.fn(async (packageId: string) => {
-      if (packageId === "pkg-fail") {
-        throw new Error("intentional package failure");
-      }
+    const catalog = createCatalogStub({
+      etag: () => "etag-iso",
+      statuses: { "pkg-fail": "error" },
     });
-    const buildToolInfos = vi.fn(async (packageId: string) => [createTool(`${packageId}__tool`)]);
-
-    const catalog = {
-      etag: vi.fn(() => "etag-iso"),
-      ensurePackageLoaded,
-      buildToolInfos,
-    } as unknown as Catalog;
 
     const first = parseSearchResult(await handleSearchTools({ query: "tool", limit: 5 }, registry, catalog));
     const second = parseSearchResult(await handleSearchTools({ query: "tool", limit: 5 }, registry, catalog));
@@ -222,8 +182,7 @@ describe("search_tools BM25 cache and build coordination", () => {
     expect(first.results).toHaveLength(1);
     expect(first.results[0]?.tool_id).toBe("pkg-ok__tool");
     expect(second.total_tools_searched).toBe(1);
-    expect(ensurePackageLoaded).toHaveBeenCalledTimes(2);
-    expect(buildToolInfos).toHaveBeenCalledTimes(1);
+    expect(catalog.getPackageTools).toHaveBeenCalledTimes(1);
     expect(bm25Factory).toHaveBeenCalledTimes(1);
   });
 
@@ -231,14 +190,7 @@ describe("search_tools BM25 cache and build coordination", () => {
     const { handleSearchTools } = await import("../searchTools.js");
     const registry = createRegistry(["pkg-a"]);
 
-    const ensurePackageLoaded = vi.fn(async () => {});
-    const buildToolInfos = vi.fn(async (packageId: string) => [createTool(`${packageId}__tool`)]);
-
-    const catalog = {
-      etag: vi.fn(() => "etag-retry"),
-      ensurePackageLoaded,
-      buildToolInfos,
-    } as unknown as Catalog;
+    const catalog = createCatalogStub({ etag: () => "etag-retry" });
 
     bm25Factory.mockImplementationOnce(() => {
       throw new Error("intentional bm25 build failure");
@@ -253,8 +205,7 @@ describe("search_tools BM25 cache and build coordination", () => {
 
     expect(retry.total_tools_searched).toBe(1);
     expect(cached.total_tools_searched).toBe(1);
-    expect(ensurePackageLoaded).toHaveBeenCalledTimes(1);
-    expect(buildToolInfos).toHaveBeenCalledTimes(1);
+    expect(catalog.getPackageTools).toHaveBeenCalledTimes(1);
     expect(bm25Factory).toHaveBeenCalledTimes(2);
   });
 
@@ -262,41 +213,26 @@ describe("search_tools BM25 cache and build coordination", () => {
     const { handleSearchTools, invalidateSearchCache } = await import("../searchTools.js");
     const registry = createRegistry(["pkg-a"]);
 
-    const buildEntered = createDeferred();
-    const releaseBuild = createDeferred();
-    let shouldPauseFirstBuild = true;
     let currentEtag = "etag-A";
     let toolVersion = 1;
-
-    const ensurePackageLoaded = vi.fn(async () => {
-      if (!shouldPauseFirstBuild) {
-        return;
-      }
-      shouldPauseFirstBuild = false;
-      buildEntered.resolve();
-      await releaseBuild.promise;
+    const getPackageTools = vi.fn((packageId: string) => [
+      createCachedTool(packageId, `tool-v${toolVersion++}`),
+    ]);
+    const catalog = createCatalogStub({
+      etag: () => currentEtag,
+      getPackageTools,
     });
-    const buildToolInfos = vi.fn(async (packageId: string) => [createTool(`${packageId}__tool-v${toolVersion++}`)]);
-
-    const catalog = {
-      etag: vi.fn(() => currentEtag),
-      ensurePackageLoaded,
-      buildToolInfos,
-    } as unknown as Catalog;
 
     const firstBuild = handleSearchTools({ query: "tool", limit: 2 }, registry, catalog);
-    await buildEntered.promise;
     invalidateSearchCache();
     currentEtag = "etag-B";
-    releaseBuild.resolve();
 
     const first = parseSearchResult(await firstBuild);
     const second = parseSearchResult(await handleSearchTools({ query: "tool", limit: 2 }, registry, catalog));
 
     expect(first.results[0]?.tool_id).toBe("pkg-a__tool-v1");
     expect(second.results[0]?.tool_id).toBe("pkg-a__tool-v2");
-    expect(ensurePackageLoaded).toHaveBeenCalledTimes(2);
-    expect(buildToolInfos).toHaveBeenCalledTimes(2);
+    expect(getPackageTools).toHaveBeenCalledTimes(2);
     expect(bm25Factory).toHaveBeenCalledTimes(2);
   });
 });

@@ -78,6 +78,7 @@ function createErrorStatusCatalog(): Catalog {
       (pkgId: string) =>
         `Package '${pkgId}' not found in configuration. Available packages: filesystem, github`,
     ),
+    getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null }),
     buildToolInfos: vi.fn(),
     getTool: vi.fn(),
     getToolSchema: vi.fn(),
@@ -170,10 +171,10 @@ describe("list_tools — package_id input validation", () => {
 
   it("still lists tools for a well-formed package_id (regression guard)", async () => {
     const catalog = {
-      ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
       getPackageStatus: vi.fn().mockReturnValue("ready"),
       getPackageError: vi.fn().mockReturnValue(undefined),
-      buildToolInfos: vi.fn().mockResolvedValue([]),
+      getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null }),
+      getPackageTools: vi.fn().mockReturnValue([]),
     } as unknown as Catalog;
 
     const result = await handleListTools(
@@ -184,7 +185,7 @@ describe("list_tools — package_id input validation", () => {
     );
 
     expect(result.isError).toBe(false);
-    expect(catalog.ensurePackageLoaded).toHaveBeenCalledWith("filesystem");
+    expect(catalog.getPackageTools).toHaveBeenCalledWith("filesystem");
   });
 });
 
@@ -285,10 +286,10 @@ describe("get_tool_details — package prefix validation", () => {
 
   it("still hydrates well-formed tool_ids (regression guard)", async () => {
     const catalog = {
-      ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
       getPackageStatus: vi.fn().mockReturnValue("ready"),
       getPackageError: vi.fn().mockReturnValue(undefined),
-      getTool: vi.fn().mockResolvedValue({
+      getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null }),
+      getTool: vi.fn().mockReturnValue({
         packageId: "filesystem",
         tool: { name: "read_file", description: "Reads a file", inputSchema: { type: "object" } },
         summary: "Reads a file",

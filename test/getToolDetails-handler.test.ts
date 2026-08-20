@@ -89,18 +89,36 @@ function makeToolDef(name: string, opts: Partial<MockToolDef> = {}): MockToolDef
  */
 function createMockCatalog(
   toolsByPackage: Record<string, MockToolDef[]>,
-  packageStatuses: Record<string, 'ready' | 'auth_required' | 'error'> = {},
+  packageStatuses: Record<string, 'connecting' | 'ready' | 'auth_required' | 'error'> = {},
   packageErrors: Record<string, string> = {}
 ): Catalog {
   return {
-    ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
     getPackageStatus: vi.fn().mockImplementation((pkgId: string) =>
       packageStatuses[pkgId] ?? 'ready'
     ),
     getPackageError: vi.fn().mockImplementation((pkgId: string) =>
       packageErrors[pkgId]
     ),
-    getTool: vi.fn().mockImplementation(async (pkgId: string, toolName: string) => {
+    getRetryHint: vi.fn().mockImplementation((pkgId: string) => {
+      const status = packageStatuses[pkgId] ?? 'ready';
+      return status === 'ready'
+        ? { retryAt: null, retryInMs: null, schedule: 'none' }
+        : { retryAt: Date.now(), retryInMs: 0, schedule: 'transient_backoff' };
+    }),
+    getPackageTools: vi.fn().mockImplementation((pkgId: string) =>
+      (toolsByPackage[pkgId] ?? []).map((found) => ({
+        packageId: pkgId,
+        tool: {
+          name: found.name,
+          description: found.description,
+          inputSchema: found.inputSchema,
+          ...(found.annotations ? { annotations: found.annotations } : {}),
+        },
+        summary: found.summary,
+        argsSkeleton: found.argsSkeleton,
+        schemaHash: found.schemaHash,
+      }))),
+    getTool: vi.fn().mockImplementation((pkgId: string, toolName: string) => {
       const pkgTools = toolsByPackage[pkgId];
       if (!pkgTools) return undefined;
       const found = pkgTools.find(t => t.name === toolName);
@@ -197,14 +215,33 @@ function createSurfaceCatalog(
     schema_hash: 'sha256:third',
   };
   return Object.assign(catalog, {
-    buildToolInfos: vi.fn().mockResolvedValue([
-      toolInfo,
-      auxiliaryToolInfo,
-      thirdToolInfo,
+    getPackageTools: vi.fn().mockReturnValue([
+      {
+        packageId,
+        tool: { name: tool.name, description: tool.description, inputSchema: tool.inputSchema },
+        summary: tool.summary,
+        argsSkeleton: tool.argsSkeleton,
+        schemaHash: tool.schemaHash,
+      },
+      {
+        packageId,
+        tool: { name: 'auxiliary_tool', description: auxiliaryToolInfo.description, inputSchema: tool.inputSchema },
+        summary: auxiliaryToolInfo.summary,
+        argsSkeleton: tool.argsSkeleton,
+        schemaHash: auxiliaryToolInfo.schema_hash,
+      },
+      {
+        packageId,
+        tool: { name: 'third_tool', description: thirdToolInfo.description, inputSchema: tool.inputSchema },
+        summary: thirdToolInfo.summary,
+        argsSkeleton: tool.argsSkeleton,
+        schemaHash: thirdToolInfo.schema_hash,
+      },
     ]),
     etag: vi.fn().mockReturnValue('notes-surface-etag'),
     countTools: vi.fn().mockReturnValue(3),
     computePackageEmbeddingHash: vi.fn().mockReturnValue('notes-surface-hash'),
+    isSnapshotComplete: vi.fn().mockReturnValue(true),
   });
 }
 
@@ -683,9 +720,8 @@ describe('handleGetToolDetails', () => {
     expect(parsed.tools[0].not_found).toBeUndefined();
   });
 
-  it('package load exception returns error: "package_unavailable"', async () => {
-    const catalog = createMockCatalog({});
-    (catalog.ensurePackageLoaded as any).mockRejectedValueOnce(new Error('Network failure'));
+  it('an unobserved package returns an explicit connecting result without loading it', async () => {
+    const catalog = createMockCatalog({}, { failing: 'connecting' });
 
     const result = await handleGetToolDetails(
       { tool_ids: ['failing__some_tool'] },
@@ -696,7 +732,11 @@ describe('handleGetToolDetails', () => {
     const parsed = parseResult(result);
     expect(parsed.tools).toHaveLength(1);
     expect(parsed.tools[0].error).toBe('package_unavailable');
-    expect(parsed.tools[0].description).toContain("Failed to load package 'failing'");
+    expect(parsed.tools[0]).toMatchObject({
+      status: 'connecting',
+      retry_in_ms: 0,
+    });
+    expect(parsed.tools[0].description).toContain("catalog is still connecting");
   });
 
   // -----------------------------------------------------------------------

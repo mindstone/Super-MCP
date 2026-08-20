@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import express from "express";
 import { Catalog } from "../src/catalog.js";
 import { handleListToolPackages } from "../src/handlers/listToolPackages.js";
+import { handleGetHelp } from "../src/handlers/getHelp.js";
 import {
   handleSearchTools,
   invalidateSearchCache,
@@ -82,12 +83,22 @@ function parseTextResult(result: unknown): Record<string, unknown> {
   return JSON.parse(text ?? "{}") as Record<string, unknown>;
 }
 
-function invokeToolsEndpoint(registry: PackageRegistry, catalog: Catalog) {
+function invokeCatalogEndpoint(
+  registry: PackageRegistry,
+  catalog: Catalog,
+  path: "/api/tools" | "/api/tools/manifest" = "/api/tools",
+  query: Record<string, string> = { wait_for_snapshot_ms: "50" },
+  catalogRefresher?: {
+    scheduleRefresh(packageId: string): void;
+    whenCurrentGenerationReady(): Promise<void>;
+  },
+) {
   const app = express();
   app.use(express.json());
   registerHttpApiRoutes(app, {
     registry,
     catalog,
+    catalogRefresher,
     dnsRebindingGuard: (_request, _response, next) => next(),
   });
 
@@ -101,9 +112,9 @@ function invokeToolsEndpoint(registry: PackageRegistry, catalog: Catalog) {
       }>;
     };
   }).router;
-  const route = router.stack.find((layer) => layer.route?.path === "/api/tools")?.route;
+  const route = router.stack.find((layer) => layer.route?.path === path)?.route;
   const handler = route?.stack[route.stack.length - 1]?.handle;
-  if (!handler) throw new Error("/api/tools route was not registered");
+  if (!handler) throw new Error(`${path} route was not registered`);
 
   return new Promise<{ statusCode: number; payload: Record<string, unknown> }>((resolve, reject) => {
     let statusCode = 200;
@@ -119,7 +130,7 @@ function invokeToolsEndpoint(registry: PackageRegistry, catalog: Catalog) {
       },
     } as unknown as express.Response;
     const request = {
-      query: { wait_for_snapshot_ms: "50" },
+      query,
     } as unknown as express.Request;
 
     void Promise.resolve(handler(request, response, reject)).catch(reject);
@@ -132,7 +143,7 @@ describe("snapshot-only discovery", () => {
     vi.useRealTimers();
   });
 
-  it.fails("R4: list_tool_packages settles before a hung connect and reports every package with retry state", async () => {
+  it("R4: list_tool_packages settles before a hung connect and reports every package with retry state", async () => {
     vi.useFakeTimers();
     const packages = [packageConfig("alpha"), packageConfig("beta")];
     const neverConnects = new Promise<McpClient>(() => {});
@@ -155,7 +166,7 @@ describe("snapshot-only discovery", () => {
     expect(packageRows.every((row) => "retry_in_ms" in row)).toBe(true);
   });
 
-  it.fails("R5: search_tools returns healthy tools and names a hung package as unavailable", async () => {
+  it("R5: search_tools returns healthy tools and names a hung package as unavailable", async () => {
     vi.useFakeTimers();
     const healthy = packageConfig("healthy");
     const hung = packageConfig("hung");
@@ -169,6 +180,16 @@ describe("snapshot-only discovery", () => {
           properties: { query: { type: "string" } },
         },
       },
+      {
+        name: "list_records",
+        description: "List records",
+        inputSchema: { type: "object", properties: {} },
+      },
+      {
+        name: "count_records",
+        description: "Count records",
+        inputSchema: { type: "object", properties: {} },
+      },
     ]);
     const registry = registryStub([healthy, hung], async (packageId) =>
       packageId === healthy.id ? healthyClient : neverConnects);
@@ -181,6 +202,7 @@ describe("snapshot-only discovery", () => {
       catalog,
     ));
 
+    if (outcome.kind === "rejected") throw outcome.error;
     expect(outcome.kind).toBe("settled");
     if (outcome.kind !== "settled") return;
 
@@ -193,21 +215,126 @@ describe("snapshot-only discovery", () => {
     ]));
   });
 
-  it.fails("R12 primitive: bounded REST readiness returns an explicit incomplete snapshot on timeout", async () => {
+  it("package help is a passive snapshot read while the package is unreachable", async () => {
+    vi.useFakeTimers();
+    const pkg = packageConfig("hung");
+    const registry = registryStub([pkg], async () => new Promise<McpClient>(() => {}));
+    const catalog = new Catalog(registry);
+    const refreshScheduler = { scheduleRefresh: vi.fn() };
+
+    const outcome = await raceAgainstSentinel(handleGetHelp(
+      { package_id: pkg.id },
+      registry,
+      catalog,
+      refreshScheduler,
+    ));
+
+    if (outcome.kind === "rejected") throw outcome.error;
+    expect(outcome.kind).toBe("settled");
+    if (outcome.kind !== "settled") return;
+    expect(outcome.value.content[0].text).toContain("catalog snapshot");
+    expect(registry.getClient).not.toHaveBeenCalled();
+    expect(refreshScheduler.scheduleRefresh).toHaveBeenCalledWith(pkg.id);
+  });
+
+  it("R12 primitive: bounded REST readiness returns an explicit incomplete snapshot on timeout", async () => {
     vi.useFakeTimers();
     const pkg = packageConfig("hung");
     const neverConnects = new Promise<McpClient>(() => {});
     const registry = registryStub([pkg], async () => neverConnects);
     const catalog = new Catalog(registry);
-    const outcome = await raceAgainstSentinel(invokeToolsEndpoint(registry, catalog));
+    const catalogRefresher = {
+      scheduleRefresh: vi.fn(),
+      whenCurrentGenerationReady: vi.fn(() => new Promise<void>(() => {})),
+    };
+    let settled = false;
+    const responsePromise = invokeCatalogEndpoint(
+      registry,
+      catalog,
+      "/api/tools",
+      { wait_for_snapshot_ms: "50" },
+      catalogRefresher,
+    )
+      .then((response) => {
+        settled = true;
+        return response;
+      });
 
-    expect(outcome.kind).toBe("settled");
-    if (outcome.kind !== "settled") return;
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(49);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    const response = await responsePromise;
 
-    expect(outcome.value.statusCode).toBe(200);
-    expect(outcome.value.payload.snapshot_complete).toBe(false);
-    expect(outcome.value.payload.degraded_packages).toEqual(expect.arrayContaining([
+    expect(catalogRefresher.whenCurrentGenerationReady).toHaveBeenCalledOnce();
+    expect(response.statusCode).toBe(200);
+    expect(response.payload.snapshot_complete).toBe(false);
+    expect(response.payload.degraded_packages).toEqual(expect.arrayContaining([
       expect.objectContaining({ package_id: pkg.id }),
     ]));
   });
+
+  it("R12 primitive: bounded REST readiness returns the completed current-generation snapshot", async () => {
+    vi.useFakeTimers();
+    const pkg = packageConfig("warming");
+    const registry = registryStub([pkg], async () => clientWithTools([]));
+    const catalog = new Catalog(registry);
+    const catalogRefresher = {
+      scheduleRefresh: vi.fn(),
+      whenCurrentGenerationReady: vi.fn(() => new Promise<void>((resolve) => {
+        setTimeout(() => {
+          const generation = catalog.beginRefresh(pkg.id, "startup");
+          catalog.commitReady(pkg.id, [{ name: "ready_tool", inputSchema: { type: "object" } }], generation);
+          resolve();
+        }, 20);
+      })),
+    };
+
+    const responsePromise = invokeCatalogEndpoint(
+      registry,
+      catalog,
+      "/api/tools",
+      { wait_for_snapshot_ms: "50" },
+      catalogRefresher,
+    );
+    await vi.advanceTimersByTimeAsync(20);
+    const response = await responsePromise;
+
+    expect(response.payload.snapshot_complete).toBe(true);
+    expect(response.payload.degraded_packages).toEqual([]);
+    expect(response.payload.tool_count).toBe(1);
+  });
+
+  it.each(["/api/tools", "/api/tools/manifest"] as const)(
+    "%s returns an incomplete snapshot immediately by default without connecting",
+    async (path) => {
+      vi.useFakeTimers();
+      const pkg = packageConfig("hung");
+      const registry = registryStub([pkg], async () => new Promise<McpClient>(() => {}));
+      const catalog = new Catalog(registry);
+      const catalogRefresher = {
+        scheduleRefresh: vi.fn(),
+        whenCurrentGenerationReady: vi.fn(() => new Promise<void>(() => {})),
+      };
+
+      const outcome = await raceAgainstSentinel(invokeCatalogEndpoint(
+        registry,
+        catalog,
+        path,
+        {},
+        catalogRefresher,
+      ));
+
+      if (outcome.kind === "rejected") throw outcome.error;
+      expect(outcome.kind).toBe("settled");
+      if (outcome.kind !== "settled") return;
+      expect(registry.getClient).not.toHaveBeenCalled();
+      expect(catalogRefresher.whenCurrentGenerationReady).not.toHaveBeenCalled();
+      expect(outcome.value.payload.snapshot_complete).toBe(false);
+      expect(outcome.value.payload.degraded_packages).toEqual(expect.arrayContaining([
+        expect.objectContaining({ package_id: pkg.id }),
+      ]));
+    },
+  );
 });

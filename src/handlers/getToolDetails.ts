@@ -1,6 +1,10 @@
 import { ERROR_CODES, ToolInfo } from "../types.js";
-import { Catalog } from "../catalog.js";
-import { PackageRegistry } from "../registry.js";
+import type {
+  CatalogRefreshScheduler,
+  CatalogView,
+  PackageMetadataView,
+} from "../catalog.js";
+import { getDiscoveryPackageState } from "../catalogFormatters.js";
 import { computeSecurityAnnotation } from "./annotateToolSecurity.js";
 import { getLogger } from "../logging.js";
 import {
@@ -24,8 +28,9 @@ interface GetToolDetailsInput {
 
 export async function handleGetToolDetails(
   input: GetToolDetailsInput,
-  catalog: Catalog,
-  registry: PackageRegistry
+  catalog: CatalogView,
+  packagesView: PackageMetadataView,
+  refreshScheduler?: CatalogRefreshScheduler,
 ): Promise<any> {
   // Normalize tool_ids that the model may have stringified (upstream Claude model bug).
   // See: anthropics/claude-code#25865
@@ -97,8 +102,10 @@ export async function handleGetToolDetails(
   type ResultEntry = ToolInfo & {
     not_found?: boolean;
     error?: string;
-    status?: "setup_incomplete";
+    status?: "connecting" | "auth_required" | "setup_incomplete" | "error";
     reason?: string;
+    retry_in_ms?: number | null;
+    next_retry_at?: number | null;
     notes?: {
       notice: string;
       text: string;
@@ -121,17 +128,20 @@ export async function handleGetToolDetails(
 
   for (const [packageId, toolRequests] of byPackage) {
     try {
-      await catalog.ensurePackageLoaded(packageId);
-      const packageStatus = catalog.getPackageStatus(packageId);
+      refreshScheduler?.scheduleRefresh(packageId);
+      const packageState = getDiscoveryPackageState(catalog, packageId);
+      const packageStatus = packageState.catalogStatus;
 
-      if (packageStatus === "auth_required" || packageStatus === "setup_incomplete" || packageStatus === "error") {
+      if (packageStatus !== "ready") {
         for (const req of toolRequests) {
-          const setupReason = catalog.getPackageError(packageId);
+          const setupReason = packageState.reason;
           const description = packageStatus === "auth_required"
             ? `Package '${packageId}' requires authentication.`
             : packageStatus === "setup_incomplete"
               ? `Package '${packageId}' is not set up on this instance (${setupReason || 'setup incomplete'}). Signing in again will not fix it.`
-              : `Package '${packageId}' is unavailable: ${setupReason || 'unknown error'}`;
+              : packageStatus === "connecting"
+                ? `Package '${packageId}' catalog is still connecting.`
+                : `Package '${packageId}' is unavailable: ${setupReason || 'unknown error'}`;
           resultMap.set(req.toolId, {
             package_id: packageId,
             tool_id: req.toolId,
@@ -139,16 +149,17 @@ export async function handleGetToolDetails(
             schema_hash: "",
             error: packageStatus === "setup_incomplete" ? "setup_incomplete" : "package_unavailable",
             description,
-            ...(packageStatus === "setup_incomplete"
-              ? { status: packageStatus, reason: setupReason }
-              : {}),
+            status: packageStatus,
+            reason: setupReason,
+            retry_in_ms: packageState.retryInMs,
+            next_retry_at: packageState.nextRetryAt,
           });
         }
         continue;
       }
 
       for (const req of toolRequests) {
-        const cachedTool = await catalog.getTool(packageId, req.rawName);
+        const cachedTool = catalog.getTool(packageId, req.rawName);
         if (!cachedTool) {
           resultMap.set(req.toolId, {
             package_id: packageId,
@@ -193,7 +204,7 @@ export async function handleGetToolDetails(
           ...(cachedTool.tool?.annotations ? { annotations: cachedTool.tool.annotations } : {}),
         };
 
-        const catalogId = registry.getPackage(packageId)?.catalogId;
+        const catalogId = packagesView.getPackage(packageId)?.catalogId;
         const annotation = computeSecurityAnnotation(packageId, catalogId, req.rawName);
         resultMap.set(req.toolId, { ...toolInfo, ...annotation });
       }

@@ -1,6 +1,10 @@
 import { ERROR_CODES, ToolInfo } from "../types.js";
-import { Catalog } from "../catalog.js";
-import { PackageRegistry } from "../registry.js";
+import type {
+  CatalogRefreshScheduler,
+  CatalogView,
+  PackageMetadataView,
+} from "../catalog.js";
+import { buildToolInfos, listUnavailablePackages } from "../catalogFormatters.js";
 import { computeSecurityAnnotation, extractRawToolId } from "./annotateToolSecurity.js";
 import { getLogger } from "../logging.js";
 import { coerceStringifiedJson, coerceStringifiedNumber } from "../utils/normalizeInput.js";
@@ -29,6 +33,7 @@ export interface SearchToolsOutput {
   results: Array<ToolInfo & { relevance_score: number }>;
   query: string;
   total_tools_searched: number;
+  unavailable_packages: ReturnType<typeof listUnavailablePackages>;
 }
 
 // Cache for BM25 engine - rebuilt when catalog changes
@@ -48,8 +53,8 @@ function tokenize(text: string): string[] {
 }
 
 async function buildBM25Index(
-  registry: PackageRegistry,
-  catalog: Catalog
+  packagesView: PackageMetadataView,
+  catalog: CatalogView,
 ): Promise<{ engine: BM25Engine; toolMap: Map<string, ToolInfo> }> {
   const currentEtag = catalog.etag();
 
@@ -80,10 +85,9 @@ async function buildBM25Index(
 
     const toolMap = new Map<string, ToolInfo>();
 
-    for (const pkg of registry.getPackages()) {
-      try {
-        await catalog.ensurePackageLoaded(pkg.id);
-        const tools = await catalog.buildToolInfos(pkg.id, {
+    for (const pkg of packagesView.getPackages()) {
+      if (catalog.getPackageStatus(pkg.id) === "ready") {
+        const tools = buildToolInfos(pkg.id, catalog.getPackageTools(pkg.id), {
           summarize: true,
           include_schemas: true,
         });
@@ -104,10 +108,10 @@ async function buildBM25Index(
             package_id: pkg.id,
           });
         }
-      } catch (error) {
+      } else {
         logger.debug("Skipping package for search index", {
           package_id: pkg.id,
-          error: error instanceof Error ? error.message : String(error),
+          catalog_status: catalog.getPackageStatus(pkg.id),
         });
       }
     }
@@ -151,8 +155,9 @@ async function buildBM25Index(
 
 export async function handleSearchTools(
   input: SearchToolsInput,
-  registry: PackageRegistry,
-  catalog: Catalog
+  packagesView: PackageMetadataView,
+  catalog: CatalogView,
+  refreshScheduler?: CatalogRefreshScheduler,
 ): Promise<any> {
   let { query, limit = 5, threshold = 0.0, packages } = input;
 
@@ -169,7 +174,12 @@ export async function handleSearchTools(
     };
   }
 
-  const { engine, toolMap } = await buildBM25Index(registry, catalog);
+  const configuredPackages = packagesView.getPackages();
+  for (const pkg of configuredPackages) {
+    refreshScheduler?.scheduleRefresh(pkg.id);
+  }
+
+  const { engine, toolMap } = await buildBM25Index(packagesView, catalog);
 
   // Search with BM25
   const searchResults = engine.search(query, Math.min(limit * 2, 50));
@@ -194,7 +204,7 @@ export async function handleSearchTools(
     if (normalizedScore < threshold) continue;
 
     const rawToolId = extractRawToolId(toolId);
-    const packageConfig = registry.getPackage(tool.package_id!);
+    const packageConfig = packagesView.getPackage(tool.package_id!);
     const annotation = computeSecurityAnnotation(tool.package_id!, packageConfig?.catalogId, rawToolId);
 
     results.push({
@@ -210,6 +220,12 @@ export async function handleSearchTools(
     results,
     query,
     total_tools_searched: toolMap.size,
+    unavailable_packages: listUnavailablePackages(
+      packages && packages.length > 0
+        ? configuredPackages.filter((pkg) => packages.includes(pkg.id))
+        : configuredPackages,
+      catalog,
+    ),
   };
 
   return {

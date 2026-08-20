@@ -71,27 +71,31 @@ function seedCatalogPackage(
 
 function createRouteCatalog() {
   return {
-    ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
-    buildToolInfos: vi.fn().mockImplementation(async (packageId: string) => [
+    getPackageTools: vi.fn().mockImplementation((packageId: string) => [
       {
-        package_id: packageId,
-        tool_id: `${packageId}__tool`,
-        name: `${packageId}__tool`,
-        description: `Description for ${packageId}`,
-        summary: `Summary for ${packageId}`,
-        schema_hash: `sha256:${packageId}`,
-        schema: {
-          type: "object",
-          properties: {
-            query: { type: "string" },
+        packageId,
+        tool: {
+          name: "tool",
+          description: `Description for ${packageId}`,
+          inputSchema: {
+            type: "object",
+            properties: {
+              query: { type: "string" },
+            },
           },
         },
+        summary: `Summary for ${packageId}`,
+        argsSkeleton: {},
+        schemaHash: `sha256:${packageId}`,
       },
     ]),
     etag: vi.fn().mockReturnValue("sha256:catalog"),
     countTools: vi.fn().mockReturnValue(1),
     computePackageEmbeddingHash: vi.fn().mockImplementation((packageId: string) => `hash-${packageId}`),
     getPackageStatus: vi.fn().mockReturnValue("ready"),
+    getPackageError: vi.fn().mockReturnValue(undefined),
+    getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
+    isSnapshotComplete: vi.fn().mockReturnValue(true),
   };
 }
 
@@ -229,9 +233,9 @@ describe("/api/tools package filtering", () => {
       expect(response.ok).toBe(true);
       expect(body.package_count).toBe(2);
       expect(body.tools.map((tool: { package_id: string }) => tool.package_id)).toEqual(["beta", "gamma"]);
-      expect(catalog.ensurePackageLoaded).toHaveBeenCalledTimes(2);
-      expect(catalog.ensurePackageLoaded).toHaveBeenCalledWith("beta");
-      expect(catalog.ensurePackageLoaded).toHaveBeenCalledWith("gamma");
+      expect(catalog.getPackageTools).toHaveBeenCalledTimes(2);
+      expect(catalog.getPackageTools).toHaveBeenCalledWith("beta");
+      expect(catalog.getPackageTools).toHaveBeenCalledWith("gamma");
     } finally {
       await server.close();
     }
@@ -254,7 +258,7 @@ describe("/api/tools package filtering", () => {
       expect(response.ok).toBe(true);
       expect(body.package_count).toBe(3);
       expect(body.tools.map((tool: { package_id: string }) => tool.package_id)).toEqual(["alpha", "beta", "gamma"]);
-      expect(catalog.ensurePackageLoaded).toHaveBeenCalledTimes(3);
+      expect(catalog.getPackageTools).toHaveBeenCalledTimes(3);
     } finally {
       await server.close();
     }

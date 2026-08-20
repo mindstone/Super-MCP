@@ -376,7 +376,7 @@ export class CatalogRefresher {
   }
 
   private async runRefresh(packageId: string, refresh: QueuedRefresh): Promise<void> {
-    const generation = this.catalog.beginRefresh(packageId);
+    const generation = this.catalog.beginRefresh(packageId, refresh.reason);
     let attemptActive = true;
     let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
     let disposeAttempt: (() => void) | null = null;
@@ -436,6 +436,7 @@ export class CatalogRefresher {
       this.catalog.commitFailure(packageId, generation, {
         status: "auth_required",
         lastError: undefined,
+        failureClass: "auth_required",
         nextRetryAt: null,
         nextAuthProbeAt: this.authProbeIntervalMs === 0
           ? null
@@ -447,7 +448,7 @@ export class CatalogRefresher {
       this.catalog.commitFailure(packageId, generation, {
         status: "setup_incomplete",
         lastError: outcome.reason,
-        failureClass: "permanent",
+        failureClass: "setup_incomplete",
         nextRetryAt: null,
         nextAuthProbeAt: null,
       });
@@ -458,7 +459,7 @@ export class CatalogRefresher {
       this.catalog.commitFailure(packageId, generation, {
         status: categorized.status,
         lastError: categorized.lastError,
-        failureClass: "permanent",
+        failureClass: outcome.failureClass,
         nextRetryAt: null,
         nextAuthProbeAt: null,
       });
@@ -520,6 +521,7 @@ export class CatalogRefresher {
       this.catalog.commitFailure(packageId, generation, {
         status: "auth_required",
         lastError: categorized.lastError,
+        failureClass: "auth_required",
         nextRetryAt: null,
         nextAuthProbeAt: this.authProbeIntervalMs === 0
           ? null

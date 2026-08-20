@@ -1,13 +1,15 @@
-import { PackageRegistry } from "../registry.js";
-import { Catalog } from "../catalog.js";
-import { getLogger } from "../logging.js";
+import type {
+  CatalogRefreshScheduler,
+  CatalogView,
+  PackageMetadataView,
+} from "../catalog.js";
 import { coerceStringifiedNumber } from "../utils/normalizeInput.js";
-
-const logger = getLogger();
 
 export async function handleGetHelp(
   input: { topic?: string; package_id?: string; error_code?: number },
-  registry: PackageRegistry
+  packagesView: PackageMetadataView,
+  catalog: CatalogView,
+  refreshScheduler?: CatalogRefreshScheduler,
 ): Promise<any> {
   let { topic = "getting_started", package_id, error_code } = input;
 
@@ -21,7 +23,7 @@ export async function handleGetHelp(
     helpContent = getErrorHelp(error_code);
   }
   else if (package_id) {
-    helpContent = await getPackageHelp(package_id, registry);
+    helpContent = getPackageHelp(package_id, packagesView, catalog, refreshScheduler);
   }
   else {
     helpContent = getTopicHelp(topic);
@@ -382,9 +384,14 @@ For more help, try:
 - \`get_help(topic: "workflow")\``;
 }
 
-export async function getPackageHelp(packageId: string, registry: PackageRegistry): Promise<string> {
+export function getPackageHelp(
+  packageId: string,
+  packagesView: PackageMetadataView,
+  catalog: CatalogView,
+  refreshScheduler?: CatalogRefreshScheduler,
+): string {
   try {
-    const pkg = registry.getPackage(packageId);
+    const pkg = packagesView.getPackage(packageId);
     if (!pkg) {
       return `# Package Not Found: ${packageId}
 
@@ -393,28 +400,24 @@ The package "${packageId}" doesn't exist.
 Run \`list_tool_packages()\` to see available packages.`;
     }
 
-    const catalog = new Catalog(registry);
     let toolCount = 0;
     let toolExamples = "";
-    
-    try {
-      const tools = await catalog.getPackageTools(packageId);
-      toolCount = tools.length;
-      
-      if (tools.length > 0) {
-        const exampleTools = tools.slice(0, 5).map(t => `- ${t.tool.name}: ${t.tool.description || 'No description'}`).join('\n');
-        toolExamples = `
+    refreshScheduler?.scheduleRefresh(packageId);
+    const tools = catalog.getPackageTools(packageId);
+    toolCount = tools.length;
+
+    if (tools.length > 0) {
+      const exampleTools = tools.slice(0, 5).map(t => `- ${t.tool.name}: ${t.tool.description || 'No description'}`).join('\n');
+      toolExamples = `
 ## Available Tools (showing first 5 of ${toolCount})
 ${exampleTools}
 
 Use \`list_tools(package_id: "${packageId}", detail: "lite")\` to browse all tools.`;
-      }
-    } catch (error) {
-      logger.debug("Could not load tools for help", { package_id: packageId });
+    } else if (catalog.getPackageStatus(packageId) !== "ready") {
       toolExamples = `
 ## Tools
-Unable to load tools. The package may require authentication.
-Use \`authenticate(package_id: "${packageId}")\` if needed.`;
+The catalog snapshot for this package is not currently available.
+Run \`list_tool_packages()\` for its status and retry guidance.`;
     }
 
     const authInfo = pkg.transport === "http" && pkg.oauth 

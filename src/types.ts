@@ -139,6 +139,8 @@ export interface PackageInfo {
   visibility: 'default' | 'hidden';
   catalog_status?: CatalogStatus;
   catalog_error?: string;
+  retry_in_ms: number | null;
+  next_retry_at: number | null;
 }
 
 export interface ToolInfo {
@@ -176,6 +178,7 @@ export interface ListToolPackagesOutput {
   packages: PackageInfo[];
   catalog_etag: string;
   updated_at: string;
+  snapshot_complete: boolean;
 }
 
 export interface ListToolsInput {

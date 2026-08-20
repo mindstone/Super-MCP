@@ -3,10 +3,10 @@ import { handleHealthCheckPackage } from '../src/handlers/healthCheckPackage.js'
 import { handleHealthCheckAll } from '../src/handlers/healthCheck.js';
 import { handleRestartPackage } from '../src/handlers/restartPackage.js';
 import { handleAuthenticate } from '../src/handlers/authenticate.js';
-import { handleListToolPackages } from '../src/handlers/listToolPackages.js';
 import { handleReadResource } from '../src/handlers/readResource.js';
-import type { Catalog } from '../src/catalog.js';
-import type { PackageRegistry } from '../src/registry.js';
+import { Catalog } from '../src/catalog.js';
+import { CatalogRefresher } from '../src/catalogRefresher.js';
+import type { PackageRegistry, RegistryLifecycleEvent } from '../src/registry.js';
 import type { McpClient, PackageConfig } from '../src/types.js';
 
 // Suppress logger output during tests
@@ -372,22 +372,54 @@ describe('Catalog-Registry sync: authenticate handler', () => {
 // ---------------------------------------------------------------------------
 
 describe('Catalog-Registry sync: list_tool_packages handler', () => {
-  it('clears catalog and re-fetches when health="ok" and catalog="error"', async () => {
-    const catalog = createMockCatalog({ 'test-pkg': 'error' });
-    const registry = createMockRegistry({
-      healthCheck: vi.fn().mockResolvedValue('ok'),
+  it('refresher clears a stale catalog error after a healthy client lifecycle event', async () => {
+    const pkg: PackageConfig = {
+      id: 'test-pkg',
+      name: 'Test Package',
+      transport: 'http',
+      base_url: 'http://localhost:3000',
+      visibility: 'default',
+    };
+    const client = createMockClient({
+      listTools: vi.fn().mockResolvedValue([{ name: 'recovered_tool' }]),
+    });
+    let lifecycleListener: ((event: RegistryLifecycleEvent) => void) | undefined;
+    const registry = {
+      getPackage: vi.fn().mockReturnValue(pkg),
+      getPackages: vi.fn().mockReturnValue([pkg]),
+      subscribeLifecycle: vi.fn((listener: (event: RegistryLifecycleEvent) => void) => {
+        lifecycleListener = listener;
+        return vi.fn();
+      }),
+      connectForCatalog: vi.fn().mockResolvedValue({ kind: 'connected', client }),
+    } as unknown as PackageRegistry;
+    const catalog = new Catalog(registry);
+    const readyGeneration = catalog.beginRefresh(pkg.id);
+    catalog.commitReady(pkg.id, [{ name: 'old_tool' }], readyGeneration);
+    const refresher = new CatalogRefresher(catalog, registry);
+    refresher.start();
+
+    const failureGeneration = catalog.beginRefresh(pkg.id);
+    catalog.commitFailure(pkg.id, failureGeneration, {
+      status: 'error',
+      lastError: 'stale failure',
+      failureClass: 'permanent',
+      nextRetryAt: null,
+      nextAuthProbeAt: null,
+    });
+    lifecycleListener?.({
+      type: 'client_created',
+      packageId: pkg.id,
+    });
+    await vi.waitFor(() => {
+      expect(catalog.getPackageStatus(pkg.id)).toBe('ready');
     });
 
-    await handleListToolPackages(
-      { safe_only: true, limit: 100, include_health: true },
-      registry,
-      catalog,
-    );
-
-    expect(catalog.clearPackage).toHaveBeenCalledWith('test-pkg');
-    // After clearing, ensurePackageLoaded should be called again for re-fetch
-    // First call is the initial load, second is the re-fetch after clear
-    expect(catalog.ensurePackageLoaded).toHaveBeenCalledTimes(2);
+    expect(catalog.getPackageTools(pkg.id).map((tool) => tool.tool.name)).toEqual([
+      'recovered_tool',
+    ]);
+    expect(registry.connectForCatalog).toHaveBeenCalledOnce();
+    await refresher.dispose();
   });
 });
 

@@ -219,16 +219,16 @@ function validateReadOnlyFromAnnotations(toolId: string, annotations: ToolAnnota
   return `bulk_export only supports tools with explicit read-only annotations. '${toolId}' has annotations but no readOnlyHint.`;
 }
 
-async function validateReadOnlyTool(
+function validateReadOnlyTool(
   packageId: string,
   toolId: string,
   catalog: Catalog,
-): Promise<string | null> {
+): string | null {
   const catalogWithGetTool = catalog as Catalog & {
-    getTool?: (packageId: string, toolId: string) => Promise<{ tool?: { annotations?: ToolAnnotations } } | undefined>;
+    getTool?: (packageId: string, toolId: string) => { tool?: { annotations?: ToolAnnotations } } | undefined;
   };
   const cachedTool = typeof catalogWithGetTool.getTool === "function"
-    ? await catalogWithGetTool.getTool(packageId, toolId)
+    ? catalogWithGetTool.getTool(packageId, toolId)
     : undefined;
   const annotationDecision = validateReadOnlyFromAnnotations(toolId, cachedTool?.tool?.annotations);
   if (annotationDecision !== undefined) {
@@ -810,7 +810,7 @@ function validateSecurityPolicy(packageId: string, toolId: string, registry: Pac
 }
 
 async function validatePackageAvailable(packageId: string, catalog: Catalog): Promise<string | null> {
-  await catalog.ensurePackageLoaded(packageId);
+  await catalog.ensurePackageLoaded(packageId, { reason: "explicit" });
   const packageStatus = catalog.getPackageStatus(packageId);
   if (packageStatus === "auth_required") {
     return `Package '${packageId}' requires authentication. Run 'authenticate(package_id: "${packageId}")'.`;
@@ -854,7 +854,7 @@ export async function handleBulkExport(
   }
 
   try {
-    const readOnlyError = await validateReadOnlyTool(parsedInput.packageId, parsedInput.toolId, catalog);
+    const readOnlyError = validateReadOnlyTool(parsedInput.packageId, parsedInput.toolId, catalog);
     if (readOnlyError) {
       return errorResponse(readOnlyError);
     }

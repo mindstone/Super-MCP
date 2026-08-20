@@ -1,6 +1,10 @@
 import { ListToolsInput, ListToolsOutput, ERROR_CODES, ToolInfo } from "../types.js";
-import { Catalog } from "../catalog.js";
-import { PackageRegistry } from "../registry.js";
+import type {
+  CatalogRefreshScheduler,
+  CatalogView,
+  PackageMetadataView,
+} from "../catalog.js";
+import { buildToolInfos, getDiscoveryPackageState } from "../catalogFormatters.js";
 import { computeSecurityAnnotation, extractRawToolId } from "./annotateToolSecurity.js";
 import {
   coerceStringifiedNumber,
@@ -9,9 +13,10 @@ import {
 
 export async function handleListTools(
   input: ListToolsInput,
-  catalog: Catalog,
+  catalog: CatalogView,
   _validator: any,
-  registry?: PackageRegistry
+  packagesView?: PackageMetadataView,
+  refreshScheduler?: CatalogRefreshScheduler,
 ): Promise<any> {
   let {
     package_id,
@@ -41,8 +46,9 @@ export async function handleListTools(
   const effectiveSummarize = detail === "full";
   const effectiveIncludeSchemas = detail === "full";
 
-  await catalog.ensurePackageLoaded(package_id);
-  const packageStatus = catalog.getPackageStatus(package_id);
+  refreshScheduler?.scheduleRefresh(package_id);
+  const state = getDiscoveryPackageState(catalog, package_id);
+  const packageStatus = state.catalogStatus;
   if (packageStatus === "auth_required") {
     throw {
       code: ERROR_CODES.PACKAGE_UNAVAILABLE,
@@ -66,15 +72,27 @@ export async function handleListTools(
       data: { package_id, status: packageStatus },
     };
   }
+  if (packageStatus === "connecting") {
+    throw {
+      code: ERROR_CODES.PACKAGE_UNAVAILABLE,
+      message: `Package '${package_id}' catalog is still connecting.`,
+      data: {
+        package_id,
+        status: packageStatus,
+        retry_in_ms: state.retryInMs,
+        next_retry_at: state.nextRetryAt,
+      },
+    };
+  }
 
-  const toolInfos = await catalog.buildToolInfos(package_id, {
+  const toolInfos = buildToolInfos(package_id, catalog.getPackageTools(package_id), {
     summarize: effectiveSummarize,
     include_schemas: effectiveIncludeSchemas,
     include_descriptions: true,
   });
 
   // Annotate tools with security blocked status
-  const catalogId = registry?.getPackage(package_id)?.catalogId;
+  const catalogId = packagesView?.getPackage(package_id)?.catalogId;
   const tools: ToolInfo[] = toolInfos.map(tool => ({
     ...tool,
     ...computeSecurityAnnotation(package_id, catalogId, extractRawToolId(tool.tool_id)),

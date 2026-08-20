@@ -59,7 +59,7 @@ export async function handleReadResource(
     };
   }
 
-  await catalog.ensurePackageLoaded(packageId);
+  await catalog.ensurePackageLoaded(packageId, { reason: "explicit" });
   const packageStatus = catalog.getPackageStatus(packageId);
   if (packageStatus === "setup_incomplete") {
     throw {

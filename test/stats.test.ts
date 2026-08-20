@@ -101,15 +101,23 @@ async function startApiServer(
 ) {
   const app = express();
   app.use(express.json());
-  // `/manifest` / `/api/tools` need a catalog shape; `/stats` does not touch it,
-  // but `registerHttpApiRoutes` requires the property. Minimal stub is fine.
+  // The route registrar shares one catalog across the catalog endpoints and
+  // `/stats`; keep this stub at the read-only surface those routes consume.
   const catalogStub = {
-    ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
-    buildToolInfos: vi.fn().mockResolvedValue([]),
+    getPackageTools: vi.fn().mockReturnValue([]),
     etag: vi.fn().mockReturnValue("sha256:catalog"),
     countTools: vi.fn().mockReturnValue(0),
     computePackageEmbeddingHash: vi.fn().mockReturnValue(""),
     getPackageStatus: vi.fn().mockReturnValue("ready"),
+    getPackageError: vi.fn().mockReturnValue(undefined),
+    getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
+    isSnapshotComplete: vi.fn().mockReturnValue(true),
+    getPackageDiagnostics: vi.fn().mockReturnValue({
+      status: "ready",
+      consecutiveFailures: 0,
+      nextRetryAt: null,
+      lastErrorClass: null,
+    }),
   } as unknown as Catalog;
 
   registerHttpApiRoutes(app, {
@@ -140,6 +148,31 @@ afterEach(() => {
 // ── Route shape tests ────────────────────────────────────────────────
 
 describe("GET /stats route shape", () => {
+  it("includes catalog degradation diagnostics in each child snapshot", () => {
+    const registry = createRegistry([stdioPackage("alpha")]);
+    const catalog = {
+      getPackageDiagnostics: vi.fn().mockReturnValue({
+        status: "error",
+        lastError: "connection timed out",
+        consecutiveFailures: 3,
+        nextRetryAt: 1_800_000,
+        lastErrorClass: "timeout",
+        retainedToolCount: 2,
+        generation: 7,
+      }),
+    };
+
+    expect(registry.getChildStats(catalog)).toEqual([
+      expect.objectContaining({
+        package_id: "alpha",
+        catalog_status: "error",
+        consecutive_failures: 3,
+        next_retry_at: 1_800_000,
+        last_error_class: "timeout",
+      }),
+    ]);
+  });
+
   it("returns router metadata + empty children when no packages configured", async () => {
     const registry = createRegistry([]);
     const server = await startApiServer(registry);

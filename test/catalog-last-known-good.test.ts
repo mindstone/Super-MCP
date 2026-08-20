@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Catalog } from "../src/catalog.js";
+import { buildPackageSummary } from "../src/catalogFormatters.js";
 import type { PackageRegistry } from "../src/registry.js";
 import type { McpClient, PackageConfig } from "../src/types.js";
 
@@ -86,7 +87,7 @@ describe("Catalog last-known-good retention", () => {
     }).resourceUriToPackage;
     expect(retainedUriOwners.get("ui://records")).toBe(PACKAGE.id);
     expect(retainedEmbeddingHash).not.toBe("");
-    await expect(catalog.buildPackageSummary(PACKAGE)).resolves.toContain(
+    expect(buildPackageSummary(PACKAGE, catalog)).toContain(
       "degraded — showing last-known-good tools",
     );
 
