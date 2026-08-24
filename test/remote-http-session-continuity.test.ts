@@ -377,7 +377,20 @@ async function mintHandle(
 }
 
 describe("remote HTTP MCP session continuity", () => {
-  it("preserves a session-bound handle after a transient health-probe failure", async () => {
+  // ── KNOWN-FAILING BY DESIGN (red repro) ───────────────────────────────────
+  // These use `it.fails`: they PASS while the defect exists and go RED the
+  // moment it is fixed — at which point convert them to plain `it(...)`.
+  //
+  // Defect: `PackageRegistry.getClient()` runs a pre-dispatch `healthCheck()`
+  // that, for HTTP clients, is a full `listTools()` round-trip. A single
+  // transient non-401 failure evicts the client; the replacement transport is
+  // built with no `sessionId`, so the remote server mints a NEW Mcp-Session-Id
+  // between two consecutive tool calls. Any server state bound to the old
+  // session is silently invalidated.
+  //
+  // The fix is deliberately deferred; see the Rebel planning folder
+  // 260824_fix-stripe-mcp-session-churn (Stage 3).
+  it.fails("preserves a session-bound handle after a transient health-probe failure", async () => {
     const scenario = await createScenario("session-continuity");
     const lifecycleEvents: RegistryLifecycleEvent[] = [];
     scenario.registry.subscribeLifecycle((event) =>
@@ -424,7 +437,7 @@ describe("remote HTTP MCP session continuity", () => {
       .toEqual(new Set([mintSession]));
   });
 
-  it("preserves session-bound handles for a generic remote HTTP MCP package", async () => {
+  it.fails("preserves session-bound handles for a generic remote HTTP MCP package", async () => {
     // This is the artifact proving the failure class belongs to the generic
     // remote HTTP MCP lifecycle, rather than to any connector implementation.
     const scenario = await createScenario("generic-remote-service");
