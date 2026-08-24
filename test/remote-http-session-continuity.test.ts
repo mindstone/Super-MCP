@@ -41,6 +41,8 @@ interface ToolCallObservation {
 interface SessionBoundMcpServer {
   url: string;
   armOneShotListToolsFailure(): void;
+  armPersistentListToolsFailure(): void;
+  listToolsFailureCount(): number;
   assignedSessionIds(): readonly string[];
   observedSessionIds(): readonly string[];
   toolCallSession(toolName: string): string | undefined;
@@ -183,6 +185,8 @@ async function startSessionBoundMcpServer(): Promise<SessionBoundMcpServer> {
   const observedSessionIds: string[] = [];
   const toolCalls: ToolCallObservation[] = [];
   let failNextListTools = false;
+  let failAllListTools = false;
+  let listToolsFailures = 0;
 
   const handleRequest = async (
     request: IncomingMessage,
@@ -255,8 +259,12 @@ async function startSessionBoundMcpServer(): Promise<SessionBoundMcpServer> {
       return;
     }
 
-    if (failNextListTools && isJsonRpcMethod(body, "tools/list")) {
+    if (
+      (failNextListTools || failAllListTools) &&
+      isJsonRpcMethod(body, "tools/list")
+    ) {
       failNextListTools = false;
+      listToolsFailures += 1;
       writeJson(response, 500, {
         jsonrpc: "2.0",
         error: { code: -32_000, message: "Transient tools/list failure" },
@@ -297,11 +305,16 @@ async function startSessionBoundMcpServer(): Promise<SessionBoundMcpServer> {
     armOneShotListToolsFailure: () => {
       failNextListTools = true;
     },
+    armPersistentListToolsFailure: () => {
+      failAllListTools = true;
+    },
+    listToolsFailureCount: () => listToolsFailures,
     assignedSessionIds: () => assignedSessionIds,
     observedSessionIds: () => observedSessionIds,
     toolCallSession: (toolName) =>
-      toolCalls.find((observation) => observation.toolName === toolName)
-        ?.sessionId,
+      [...toolCalls]
+        .reverse()
+        .find((observation) => observation.toolName === toolName)?.sessionId,
     close: async () => {
       await Promise.allSettled(
         [...sessions.values()].map((entry) => entry.server.close()),
@@ -461,4 +474,69 @@ describe("remote HTTP MCP session continuity", () => {
     expect.soft(firstText(useResult)).toBe("Handle accepted");
     expect.soft(useSession).toBe(mintSession);
   });
+
+  it.fails(
+    "under a PERSISTENT (not one-shot) probe failure, every call after the first gets a fresh session — a deterministic, not intermittent, break",
+    async () => {
+      // Models the field scenario in PLAN.md amendment A12: an expired/failing
+      // OAuth token puts healthCheck() into a persistently non-401-failing
+      // state (httpClient.ts classifies auth failures by substring-matching
+      // "Unauthorized"/"401" only — anything else, e.g. a session-expiry 404
+      // or a refresh 400, is treated as a generic probe failure and evicts).
+      // Once persistent, EVERY getClient() call after the first sees an
+      // existing-but-unhealthy client and evicts it, so no handle survives
+      // even a single subsequent call. This is the mechanism that explains
+      // "works right after re-auth, then every data call fails until the next
+      // re-auth" without needing any Stripe-specific behavior.
+      const scenario = await createScenario("persistent-probe-failure");
+
+      // Call 1: no client exists yet, so no health probe runs. Establishes
+      // session A and mints a handle bound to it.
+      const handle1 = await mintHandle(scenario);
+      const session1 = scenario.server.toolCallSession("mint_handle");
+
+      // From here on, every tools/list probe fails — simulating a token that
+      // has expired and whose refresh keeps failing with a non-401 shape.
+      scenario.server.armPersistentListToolsFailure();
+
+      // Call 2: getClient() finds the existing client, probes it, the probe
+      // fails, the client is evicted, a fresh client is created (no probe on
+      // a brand-new client) under session B, and use_handle runs there.
+      const useResult1 = asToolResult(
+        await scenario.registry.callTool(scenario.packageId, "use_handle", {
+          handle: handle1,
+        }),
+      );
+
+      // Call 3: same story — the session-B client now exists, gets probed,
+      // fails, evicted, session C. mint_handle succeeds but binds to C.
+      const handle2 = await mintHandle(scenario);
+      const session3 = scenario.server.toolCallSession("mint_handle");
+
+      // Call 4: session-C client gets probed, fails, evicted, session D.
+      // The handle minted one call ago is already dead.
+      const useResult2 = asToolResult(
+        await scenario.registry.callTool(scenario.packageId, "use_handle", {
+          handle: handle2,
+        }),
+      );
+
+      // Desired green behavior: session identity survives regardless of how
+      // many times the probe fails, so every one of these succeeds.
+      expect.soft(useResult1.isError).toBe(false);
+      expect.soft(firstText(useResult1)).toBe("Handle accepted");
+      expect.soft(useResult2.isError).toBe(false);
+      expect.soft(firstText(useResult2)).toBe("Handle accepted");
+
+      // The deterministic signature: with a persistent probe failure, EVERY
+      // call after the first lands in a brand-new session — not just the one
+      // that happened to straddle a transient blip.
+      expect.soft(scenario.server.listToolsFailureCount()).toBeGreaterThanOrEqual(2);
+      expect.soft(scenario.server.assignedSessionIds().length).toBeGreaterThanOrEqual(4);
+      expect.soft(session3).not.toBe(session1);
+      expect
+        .soft(evictionCount(scenario.registry, scenario.packageId))
+        .toBeGreaterThanOrEqual(2);
+    },
+  );
 });
