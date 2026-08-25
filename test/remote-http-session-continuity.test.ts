@@ -401,8 +401,10 @@ describe("remote HTTP MCP session continuity", () => {
   // between two consecutive tool calls. Any server state bound to the old
   // session is silently invalidated.
   //
-  // The fix is deliberately deferred; see the Rebel planning folder
-  // 260824_fix-stripe-mcp-session-churn (Stage 3).
+  // Field-verified: this probe ran 1:1 before each tool call. No fix is
+  // scheduled. The original Stripe attribution was falsified: `stripe_context`
+  // is a stable account ID that survives session rotation and re-auth. See
+  // docs-private/postmortems/260825_model_authored_bug_report_feedback_loop.md.
   it.fails("preserves a session-bound handle after a transient health-probe failure", async () => {
     const scenario = await createScenario("session-continuity");
     const lifecycleEvents: RegistryLifecycleEvent[] = [];
@@ -450,44 +452,14 @@ describe("remote HTTP MCP session continuity", () => {
       .toEqual(new Set([mintSession]));
   });
 
-  it.fails("preserves session-bound handles for a generic remote HTTP MCP package", async () => {
-    // This is the artifact proving the failure class belongs to the generic
-    // remote HTTP MCP lifecycle, rather than to any connector implementation.
-    const scenario = await createScenario("generic-remote-service");
-    const handle = await mintHandle(scenario);
-    const mintSession = scenario.server.toolCallSession("mint_handle");
-    if (mintSession === undefined) {
-      throw new Error("Server did not observe the mint_handle session");
-    }
-
-    scenario.server.armOneShotListToolsFailure();
-    const useResult = asToolResult(
-      await scenario.registry.callTool(scenario.packageId, "use_handle", {
-        handle,
-      }),
-    );
-    const useSession = scenario.server.toolCallSession("use_handle");
-
-    // Desired green behavior: a transient probe failure must not invalidate
-    // state that the remote server explicitly bound to the live MCP session.
-    expect.soft(useResult.isError).toBe(false);
-    expect.soft(firstText(useResult)).toBe("Handle accepted");
-    expect.soft(useSession).toBe(mintSession);
-  });
-
   it.fails(
     "under a PERSISTENT (not one-shot) probe failure, every call after the first gets a fresh session — a deterministic, not intermittent, break",
     async () => {
-      // Models the field scenario in PLAN.md amendment A12: an expired/failing
-      // OAuth token puts healthCheck() into a persistently non-401-failing
-      // state (httpClient.ts classifies auth failures by substring-matching
-      // "Unauthorized"/"401" only — anything else, e.g. a session-expiry 404
-      // or a refresh 400, is treated as a generic probe failure and evicts).
-      // Once persistent, EVERY getClient() call after the first sees an
-      // existing-but-unhealthy client and evicts it, so no handle survives
-      // even a single subsequent call. This is the mechanism that explains
-      // "works right after re-auth, then every data call fails until the next
-      // re-auth" without needing any Stripe-specific behavior.
+      // This generic lifecycle defect is real and field-verified: the probe ran
+      // 1:1 before each tool call. No fix is scheduled. The original Stripe
+      // attribution was falsified: `stripe_context` is a stable account ID that
+      // survives session rotation and re-auth. See docs-private/postmortems/
+      // 260825_model_authored_bug_report_feedback_loop.md.
       const scenario = await createScenario("persistent-probe-failure");
 
       // Call 1: no client exists yet, so no health probe runs. Establishes
@@ -495,8 +467,7 @@ describe("remote HTTP MCP session continuity", () => {
       const handle1 = await mintHandle(scenario);
       const session1 = scenario.server.toolCallSession("mint_handle");
 
-      // From here on, every tools/list probe fails — simulating a token that
-      // has expired and whose refresh keeps failing with a non-401 shape.
+      // From here on, every tools/list probe returns a non-401 failure.
       scenario.server.armPersistentListToolsFailure();
 
       // Call 2: getClient() finds the existing client, probes it, the probe

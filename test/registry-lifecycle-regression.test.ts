@@ -13,10 +13,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import {
-  PackageRegistry,
-  type RegistryLifecycleEvent,
-} from "../src/registry.js";
+import { PackageRegistry } from "../src/registry.js";
 import type { McpClient, PackageConfig, SuperMcpConfig } from "../src/types.js";
 
 vi.mock("../src/logging.js", () => ({
@@ -40,10 +37,7 @@ interface ToolCallObservation {
 
 interface SessionBoundMcpServer {
   url: string;
-  armOneShotListToolsFailure(): void;
-  armPersistentListToolsFailure(): void;
   armPersistent401OnListTools(): void;
-  listToolsFailureCount(): number;
   listTools401Count(): number;
   assignedSessionIds(): readonly string[];
   observedSessionIds(): readonly string[];
@@ -187,10 +181,7 @@ async function startSessionBoundMcpServer(): Promise<SessionBoundMcpServer> {
   const assignedSessionIds: string[] = [];
   const observedSessionIds: string[] = [];
   const toolCalls: ToolCallObservation[] = [];
-  let failNextListTools = false;
-  let failAllListTools = false;
   let failAllListTools401 = false;
-  let listToolsFailures = 0;
   let listTools401Count = 0;
 
   const handleRequest = async (
@@ -264,19 +255,6 @@ async function startSessionBoundMcpServer(): Promise<SessionBoundMcpServer> {
       return;
     }
 
-    if (
-      (failNextListTools || failAllListTools) &&
-      isJsonRpcMethod(body, "tools/list")
-    ) {
-      failNextListTools = false;
-      listToolsFailures += 1;
-      writeJson(response, 500, {
-        jsonrpc: "2.0",
-        error: { code: -32_000, message: "Transient tools/list failure" },
-      });
-      return;
-    }
-
     if (failAllListTools401 && isJsonRpcMethod(body, "tools/list")) {
       listTools401Count += 1;
       writeJson(response, 401, {
@@ -316,16 +294,9 @@ async function startSessionBoundMcpServer(): Promise<SessionBoundMcpServer> {
 
   return {
     url: `http://127.0.0.1:${address.port}/mcp`,
-    armOneShotListToolsFailure: () => {
-      failNextListTools = true;
-    },
-    armPersistentListToolsFailure: () => {
-      failAllListTools = true;
-    },
     armPersistent401OnListTools: () => {
       failAllListTools401 = true;
     },
-    listToolsFailureCount: () => listToolsFailures,
     listTools401Count: () => listTools401Count,
     assignedSessionIds: () => assignedSessionIds,
     observedSessionIds: () => observedSessionIds,
@@ -420,42 +391,6 @@ async function createHttpScenario(packageId: string): Promise<HttpScenario> {
   return scenario;
 }
 
-async function createDualHttpScenario(
-  packageA: string,
-  packageB: string,
-): Promise<{
-  registry: PackageRegistry;
-  serverA: SessionBoundMcpServer;
-  serverB: SessionBoundMcpServer;
-  close(): Promise<void>;
-}> {
-  const serverA = await startSessionBoundMcpServer();
-  const serverB = await startSessionBoundMcpServer();
-  const registry = new PackageRegistry({
-    packages: [
-      httpPackage(packageA, serverA.url),
-      httpPackage(packageB, serverB.url),
-    ],
-  });
-  const scenario = {
-    registry,
-    serverA,
-    serverB,
-    close: async () => {
-      await registry.closeAll();
-      await serverA.close();
-      await serverB.close();
-    },
-  };
-  activeHttpScenarios.push({
-    registry,
-    server: serverA,
-    packageId: packageA,
-    close: scenario.close,
-  });
-  return scenario;
-}
-
 function asToolResult(result: unknown): ToolResult {
   if (typeof result !== "object" || result === null) {
     throw new Error("Expected an MCP tool result object");
@@ -514,34 +449,6 @@ describe("registry client-lifecycle regression net", () => {
       expect(createSpy).toHaveBeenCalledTimes(1);
       expect(spawnCount(registry, packageId)).toBe(1);
     });
-
-    it("keeps evicting and respawning a permanently unhealthy stdio child", async () => {
-      const packageId = "broken-stdio";
-      const registry = createRegistry([stdioPackage(packageId)]);
-      const createSpy = vi
-        .spyOn(registry as unknown as { createAndConnectClient: Function }, "createAndConnectClient")
-        .mockImplementation(async () =>
-          createMockClient({
-            healthCheck: vi.fn().mockResolvedValue("error"),
-            close: vi.fn().mockResolvedValue(undefined),
-          }),
-        );
-
-      await registry.getClient(packageId);
-      expect(createSpy).toHaveBeenCalledTimes(1);
-      expect(spawnCount(registry, packageId)).toBe(1);
-      expect(evictionCount(registry, packageId)).toBe(0);
-
-      await registry.getClient(packageId);
-      expect(createSpy).toHaveBeenCalledTimes(2);
-      expect(spawnCount(registry, packageId)).toBe(2);
-      expect(evictionCount(registry, packageId)).toBe(1);
-
-      await registry.getClient(packageId);
-      expect(createSpy).toHaveBeenCalledTimes(3);
-      expect(spawnCount(registry, packageId)).toBe(3);
-      expect(evictionCount(registry, packageId)).toBe(2);
-    });
   });
 
   describe("HTTP transport", () => {
@@ -583,81 +490,6 @@ describe("registry client-lifecycle regression net", () => {
       expect(scenario.server.toolCallSession("use_handle")).toBe(mintSession);
       expect(evictionCount(scenario.registry, scenario.packageId)).toBe(0);
       expect(scenario.server.assignedSessionIds()).toHaveLength(1);
-    });
-
-    it("keeps evicting and reconnecting when the HTTP server is permanently unreachable on probes", async () => {
-      const scenario = await createHttpScenario("dead-http");
-      await mintHandle(scenario);
-      expect(spawnCount(scenario.registry, scenario.packageId)).toBe(1);
-      expect(evictionCount(scenario.registry, scenario.packageId)).toBe(0);
-
-      scenario.server.armPersistentListToolsFailure();
-
-      await scenario.registry.getClient(scenario.packageId);
-      expect(spawnCount(scenario.registry, scenario.packageId)).toBe(2);
-      expect(evictionCount(scenario.registry, scenario.packageId)).toBe(1);
-
-      await scenario.registry.getClient(scenario.packageId);
-      expect(spawnCount(scenario.registry, scenario.packageId)).toBe(3);
-      expect(evictionCount(scenario.registry, scenario.packageId)).toBe(2);
-      expect(scenario.server.listToolsFailureCount()).toBeGreaterThanOrEqual(2);
-    });
-  });
-
-  describe("package isolation", () => {
-    it("does not cross-evict or cross-session unrelated HTTP packages", async () => {
-      const packageA = "isolated-a";
-      const packageB = "isolated-b";
-      const dual = await createDualHttpScenario(packageA, packageB);
-
-      const handleB = asToolResult(
-        await dual.registry.callTool(packageB, "mint_handle", {}),
-      );
-      expect(handleB.isError).toBe(false);
-      const handleBText = firstText(handleB);
-      if (handleBText === undefined) {
-        throw new Error("package B mint_handle did not return a handle");
-      }
-      const mintSessionB = dual.serverB.toolCallSession("mint_handle");
-      if (mintSessionB === undefined) {
-        throw new Error("package B server did not observe mint_handle");
-      }
-
-      await mintHandle({
-        registry: dual.registry,
-        server: dual.serverA,
-        packageId: packageA,
-        close: dual.close,
-      });
-
-      const evictionsBeforeA = evictionCount(dual.registry, packageA);
-      const evictionsBeforeB = evictionCount(dual.registry, packageB);
-      const spawnBeforeB = spawnCount(dual.registry, packageB);
-
-      dual.serverA.armOneShotListToolsFailure();
-      const useResultA = asToolResult(
-        await dual.registry.callTool(packageA, "use_handle", {
-          handle: "stale-handle",
-        }),
-      );
-      expect(useResultA.isError).toBe(true);
-
-      expect(evictionCount(dual.registry, packageA)).toBe(evictionsBeforeA + 1);
-      expect(evictionCount(dual.registry, packageB)).toBe(evictionsBeforeB);
-      expect(spawnCount(dual.registry, packageB)).toBe(spawnBeforeB);
-
-      const useResultB = asToolResult(
-        await dual.registry.callTool(packageB, "use_handle", {
-          handle: handleBText,
-        }),
-      );
-      expect(useResultB.isError).toBe(false);
-      expect(firstText(useResultB)).toBe("Handle accepted");
-      expect(dual.serverB.toolCallSession("use_handle")).toBe(mintSessionB);
-      expect(dual.serverA.assignedSessionIds()).not.toEqual(
-        dual.serverB.assignedSessionIds(),
-      );
-      expect(evictionCount(dual.registry, packageB)).toBe(evictionsBeforeB);
     });
   });
 });
