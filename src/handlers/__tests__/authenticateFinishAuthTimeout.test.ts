@@ -50,6 +50,9 @@ vi.mock("../../auth/providers/simple.js", () => {
   class MockSimpleOAuthProvider {
     static getSavedClientPort = vi.fn(async () => null);
     static hasPersistedAccessToken = vi.fn(async () => false);
+    static async readNeedsReconnectMarkerState() {
+      return { state: "absent" as const };
+    }
     initialize = vi.fn(async () => {});
     checkAndInvalidateOnPortMismatch = vi.fn(async () => false);
     state = vi.fn(async () => "csrf-state");

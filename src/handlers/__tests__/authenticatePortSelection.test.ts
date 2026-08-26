@@ -57,6 +57,9 @@ vi.mock("../../utils/portFinder.js", () => ({
 vi.mock("../../auth/providers/simple.js", () => {
   class MockSimpleOAuthProvider {
     static getSavedClientPort = getSavedClientPort;
+    static async readNeedsReconnectMarkerState() {
+      return { state: "absent" as const };
+    }
     oauthPort: number;
     staticCredentials: unknown;
     initialize = vi.fn(async () => {});

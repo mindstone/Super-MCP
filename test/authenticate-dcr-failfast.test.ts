@@ -67,6 +67,7 @@ vi.mock('../src/auth/providers/simple.js', () => {
   }
   MockSimpleOAuthProvider.getSavedClientPort = vi.fn().mockResolvedValue(undefined);
   MockSimpleOAuthProvider.hasPersistedAccessToken = vi.fn().mockResolvedValue(false);
+  MockSimpleOAuthProvider.readNeedsReconnectMarkerState = async () => ({ state: 'absent' });
   return { SimpleOAuthProvider: MockSimpleOAuthProvider };
 });
 

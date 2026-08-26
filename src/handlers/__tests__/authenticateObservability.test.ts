@@ -53,6 +53,9 @@ vi.mock("../../auth/providers/simple.js", () => {
   class MockSimpleOAuthProvider {
     static getSavedClientPort = vi.fn(async () => undefined);
     static hasPersistedAccessToken = vi.fn(async () => false);
+    static async readNeedsReconnectMarkerState() {
+      return { state: "absent" as const };
+    }
 
     oauthPort: number;
     skipProbe = false;

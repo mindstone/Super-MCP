@@ -279,6 +279,33 @@ async function handleAuthenticateCore(
       isError: false,
     };
   }
+
+  if (!force && pkg.transport === "http" && pkg.oauth === true) {
+    const markerState =
+      await SimpleOAuthProvider.readNeedsReconnectMarkerState(package_id);
+    if (markerState.state === "present") {
+      // The durable dead-grant marker is more authoritative than a cached
+      // client's health/tool probe, so reuse the existing forced-auth path.
+      force = true;
+    } else if (markerState.state === "read-error") {
+      logger.warn("Could not read OAuth reconnect marker", {
+        code: markerState.code,
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              package_id,
+              status: "error",
+              error: "Could not verify the package's authentication state. Please try again.",
+            }, null, 2),
+          },
+        ],
+        isError: true,
+      };
+    }
+  }
   
   if (force) {
     logger.info("Force re-auth requested, skipping health check", { package_id });

@@ -106,6 +106,11 @@ export interface OAuthErrorSummary {
   error_description?: string;
 }
 
+export type NeedsReconnectMarkerState =
+  | { state: "present" }
+  | { state: "absent" }
+  | { state: "read-error"; code: string };
+
 export class SimpleOAuthProvider implements OAuthClientProvider {
   private packageId: string;
   private savedTokens?: any;
@@ -222,6 +227,30 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       return undefined;
     } catch {
       return undefined; // No saved client or parse error
+    }
+  }
+
+  /**
+   * Read the durable dead-grant marker without collapsing an unreadable marker
+   * into absence. Callers must not report a package as authenticated when this
+   * state is unknown.
+   */
+  static async readNeedsReconnectMarkerState(
+    packageId: string,
+  ): Promise<NeedsReconnectMarkerState> {
+    const markerPath = path.join(
+      getOAuthTokenStoragePath(),
+      `${packageId}_needsReconnect.json`,
+    );
+    try {
+      await fs.access(markerPath);
+      return { state: "present" };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code ?? "unknown";
+      if (code === "ENOENT") {
+        return { state: "absent" };
+      }
+      return { state: "read-error", code };
     }
   }
   
@@ -1014,27 +1043,15 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     });
   }
 
-  /**
-   * Remove the needsReconnect marker after a successful re-auth / refresh. Gated
-   * on the marker actually existing so the common (no-marker) hourly-refresh path
-   * costs a single `access` stat rather than an unconditional `unlink` syscall.
-   */
+  /** Remove the needsReconnect marker after a successful re-auth / refresh. */
   async clearNeedsReconnectMarker(): Promise<void> {
     const markerPath = this.getNeedsReconnectMarkerPath();
     try {
-      await fs.access(markerPath);
-    } catch {
-      // No marker present (the overwhelmingly common case): nothing to do.
-      return;
-    }
-    try {
       await fs.unlink(markerPath);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
-        logger.debug("Could not remove needsReconnect marker", {
-          package_id: this.packageId,
-          error: error instanceof Error ? error.message : String(error),
-        });
+      const code = (error as NodeJS.ErrnoException)?.code ?? "unknown";
+      if (code !== "ENOENT") {
+        logger.warn("Could not remove needsReconnect marker", { code });
       }
     }
   }
