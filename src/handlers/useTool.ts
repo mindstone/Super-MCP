@@ -1314,6 +1314,24 @@ export async function handleUseTool(
     field: "max_output_chars",
   }) as typeof max_output_chars;
 
+  // Defensive: some MCP clients (e.g., Claude Code) may serialize the `args` object
+  // as a JSON string instead of passing a proper object. Detect and parse it back.
+  if (typeof args === 'string') {
+    try {
+      const parsed = JSON.parse(args);
+      if (isRecord(parsed)) {
+        logger.info("Coerced args from JSON string to object", {
+          package_id,
+          tool_id,
+          original_length: args.length,
+        });
+        args = parsed;
+      }
+    } catch {
+      // Not valid JSON — let downstream validation produce a clear error
+    }
+  }
+
   // Handle namespaced tool IDs for backward compatibility and Claude Code subagent support
   // Tool IDs now follow the format: "PackageName__tool_name"
   // This ensures global uniqueness when multiple packages have identically named tools

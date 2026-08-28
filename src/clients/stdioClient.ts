@@ -511,10 +511,28 @@ export class StdioMcpClient implements McpClient {
     const timeout = this.config.timeout ||
                     parseInt(process.env.SUPER_MCP_TOOL_TIMEOUT || '14400000');
 
+    // Defensive: ensure args is an object before forwarding to the MCP SDK.
+    // Some callers may pass a JSON string instead of a parsed object.
+    let resolvedArgs = args;
+    if (typeof args === 'string') {
+      try {
+        const parsed = JSON.parse(args);
+        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+          resolvedArgs = parsed;
+          logger.info("Coerced args from JSON string to object in callTool", {
+            package_id: this.packageId,
+            tool_name: name,
+          });
+        }
+      } catch {
+        // Not valid JSON — pass through and let the child server reject it
+      }
+    }
+
     logger.info("Calling tool on stdio MCP", {
       package_id: this.packageId,
       tool_name: name,
-      args_keys: typeof args === "object" && args ? Object.keys(args) : [],
+      args_keys: typeof resolvedArgs === "object" && resolvedArgs ? Object.keys(resolvedArgs) : [],
       timeout_ms: timeout,
       queue_size: this.requestQueue.size,
       queue_pending: this.requestQueue.pending,
@@ -524,7 +542,7 @@ export class StdioMcpClient implements McpClient {
       try {
         const response = await this.client.callTool({
           name,
-          arguments: args || {},
+          arguments: resolvedArgs || {},
         }, undefined, {
           timeout,
           resetTimeoutOnProgress: true, // Reset timeout when progress notifications are received
