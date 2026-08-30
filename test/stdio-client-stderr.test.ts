@@ -135,8 +135,17 @@ describe('StdioMcpClient stderr ring buffer bounding', () => {
   it('keeps only the most recent lines under the line cap', async () => {
     // Emit far more than 50 lines, then exit non-zero. The captured tail must
     // be bounded and contain the LAST lines, not the first.
+    // The last write carries the exit: `process.stderr.write` to a PIPE is
+    // asynchronous, and `process.exit()` tears the process down without
+    // flushing what is still queued — so a bare `exit(7)` after the loop
+    // truncates the child's own output. Under `gate:ci` load on a 32-core box
+    // the tail genuinely stopped at line-121/line-147: those lines were never
+    // written, so no amount of waiting on the parent side could recover them.
+    // Exiting from the final write's completion callback keeps the non-zero
+    // exit this test needs while guaranteeing all 200 lines were handed over.
     const script =
-      'for (let i = 0; i < 200; i++) { process.stderr.write("line-" + i + "\\n"); } process.exit(7);';
+      'for (let i = 0; i < 199; i++) { process.stderr.write("line-" + i + "\\n"); } ' +
+      'process.stderr.write("line-199\\n", () => process.exit(7));';
     const client = new StdioMcpClient('stderr-probe', makeConfig(['-e', script]));
 
     try {
@@ -145,7 +154,21 @@ describe('StdioMcpClient stderr ring buffer bounding', () => {
       /* expected */
     }
 
-    const tail = client.getStderrTail();
+    // `connect()` can reject the moment the child exits, while the parent is
+    // still draining its stderr pipe — the ring is filled from an async 'data'
+    // handler, so a read taken right here can legitimately stop short of the
+    // last line. Observed under `gate:ci` load on a 32-core box: the tail ended
+    // at line-121 while the child had written through line-199. Waiting for the
+    // drain does not weaken anything the assertions below check (bounding, and
+    // that the retained window is the most RECENT one) — it only stops reading
+    // mid-stream. If the line genuinely never arrives, the assertions still fail.
+    let tail = client.getStderrTail();
+    const drainDeadline = Date.now() + 2_000;
+    while (!tail?.includes('line-199') && Date.now() < drainDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      tail = client.getStderrTail();
+    }
+
     expect(tail).not.toBeNull();
     const lines = (tail as string).split('\n').filter((l) => l.length > 0);
     // Bounded: at most 50 lines retained.
