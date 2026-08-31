@@ -489,4 +489,29 @@ describe("materializeOutput mixed-content behavior", () => {
       mimeType: "image/png",
     });
   });
+
+  it("MC-T20: image/jpg direct and resource blocks emit canonical image/jpeg", () => {
+    const extracted = extractImageContentBlocks({
+      content: [
+        createImageBlock(TINY_PNG_BASE64, "IMAGE/JPG"),
+        createResourceImageBlock(TINY_PNG_BASE64, "image/jpg", "file:///legacy.jpg"),
+      ],
+      isError: false,
+    });
+
+    expect(extracted).toEqual([
+      { type: "image", data: TINY_PNG_BASE64, mimeType: "image/jpeg" },
+      { type: "image", data: TINY_PNG_BASE64, mimeType: "image/jpeg" },
+    ]);
+  });
+
+  it("MC-T21: image/jpg materializes with the canonical JPEG extension", async () => {
+    const result = await runMaterialize({
+      content: [createImageBlock(TINY_PNG_BASE64, "image/jpg")],
+      isError: false,
+    }, 1);
+
+    expect(result?.result.image_files).toHaveLength(1);
+    expect(result?.result.image_files[0]).toMatch(/\.jpg$/);
+  });
 });

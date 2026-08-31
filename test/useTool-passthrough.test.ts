@@ -124,6 +124,30 @@ describe("useTool passthrough contract", () => {
     expect(typeof response._meta.superMcp.outputChars).toBe("number");
   });
 
+  it("strips an extracted image/jpg resource from serialized output and emits canonical image/jpeg", async () => {
+    const inner = {
+      content: [{
+        type: "resource",
+        resource: {
+          uri: "file:///legacy.jpg",
+          mimeType: "image/jpg",
+          blob: "legacy-base64",
+        },
+      }],
+    };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+
+    const response = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator);
+    const envelope = parseEnvelope(response);
+
+    expect(JSON.stringify(envelope)).not.toContain("legacy-base64");
+    expect(response.content[1]).toEqual({
+      type: "image",
+      data: "legacy-base64",
+      mimeType: "image/jpeg",
+    });
+  });
+
   it("Case 2 — structuredContent only: hoisted onto outer block; _meta.ui still absent", async () => {
     const inner = {
       content: [{ type: "text", text: "draft staged" }],

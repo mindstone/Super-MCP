@@ -4,13 +4,14 @@ import crypto from "node:crypto";
 import { UseToolOutput } from "../types.js";
 import { getLogger } from "../logging.js";
 
-export const SUPPORTED_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/jpg", "image/gif", "image/webp"]);
+// super-mcp is a separately built package and cannot import @rebel/shared.
+// Parent-repo conformance tests keep this exact set aligned with IMAGE_MIME_TYPES.
+export const SUPPORTED_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 const MAX_SAVE_IMAGES = 5;
 const MAX_SAVE_IMAGE_BYTES = 10 * 1024 * 1024; // 10MB total base64
 const MIME_TO_EXT: Record<string, string> = {
   "image/png": ".png",
   "image/jpeg": ".jpg",
-  "image/jpg": ".jpg",
   "image/gif": ".gif",
   "image/webp": ".webp",
 };
@@ -44,6 +45,15 @@ function sanitizeForFilename(str: string): string {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function normalizeImageMimeType(mimeType: string): string {
+  const lowercased = mimeType.toLowerCase();
+  return lowercased === "image/jpg" ? "image/jpeg" : lowercased;
+}
+
+export function isSupportedImageMimeType(mimeType: string): boolean {
+  return SUPPORTED_IMAGE_MIME_TYPES.has(normalizeImageMimeType(mimeType));
 }
 
 function isPathWithinTarget(filePath: string, targetDir: string): boolean {
@@ -134,7 +144,7 @@ export function extractImageContentBlocks(toolResult: unknown): ImageContentBloc
         continue;
       }
 
-      const normalizedMimeType = block.mimeType.toLowerCase();
+      const normalizedMimeType = normalizeImageMimeType(block.mimeType);
       if (!SUPPORTED_IMAGE_MIME_TYPES.has(normalizedMimeType)) {
         continue;
       }
@@ -163,7 +173,7 @@ export function extractImageContentBlocks(toolResult: unknown): ImageContentBloc
       if (
         typeof resource.blob === "string" && resource.blob &&
         typeof resource.mimeType === "string" &&
-        SUPPORTED_IMAGE_MIME_TYPES.has(resource.mimeType.toLowerCase())
+        isSupportedImageMimeType(resource.mimeType)
       ) {
         if (imageBlocks.length >= MAX_SAVE_IMAGES) {
           droppedForCount += 1;
@@ -180,7 +190,7 @@ export function extractImageContentBlocks(toolResult: unknown): ImageContentBloc
         imageBlocks.push({
           type: "image",
           data: resource.blob,
-          mimeType: resource.mimeType.toLowerCase(),
+          mimeType: normalizeImageMimeType(resource.mimeType),
         });
         totalBase64Bytes = nextTotalBytes;
       }

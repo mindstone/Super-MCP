@@ -26,7 +26,11 @@ import {
   requirePackageId,
   type AutoRepairBreadcrumb,
 } from "../utils/normalizeInput.js";
-import { materializeOutput, extractImageContentBlocks, SUPPORTED_IMAGE_MIME_TYPES } from "./materializeOutput.js";
+import {
+  materializeOutput,
+  extractImageContentBlocks,
+  isSupportedImageMimeType,
+} from "./materializeOutput.js";
 import { parseUseToolInput } from "./useToolInput.js";
 
 const logger = getLogger();
@@ -1988,7 +1992,7 @@ export async function handleUseTool(
               if (block.type === "resource" && isRecord(block.resource)) {
                 const r = block.resource as Record<string, unknown>;
                 if (typeof r.blob === "string" && r.blob && typeof r.mimeType === "string"
-                  && SUPPORTED_IMAGE_MIME_TYPES.has((r.mimeType as string).toLowerCase())) {
+                  && isSupportedImageMimeType(r.mimeType as string)) {
                   return false;
                 }
               }
