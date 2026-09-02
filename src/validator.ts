@@ -1,7 +1,21 @@
-import Ajv from "ajv";
+import { createRequire } from "node:module";
+import Ajv2020 from "ajv/dist/2020.js";
 import addFormats from "ajv-formats";
 import { ERROR_CODES } from "./types.js";
 import { getLogger } from "./logging.js";
+
+// Upstream MCP servers hand us tool input schemas in whatever JSON Schema
+// dialect they were written in. Linear's declare `$schema: draft/2020-12`;
+// most others declare draft-07 or nothing. Ajv resolves a declared `$schema`
+// against its registered meta-schemas and throws `no schema with key or ref`
+// for one it does not know — with a draft-07-only instance every Linear tool
+// call failed as "Approved, but the action failed: no schema with key or ref
+// https://json-schema.org/draft/2020-12/schema". Use the 2020-12 class and
+// register the draft-07 meta-schema so both dialects (and undeclared
+// schemas) compile. The meta-schema is CJS JSON; createRequire avoids ESM
+// JSON-import attributes (same pattern as installGracefulFs / tokenRefreshLock).
+const requireFn = createRequire(import.meta.url);
+const draft7MetaSchema = requireFn("ajv/dist/refs/json-schema-draft-07.json");
 
 const logger = getLogger();
 
@@ -26,16 +40,18 @@ export interface ValidationResult {
 }
 
 export class Validator {
-  private ajv: Ajv;
+  private ajv: Ajv2020;
   private injectedSchemaCache = new WeakMap<object, object>();
 
   constructor() {
-    this.ajv = new Ajv({
+    this.ajv = new Ajv2020({
       strict: false,  // Changed to false to allow unknown formats
       allErrors: true,
       verbose: true,
     });
-    
+    // Draft-07 schemas (the common case) must keep compiling on the 2020-12 class.
+    this.ajv.addMetaSchema(draft7MetaSchema);
+
     // Add support for standard formats like date, date-time, email, etc.
     addFormats(this.ajv);
   }
