@@ -35,6 +35,33 @@ describe("Validator — JSON Schema dialects declared by upstream tools", () => 
     expect(validator.validate({ ...shape }, {}).valid).toBe(false);
   });
 
+  it("keeps draft-07 tuple-form `items: [...]` compiling for draft-07 and undeclared schemas (review F1)", () => {
+    // The 2020-12 class rejects array-form `items`; routing draft-07/undeclared
+    // schemas to a draft-07 instance preserves the historical behaviour.
+    const validator = new Validator();
+    const tuple = {
+      type: "object",
+      properties: { pair: { type: "array", items: [{ type: "string" }, { type: "integer" }] } },
+      required: ["pair"],
+    };
+    expect(validator.validate({ $schema: "http://json-schema.org/draft-07/schema#", ...tuple }, { pair: ["a", 1] }).valid).toBe(true);
+    expect(validator.validate({ ...tuple }, { pair: ["a", 1] }).valid).toBe(true);
+    expect(validator.validate({ ...tuple }, { pair: [1, "a"] }).valid).toBe(false);
+  });
+
+  it("applies 2020-12 semantics (prefixItems) when the schema declares 2020-12 (review F3)", () => {
+    const validator = new Validator();
+    const schema = {
+      $schema: "https://json-schema.org/draft/2020-12/schema",
+      type: "object",
+      properties: { pair: { type: "array", prefixItems: [{ type: "string" }, { type: "integer" }], items: false } },
+      required: ["pair"],
+    };
+    expect(validator.validate(schema, { pair: ["a", 1] }).valid).toBe(true);
+    expect(validator.validate(schema, { pair: [1, "a"] }).valid).toBe(false);
+    expect(validator.validate(schema, { pair: ["a", 1, "extra"] }).valid).toBe(false);
+  });
+
   it("accepts 2020-12 keywords ($defs/$ref) used by upstream tool schemas", () => {
     const validator = new Validator();
     const schema = {
