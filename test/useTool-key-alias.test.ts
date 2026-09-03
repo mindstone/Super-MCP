@@ -26,14 +26,30 @@ function createMocks() {
     notifyActivity: vi.fn(),
   } as unknown as PackageRegistry;
 
+  const toolSchema = {
+    type: "object",
+    properties: {},
+    additionalProperties: true,
+  };
+  const knownTargets = new Set([
+    "Slack-test\0search_slack_messages",
+    "Slack-test\0list_slack_channels",
+    "HubSpot-x\0create_hubspot_note",
+    "Microsoft-foo\0list_workspace_calendar_events",
+  ]);
+  const getTool = (packageId: string, toolId: string) =>
+    knownTargets.has(`${packageId}\0${toolId}`)
+      ? { packageId, tool: { name: toolId, inputSchema: toolSchema }, schemaHash: "" }
+      : undefined;
   const mockCatalog = {
     ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
     getPackageStatus: vi.fn().mockReturnValue("ready"),
-    getToolSchema: vi.fn().mockResolvedValue({
-      type: "object",
-      properties: {},
-      additionalProperties: true,
-    }),
+    getPackageError: vi.fn().mockReturnValue(undefined),
+    getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
+    getTool: vi.fn().mockImplementation(getTool),
+    getToolSchema: vi.fn().mockImplementation(
+      (packageId: string, toolId: string) => getTool(packageId, toolId)?.tool.inputSchema,
+    ),
   } as unknown as Catalog;
 
   const mockValidator = {

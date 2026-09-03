@@ -47,10 +47,19 @@ function createMocks() {
     callTool: async (_pkg: string, toolId: string, toolArgs: unknown) => mockClient.callTool(toolId, toolArgs),
     notifyActivity: vi.fn(),
   } as unknown as PackageRegistry;
+  const getTool = (packageId: string, toolId: string) =>
+    packageId && toolId
+      ? { packageId, tool: { name: toolId, inputSchema: UNFULFILLABLE_SCHEMA }, schemaHash: "" }
+      : undefined;
   const mockCatalog = {
     ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
     getPackageStatus: vi.fn().mockReturnValue("ready"),
-    getToolSchema: vi.fn().mockResolvedValue(UNFULFILLABLE_SCHEMA),
+    getPackageError: vi.fn().mockReturnValue(undefined),
+    getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
+    getTool: vi.fn().mockImplementation(getTool),
+    getToolSchema: vi.fn().mockImplementation(
+      (packageId: string, toolId: string) => getTool(packageId, toolId)?.tool.inputSchema,
+    ),
     findToolByName: vi.fn().mockReturnValue([]),
   } as unknown as Catalog;
   // REAL validator so the ARG_VALIDATION_FAILED teaching branch is exercised

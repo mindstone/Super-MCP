@@ -31,14 +31,28 @@ function createMocks(opts: {
     callTool: async (_pkg: string, toolId: string, toolArgs: unknown) => mockClient.callTool(toolId, toolArgs),
     notifyActivity: vi.fn(),
   } as unknown as PackageRegistry;
+  const toolSchema = opts.schema ?? {
+    type: "object",
+    properties: {},
+    additionalProperties: true,
+  };
+  const getTool = (packageId: string, toolId: string) => {
+    const isKnownMatch = (opts.toolMatches ?? []).some(
+      (match) => match.packageId === packageId && match.toolId === toolId,
+    );
+    return packagesById.has(packageId) && (isKnownMatch || toolId === "tool1" || toolId === "tool")
+      ? { packageId, tool: { name: toolId, inputSchema: toolSchema }, schemaHash: "" }
+      : undefined;
+  };
   const mockCatalog = {
     ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
     getPackageStatus: vi.fn().mockReturnValue("ready"),
-    getToolSchema: vi.fn().mockResolvedValue(opts.schema ?? {
-      type: "object",
-      properties: {},
-      additionalProperties: true,
-    }),
+    getPackageError: vi.fn().mockReturnValue(undefined),
+    getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
+    getTool: vi.fn().mockImplementation(getTool),
+    getToolSchema: vi.fn().mockImplementation(
+      (packageId: string, toolId: string) => getTool(packageId, toolId)?.tool.inputSchema,
+    ),
     findToolByName: vi.fn().mockReturnValue(opts.toolMatches ?? []),
   } as unknown as Catalog;
   const realValidator = new Validator();

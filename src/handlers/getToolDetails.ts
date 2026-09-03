@@ -131,34 +131,11 @@ export async function handleGetToolDetails(
     try {
       refreshScheduler?.scheduleRefresh(packageId);
       for (const req of toolRequests) {
-        let targetResolution = resolveToolTarget(
+        const targetResolution = resolveToolTarget(
           { catalog, registry },
           packageId,
           req.rawName,
         );
-        // Some legacy get_tool_details adapters expose only getPackage() and
-        // historically treated a ready catalog entry as usable even when that
-        // optional metadata lookup returned no annotation data. Preserve that
-        // test/adapter contract only for the partial surface: a real registry
-        // always stays exact, so a package alias can never become "absent".
-        if (
-          targetResolution.outcome === "unavailable" &&
-          targetResolution.reason === "package_unknown" &&
-          typeof registry.getPackages !== "function" &&
-          catalog.getPackageStatus(packageId) === "ready"
-        ) {
-          const catalogBackedRegistry = {
-            getPackage: (candidatePackageId: string) =>
-              candidatePackageId === packageId
-                ? { id: packageId }
-                : registry.getPackage(candidatePackageId),
-          } as unknown as PackageRegistry;
-          targetResolution = resolveToolTarget(
-            { catalog, registry: catalogBackedRegistry },
-            packageId,
-            req.rawName,
-          );
-        }
         if (targetResolution.outcome === "unavailable") {
           const packageState = getDiscoveryPackageState(catalog, packageId);
           const packageStatus = packageState.catalogStatus === "ready"

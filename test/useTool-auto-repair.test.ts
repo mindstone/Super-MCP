@@ -35,10 +35,19 @@ function createMocks(schema: unknown = CALENDAR_SCHEMA) {
     callTool: async (_pkg: string, toolId: string, toolArgs: unknown) => mockClient.callTool(toolId, toolArgs),
     notifyActivity: vi.fn(),
   } as unknown as PackageRegistry;
+  const getTool = (packageId: string, toolId: string) =>
+    packageId === "GoogleWorkspace-test" && ["list_workspace_calendar_events", "noop"].includes(toolId)
+      ? { packageId, tool: { name: toolId, inputSchema: schema }, schemaHash: "" }
+      : undefined;
   const mockCatalog = {
     ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
     getPackageStatus: vi.fn().mockReturnValue("ready"),
-    getToolSchema: vi.fn().mockResolvedValue(schema),
+    getPackageError: vi.fn().mockReturnValue(undefined),
+    getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
+    getTool: vi.fn().mockImplementation(getTool),
+    getToolSchema: vi.fn().mockImplementation(
+      (packageId: string, toolId: string) => getTool(packageId, toolId)?.tool.inputSchema,
+    ),
   } as unknown as Catalog;
   // REAL validator — exercises the actual strip-in-place + re-validate contract.
   const validator = new Validator();

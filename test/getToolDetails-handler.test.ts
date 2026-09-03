@@ -1,6 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import express from 'express';
-import type { AddressInfo } from 'node:net';
+import type { Express, Request, RequestHandler, Response } from 'express';
 import { handleGetToolDetails } from '../src/handlers/getToolDetails.js';
 import { handleListTools } from '../src/handlers/listTools.js';
 import { handleSearchTools, invalidateSearchCache } from '../src/handlers/searchTools.js';
@@ -142,9 +141,10 @@ function createMockCatalog(
 /** Create a minimal mock registry */
 function createMockRegistry(catalogIds: Record<string, string> = {}): PackageRegistry {
   return {
-    getPackage: vi.fn().mockImplementation((pkgId: string) =>
-      catalogIds[pkgId] ? { catalogId: catalogIds[pkgId] } : undefined
-    ),
+    getPackage: vi.fn().mockImplementation((pkgId: string) => ({
+      id: pkgId,
+      ...(catalogIds[pkgId] ? { catalogId: catalogIds[pkgId] } : {}),
+    })),
   } as unknown as PackageRegistry;
 }
 
@@ -245,32 +245,62 @@ function createSurfaceCatalog(
   });
 }
 
-async function startApiServer(
+function createApiHarness(
   registry: PackageRegistry,
   catalog: Catalog,
 ) {
-  const app = express();
-  app.use(express.json());
+  const routes = new Map<string, RequestHandler[]>();
+  const app = {
+    get(path: string, ...handlers: RequestHandler[]) {
+      routes.set(path, handlers);
+    },
+  } as unknown as Express;
   registerHttpApiRoutes(app, {
     registry,
     catalog,
     dnsRebindingGuard: (_req, _res, next) => next(),
   });
 
-  const server = await new Promise<ReturnType<typeof app.listen>>((resolve) => {
-    const httpServer = app.listen(0, '127.0.0.1', () =>
-      resolve(httpServer),
-    );
-  });
-  const address = server.address() as AddressInfo;
-
   return {
-    baseUrl: `http://127.0.0.1:${address.port}`,
-    async close() {
-      await new Promise<void>((resolve, reject) => {
-        server.close((error) => (error ? reject(error) : resolve()));
+    fetch(path: string) {
+      const handlers = routes.get(path);
+      if (!handlers) throw new Error(`No GET route registered for ${path}`);
+
+      return new Promise<globalThis.Response>((resolve, reject) => {
+        let status = 200;
+        const headers = new Headers();
+        const response = {
+          status(code: number) {
+            status = code;
+            return response;
+          },
+          setHeader(name: string, value: string | number | readonly string[]) {
+            headers.set(name, Array.isArray(value) ? value.join(', ') : String(value));
+            return response;
+          },
+          json(body: unknown) {
+            resolve(new globalThis.Response(JSON.stringify(body), { status, headers }));
+            return response;
+          },
+        } as unknown as Response;
+        const request = { query: {} } as Request;
+        let handlerIndex = 0;
+        const next = (error?: unknown): void => {
+          if (error) {
+            reject(error);
+            return;
+          }
+          const handler = handlers[handlerIndex++];
+          if (!handler) {
+            reject(new Error(`GET route ${path} completed without a response`));
+            return;
+          }
+          Promise.resolve(handler(request, response, next)).catch(reject);
+        };
+        next();
       });
     },
+    close: async () => undefined,
   };
 }
 
@@ -898,13 +928,11 @@ describe('handleGetToolDetails', () => {
       surfaceRegistry,
       surfaceCatalog,
     );
-    const apiServer = await startApiServer(surfaceRegistry, surfaceCatalog);
+    const apiServer = createApiHarness(surfaceRegistry, surfaceCatalog);
 
     try {
-      const toolsResponse = await fetch(`${apiServer.baseUrl}/api/tools`);
-      const manifestResponse = await fetch(
-        `${apiServer.baseUrl}/api/tools/manifest`,
-      );
+      const toolsResponse = await apiServer.fetch('/api/tools');
+      const manifestResponse = await apiServer.fetch('/api/tools/manifest');
       const surfaceOutputs = {
         list_tools: listed.content[0].text,
         search_tools: searched.content[0].text,

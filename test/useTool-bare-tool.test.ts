@@ -36,10 +36,24 @@ function createMocks(opts: {
     notifyActivity: vi.fn(),
   } as unknown as PackageRegistry;
 
+  const getTool = (packageId: string, toolId: string) => {
+    const isKnownMatch = opts.toolMatches.some(
+      (match) => match.packageId === packageId && match.toolId === toolId,
+    );
+    const isDirectWorkspaceLookup = packagesById.has(packageId) && toolId === "search_workspace_emails";
+    return isKnownMatch || isDirectWorkspaceLookup
+      ? { packageId, tool: { name: toolId, inputSchema: { type: "object" } }, schemaHash: "" }
+      : undefined;
+  };
   const mockCatalog = {
     ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
     getPackageStatus: vi.fn().mockReturnValue("ready"),
-    getToolSchema: vi.fn().mockResolvedValue({ type: "object" }),
+    getPackageError: vi.fn().mockReturnValue(undefined),
+    getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
+    getTool: vi.fn().mockImplementation(getTool),
+    getToolSchema: vi.fn().mockImplementation(
+      (packageId: string, toolId: string) => getTool(packageId, toolId)?.tool.inputSchema,
+    ),
     findToolByName: vi.fn().mockReturnValue(opts.toolMatches),
   } as unknown as Catalog;
 
