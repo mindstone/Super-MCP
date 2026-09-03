@@ -2,9 +2,10 @@ import { ERROR_CODES, ToolInfo } from "../types.js";
 import type {
   CatalogRefreshScheduler,
   CatalogView,
-  PackageMetadataView,
 } from "../catalog.js";
 import { getDiscoveryPackageState } from "../catalogFormatters.js";
+import type { PackageRegistry } from "../registry.js";
+import { resolveToolTarget } from "../toolTargetResolution.js";
 import { computeSecurityAnnotation } from "./annotateToolSecurity.js";
 import { getLogger } from "../logging.js";
 import {
@@ -29,7 +30,7 @@ interface GetToolDetailsInput {
 export async function handleGetToolDetails(
   input: GetToolDetailsInput,
   catalog: CatalogView,
-  packagesView: PackageMetadataView,
+  registry: PackageRegistry,
   refreshScheduler?: CatalogRefreshScheduler,
 ): Promise<any> {
   // Normalize tool_ids that the model may have stringified (upstream Claude model bug).
@@ -129,11 +130,40 @@ export async function handleGetToolDetails(
   for (const [packageId, toolRequests] of byPackage) {
     try {
       refreshScheduler?.scheduleRefresh(packageId);
-      const packageState = getDiscoveryPackageState(catalog, packageId);
-      const packageStatus = packageState.catalogStatus;
-
-      if (packageStatus !== "ready") {
-        for (const req of toolRequests) {
+      for (const req of toolRequests) {
+        let targetResolution = resolveToolTarget(
+          { catalog, registry },
+          packageId,
+          req.rawName,
+        );
+        // Some legacy get_tool_details adapters expose only getPackage() and
+        // historically treated a ready catalog entry as usable even when that
+        // optional metadata lookup returned no annotation data. Preserve that
+        // test/adapter contract only for the partial surface: a real registry
+        // always stays exact, so a package alias can never become "absent".
+        if (
+          targetResolution.outcome === "unavailable" &&
+          targetResolution.reason === "package_unknown" &&
+          typeof registry.getPackages !== "function" &&
+          catalog.getPackageStatus(packageId) === "ready"
+        ) {
+          const catalogBackedRegistry = {
+            getPackage: (candidatePackageId: string) =>
+              candidatePackageId === packageId
+                ? { id: packageId }
+                : registry.getPackage(candidatePackageId),
+          } as unknown as PackageRegistry;
+          targetResolution = resolveToolTarget(
+            { catalog, registry: catalogBackedRegistry },
+            packageId,
+            req.rawName,
+          );
+        }
+        if (targetResolution.outcome === "unavailable") {
+          const packageState = getDiscoveryPackageState(catalog, packageId);
+          const packageStatus = packageState.catalogStatus === "ready"
+            ? "connecting"
+            : packageState.catalogStatus;
           const setupReason = packageState.reason;
           const description = packageStatus === "auth_required"
             ? `Package '${packageId}' requires authentication.`
@@ -154,13 +184,10 @@ export async function handleGetToolDetails(
             retry_in_ms: packageState.retryInMs,
             next_retry_at: packageState.nextRetryAt,
           });
+          continue;
         }
-        continue;
-      }
 
-      for (const req of toolRequests) {
-        const cachedTool = catalog.getTool(packageId, req.rawName);
-        if (!cachedTool) {
+        if (targetResolution.outcome === "absent") {
           resultMap.set(req.toolId, {
             package_id: packageId,
             tool_id: req.toolId,
@@ -170,6 +197,8 @@ export async function handleGetToolDetails(
           });
           continue;
         }
+
+        const cachedTool = targetResolution.tool;
 
         const noteKey = makeToolNoteKey(
           cachedTool.packageId,
@@ -204,7 +233,7 @@ export async function handleGetToolDetails(
           ...(cachedTool.tool?.annotations ? { annotations: cachedTool.tool.annotations } : {}),
         };
 
-        const catalogId = packagesView.getPackage(packageId)?.catalogId;
+        const catalogId = registry.getPackage(packageId)?.catalogId;
         const annotation = computeSecurityAnnotation(packageId, catalogId, req.rawName);
         resultMap.set(req.toolId, { ...toolInfo, ...annotation });
       }
@@ -271,6 +300,7 @@ export async function handleGetToolDetails(
         text: JSON.stringify({ tools: results }, null, 2),
       },
     ],
+    structuredContent: { tools: results },
     isError: false,
   };
 }

@@ -45,6 +45,7 @@ import {
   beginTokenRefreshShutdown,
   drainInFlightTokenRefreshes,
 } from "./auth/tokenRefreshLock.js";
+import { resolveToolTarget } from "./toolTargetResolution.js";
 
 // FM6 (260706_mcp-oauth-fm6-graceful-drain): give an in-flight single-use
 // refresh-token rotation time to finish its atomic persist before we exit, so a
@@ -379,6 +380,72 @@ export function registerHttpApiRoutes(
 
   app.get("/api/skipped-servers", dnsRebindingGuard, (_req, res) => {
     res.json({ packages: registry.getSkippedPackages() });
+  });
+
+  app.get("/api/tools/resolve", dnsRebindingGuard, (req, res) => {
+    const packageId = req.query.package_id;
+    const requestedToolId = req.query.tool_id;
+    if (
+      typeof packageId !== "string" ||
+      packageId.trim().length === 0 ||
+      typeof requestedToolId !== "string" ||
+      requestedToolId.trim().length === 0
+    ) {
+      res.status(400).json({
+        error: "package_id and tool_id must be non-empty strings",
+      });
+      return;
+    }
+
+    try {
+      const resolution = resolveToolTarget(
+        { catalog, registry },
+        packageId,
+        requestedToolId,
+      );
+      const namespacePrefix = `${packageId}__`;
+      const bareToolId = requestedToolId.startsWith(namespacePrefix)
+        ? requestedToolId.slice(namespacePrefix.length)
+        : requestedToolId;
+      const namespacedToolId = resolution.outcome === "unavailable"
+        ? `${packageId}__${bareToolId}`
+        : resolution.namespacedToolId;
+      const packageStatus = resolution.outcome === "unavailable"
+        ? resolution.reason === "package_unknown"
+          ? "unknown"
+          : resolution.reason
+        : "ready";
+
+      res.json({
+        package_id: packageId,
+        requested_tool_id: requestedToolId,
+        namespaced_tool_id: namespacedToolId,
+        outcome: resolution.outcome,
+        reason: resolution.outcome === "unavailable" ? resolution.reason : null,
+        package_status: packageStatus,
+        ...(resolution.outcome === "absent"
+          ? {
+              candidates: catalog
+                .getPackageTools(packageId)
+                .map((entry) => entry.tool.name)
+                .filter((name): name is string => typeof name === "string")
+                .map((name) => name.startsWith(namespacePrefix)
+                  ? name.slice(namespacePrefix.length)
+                  : name)
+                .sort()
+                .slice(0, 24),
+            }
+          : {}),
+        generated_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      logger.error("Failed to resolve tool target", {
+        package_id: packageId,
+        tool_id: requestedToolId,
+        error: formatError(error),
+      });
+      res.status(500).json({ error: "Failed to resolve tool target" });
+    }
   });
 
   // Stage 4b of docs/plans/260423_secondary_process_cpu_observability.md:

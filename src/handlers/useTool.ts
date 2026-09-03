@@ -8,7 +8,7 @@ import {
   type ToolBlockedReason,
 } from "../types.js";
 import { PackageRegistry } from "../registry.js";
-import { Catalog } from "../catalog.js";
+import { Catalog, type CachedTool, type CatalogView } from "../catalog.js";
 import type { ValidationResult } from "../validator.js";
 import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { getLogger } from "../logging.js";
@@ -32,6 +32,7 @@ import {
   isSupportedImageMimeType,
 } from "./materializeOutput.js";
 import { parseUseToolInput } from "./useToolInput.js";
+import { resolveToolTarget } from "../toolTargetResolution.js";
 
 const logger = getLogger();
 
@@ -1496,20 +1497,62 @@ export async function handleUseTool(
     };
   }
 
-  const catalogWithGetTool = catalog as Catalog & {
-    getTool?: (packageId: string, toolId: string) => Promise<{ tool?: { inputSchema?: unknown }; schemaHash?: string } | undefined>;
-  };
-  const cachedTool = typeof catalogWithGetTool.getTool === "function"
-    ? await catalogWithGetTool.getTool(package_id, tool_id)
-    : undefined;
-  const schema = cachedTool?.tool?.inputSchema ?? await catalog.getToolSchema(package_id, tool_id);
-  if (!schema) {
+  let resolutionCatalog: CatalogView = catalog;
+  if (!(catalog instanceof Catalog)) {
+    // Preserve the handler's historical tolerance for structural test/legacy
+    // adapters whose getTool is async or which expose only getToolSchema. The
+    // production Catalog always goes straight through the shared resolver.
+    const structuralCatalog = catalog as unknown as {
+      getTool?: (
+        packageId: string,
+        toolId: string,
+      ) => CachedTool | Promise<CachedTool | undefined> | undefined;
+      getToolSchema: Catalog["getToolSchema"];
+      getPackageStatus: Catalog["getPackageStatus"];
+      getPackageError?: Catalog["getPackageError"];
+      getRetryHint?: Catalog["getRetryHint"];
+    };
+    const observedTool = typeof structuralCatalog.getTool === "function"
+      ? await structuralCatalog.getTool(package_id, tool_id)
+      : undefined;
+    const observedSchema = observedTool?.tool?.inputSchema
+      ?? await structuralCatalog.getToolSchema(package_id, tool_id);
+    resolutionCatalog = {
+      getPackageStatus: structuralCatalog.getPackageStatus.bind(structuralCatalog),
+      getPackageError: typeof structuralCatalog.getPackageError === "function"
+        ? structuralCatalog.getPackageError.bind(structuralCatalog)
+        : () => undefined,
+      getRetryHint: typeof structuralCatalog.getRetryHint === "function"
+        ? structuralCatalog.getRetryHint.bind(structuralCatalog)
+        : () => ({ retryAt: null, retryInMs: null, schedule: "none" as const }),
+      getTool: () => observedTool ?? (
+        observedSchema
+          ? {
+              packageId: package_id,
+              tool: { name: tool_id, inputSchema: observedSchema },
+              schemaHash: "",
+            }
+          : undefined
+      ),
+    } as unknown as CatalogView;
+  }
+  const targetResolution = resolveToolTarget(
+    { catalog: resolutionCatalog, registry },
+    package_id,
+    tool_id,
+  );
+  if (
+    targetResolution.outcome !== "present" ||
+    !targetResolution.tool.tool?.inputSchema
+  ) {
     throw {
       code: ERROR_CODES.TOOL_NOT_FOUND,
       message: `Tool not found: ${tool_id} in package ${package_id}`,
       data: { package_id, tool_id },
     };
   }
+  const cachedTool = targetResolution.tool;
+  const schema = cachedTool.tool.inputSchema;
 
   // schema_hash handshake (Phase 1: permissive — validate when present, pass through when absent)
   if (schema_hash && cachedTool?.schemaHash) {
