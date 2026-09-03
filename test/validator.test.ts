@@ -36,17 +36,22 @@ function createUseToolDeps(
     notifyActivity: () => {},
   };
 
+  const getTool = (packageId: string, toolId: string) => ({
+    packageId,
+    tool: {
+      name: toolId,
+      inputSchema: schema,
+    },
+    schemaHash,
+  });
   const catalog = {
     ensurePackageLoaded: async () => {},
     getPackageStatus: () => "ready",
-    getPackageError: () => null,
-    getTool: async () => ({
-      tool: {
-        inputSchema: schema,
-      },
-      schemaHash,
-    }),
-    getToolSchema: async () => schema,
+    getPackageError: () => undefined,
+    getRetryHint: () => ({ retryAt: null, retryInMs: null, schedule: "none" }),
+    getTool,
+    getToolSchema: (packageId: string, toolId: string) =>
+      getTool(packageId, toolId).tool.inputSchema,
   };
 
   return {

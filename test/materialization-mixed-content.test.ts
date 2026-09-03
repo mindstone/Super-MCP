@@ -59,10 +59,20 @@ describe("materializeOutput mixed-content behavior", () => {
       notifyActivity: vi.fn(),
     } as unknown as PackageRegistry;
 
+    const toolSchema = { type: "object" };
+    const getTool = (packageId: string, toolId: string) =>
+      packageId === "pkg1" && toolId === "tool1"
+        ? { packageId, tool: { name: toolId, inputSchema: toolSchema }, schemaHash: "" }
+        : undefined;
     const mockCatalog = {
       ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
       getPackageStatus: vi.fn().mockReturnValue("ready"),
-      getToolSchema: vi.fn().mockResolvedValue({ type: "object" }),
+      getPackageError: vi.fn().mockReturnValue(undefined),
+      getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
+      getTool: vi.fn().mockImplementation(getTool),
+      getToolSchema: vi.fn().mockImplementation(
+        (packageId: string, toolId: string) => getTool(packageId, toolId)?.tool.inputSchema,
+      ),
     } as unknown as Catalog;
 
     const mockValidator = {

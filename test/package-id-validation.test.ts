@@ -110,11 +110,20 @@ function createRegistry(knownIds: string[] = []): PackageRegistry {
 
 function createUseToolMocks(opts: { knownIds?: string[] } = {}) {
   const mockRegistry = createRegistry(opts.knownIds ?? []);
+  const toolSchema = { type: "object" };
+  const getTool = (packageId: string, toolId: string) =>
+    packageId === "filesystem" && toolId === "read_file"
+      ? { packageId, tool: { name: toolId, inputSchema: toolSchema }, schemaHash: "" }
+      : undefined;
   const mockCatalog = {
     ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
     getPackageStatus: vi.fn().mockReturnValue("ready"),
     getPackageError: vi.fn().mockReturnValue(undefined),
-    getToolSchema: vi.fn().mockResolvedValue({ type: "object" }),
+    getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
+    getTool: vi.fn().mockImplementation(getTool),
+    getToolSchema: vi.fn().mockImplementation(
+      (packageId: string, toolId: string) => getTool(packageId, toolId)?.tool.inputSchema,
+    ),
     findToolByName: vi.fn().mockReturnValue([]),
   } as unknown as Catalog;
   const mockValidator = {
