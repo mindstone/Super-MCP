@@ -47,6 +47,7 @@ function createMocks(opts: {
   const mockCatalog = {
     ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
     getPackageStatus: vi.fn().mockReturnValue("ready"),
+    getRefreshInFlight: vi.fn().mockReturnValue(false),
     getPackageError: vi.fn().mockReturnValue(undefined),
     getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
     getTool: vi.fn().mockImplementation(getTool),

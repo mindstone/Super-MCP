@@ -93,6 +93,7 @@ function createRouteCatalog() {
     countTools: vi.fn().mockReturnValue(1),
     computePackageEmbeddingHash: vi.fn().mockImplementation((packageId: string) => `hash-${packageId}`),
     getPackageStatus: vi.fn().mockReturnValue("ready"),
+    getRefreshInFlight: vi.fn().mockReturnValue(false),
     getPackageError: vi.fn().mockReturnValue(undefined),
     getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
     isSnapshotComplete: vi.fn().mockReturnValue(true),

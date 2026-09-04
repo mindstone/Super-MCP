@@ -47,6 +47,7 @@ function createUseToolDeps(
   const catalog = {
     ensurePackageLoaded: async () => {},
     getPackageStatus: () => "ready",
+    getRefreshInFlight: () => false,
     getPackageError: () => undefined,
     getRetryHint: () => ({ retryAt: null, retryInMs: null, schedule: "none" }),
     getTool,

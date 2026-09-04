@@ -109,6 +109,7 @@ async function startApiServer(
     countTools: vi.fn().mockReturnValue(0),
     computePackageEmbeddingHash: vi.fn().mockReturnValue(""),
     getPackageStatus: vi.fn().mockReturnValue("ready"),
+    getRefreshInFlight: vi.fn().mockReturnValue(false),
     getPackageError: vi.fn().mockReturnValue(undefined),
     getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
     isSnapshotComplete: vi.fn().mockReturnValue(true),

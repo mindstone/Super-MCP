@@ -74,6 +74,7 @@ function createErrorStatusCatalog(): Catalog {
   return {
     ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
     getPackageStatus: vi.fn().mockReturnValue("error"),
+    getRefreshInFlight: vi.fn().mockReturnValue(false),
     getPackageError: vi.fn().mockImplementation(
       (pkgId: string) =>
         `Package '${pkgId}' not found in configuration. Available packages: filesystem, github`,
@@ -118,6 +119,7 @@ function createUseToolMocks(opts: { knownIds?: string[] } = {}) {
   const mockCatalog = {
     ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
     getPackageStatus: vi.fn().mockReturnValue("ready"),
+    getRefreshInFlight: vi.fn().mockReturnValue(false),
     getPackageError: vi.fn().mockReturnValue(undefined),
     getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
     getTool: vi.fn().mockImplementation(getTool),
@@ -181,6 +183,7 @@ describe("list_tools — package_id input validation", () => {
   it("still lists tools for a well-formed package_id (regression guard)", async () => {
     const catalog = {
       getPackageStatus: vi.fn().mockReturnValue("ready"),
+      getRefreshInFlight: vi.fn().mockReturnValue(false),
       getPackageError: vi.fn().mockReturnValue(undefined),
       getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null }),
       getPackageTools: vi.fn().mockReturnValue([]),
@@ -296,6 +299,7 @@ describe("get_tool_details — package prefix validation", () => {
   it("still hydrates well-formed tool_ids (regression guard)", async () => {
     const catalog = {
       getPackageStatus: vi.fn().mockReturnValue("ready"),
+      getRefreshInFlight: vi.fn().mockReturnValue(false),
       getPackageError: vi.fn().mockReturnValue(undefined),
       getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null }),
       getTool: vi.fn().mockReturnValue({

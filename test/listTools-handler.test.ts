@@ -64,6 +64,7 @@ function makeTool(name: string, opts: {
 function createMockCatalog(tools: ReturnType<typeof makeTool>[]): Catalog {
   return {
     getPackageStatus: vi.fn().mockReturnValue('ready'),
+    getRefreshInFlight: vi.fn().mockReturnValue(false),
     getPackageError: vi.fn().mockReturnValue(undefined),
     getRetryHint: vi.fn().mockReturnValue({
       retryAt: null,

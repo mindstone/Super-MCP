@@ -46,6 +46,7 @@ describe("Materialization Integration (I1-I4)", () => {
     const mockCatalog = {
       ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
       getPackageStatus: vi.fn().mockReturnValue("ready"),
+      getRefreshInFlight: vi.fn().mockReturnValue(false),
       getPackageError: vi.fn().mockReturnValue(undefined),
       getRetryHint: vi.fn().mockReturnValue({ retryAt: null, retryInMs: null, schedule: "none" }),
       getTool: vi.fn().mockImplementation(getTool),
