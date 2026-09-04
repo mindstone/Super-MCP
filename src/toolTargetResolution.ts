@@ -65,6 +65,13 @@ export function resolveToolTarget(
 
   const tool = deps.catalog.getTool(packageId, bareToolId);
   if (!tool) {
+    if (packageState.refreshInFlight) {
+      return {
+        outcome: "unavailable",
+        packageId,
+        reason: "connecting",
+      };
+    }
     return {
       outcome: "absent",
       packageId,

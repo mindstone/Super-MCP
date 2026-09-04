@@ -164,6 +164,7 @@ export interface CatalogView {
   etag(): string;
   getPackageEtag(packageId: string): string;
   getPackageStatus(packageId: string): CatalogStatus | 'unknown';
+  getRefreshInFlight(packageId: string): boolean;
   getPackageError(packageId: string): string | undefined;
   getRetryHint(packageId: string, now?: number): CatalogRetryHint;
   getPackageDiagnostics(packageId: string): CatalogPackageDiagnostics;

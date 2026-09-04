@@ -95,6 +95,7 @@ function createMockCatalog(
     getPackageStatus: vi.fn().mockImplementation((pkgId: string) =>
       packageStatuses[pkgId] ?? 'ready'
     ),
+    getRefreshInFlight: vi.fn().mockReturnValue(false),
     getPackageError: vi.fn().mockImplementation((pkgId: string) =>
       packageErrors[pkgId]
     ),

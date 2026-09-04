@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import type { CachedTool, Catalog, CatalogView } from "../catalog.js";
+import { Catalog, type CachedTool, type CatalogView } from "../catalog.js";
 import type { PackageRegistry } from "../registry.js";
 import {
   ERROR_CODES,
@@ -48,6 +48,7 @@ function makeRegistry(packageIds: readonly string[]): PackageRegistry {
   );
   return {
     getPackage: vi.fn((packageId: string) => packages.get(packageId)),
+    getPackages: vi.fn(() => [...packages.values()]),
   } as unknown as PackageRegistry;
 }
 
@@ -58,6 +59,7 @@ function makeCatalog(
 ): CatalogView {
   return {
     getPackageStatus: vi.fn().mockReturnValue(status),
+    getRefreshInFlight: vi.fn().mockReturnValue(false),
     getPackageError: vi.fn().mockReturnValue(detail),
     getRetryHint: vi.fn().mockReturnValue({
       retryAt: null,
@@ -124,6 +126,33 @@ describe("resolveToolTarget", () => {
       packageId: "P",
       bareToolId: "invented",
       namespacedToolId: "P__invented",
+    });
+  });
+
+  it("returns unavailable while a ready last-good snapshot is refreshing", () => {
+    const registry = makeRegistry(["P"]);
+    const catalog = new Catalog(registry);
+    const initialGeneration = catalog.beginRefresh("P");
+    catalog.commitReady(
+      "P",
+      [makeTool("P", "search").tool],
+      initialGeneration,
+    );
+
+    catalog.beginRefresh("P");
+
+    expect(catalog.getPackageStatus("P")).toBe("ready");
+    expect(catalog.getRefreshInFlight("P")).toBe(true);
+    expect(resolveToolTarget({ catalog, registry }, "P", "search")).toMatchObject({
+      outcome: "present",
+      bareToolId: "search",
+    });
+    expect(
+      resolveToolTarget({ catalog, registry }, "P", "newly_available"),
+    ).toEqual({
+      outcome: "unavailable",
+      packageId: "P",
+      reason: "connecting",
     });
   });
 

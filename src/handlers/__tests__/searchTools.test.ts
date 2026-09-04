@@ -24,6 +24,7 @@ function createCatalogStub(options: {
   return {
     etag: vi.fn(options.etag),
     getPackageStatus: vi.fn((packageId: string) => options.statuses?.[packageId] ?? "ready"),
+    getRefreshInFlight: vi.fn().mockReturnValue(false),
     getPackageError: vi.fn().mockReturnValue(undefined),
     getRetryHint: vi.fn((packageId: string) =>
       options.statuses?.[packageId] === "error"

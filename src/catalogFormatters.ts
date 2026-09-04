@@ -14,6 +14,7 @@ export interface CatalogToolInfoOptions {
 
 export interface DiscoveryPackageState {
   catalogStatus: CatalogStatus;
+  refreshInFlight: boolean;
   reason?: string;
   retryInMs: number | null;
   nextRetryAt: number | null;
@@ -50,6 +51,7 @@ export function getDiscoveryPackageState(
 
   return {
     catalogStatus,
+    refreshInFlight: catalog.getRefreshInFlight(packageId),
     reason,
     retryInMs: retryHint.retryInMs,
     nextRetryAt: retryHint.retryAt,

@@ -52,9 +52,11 @@ function makeRegistry(packageIds: readonly string[]): PackageRegistry {
 function makeCatalog(
   status: CatalogStatus | "unknown",
   tools: readonly CachedTool[] = [],
+  refreshInFlight = false,
 ): Catalog {
   return {
     getPackageStatus: vi.fn().mockReturnValue(status),
+    getRefreshInFlight: vi.fn().mockReturnValue(refreshInFlight),
     getPackageError: vi.fn().mockReturnValue(undefined),
     getRetryHint: vi.fn().mockReturnValue({
       retryAt: null,
@@ -230,6 +232,26 @@ describe("GET /api/tools/resolve", () => {
         outcome: "unavailable",
         reason: "auth_required",
         package_status: "auth_required",
+        generated_at: expect.any(String),
+      },
+    });
+  });
+
+  it("returns unavailable while a ready last-good snapshot is refreshing", () => {
+    const callRoute = registerResolveRoute({
+      registry: makeRegistry(["P"]),
+      catalog: makeCatalog("ready", [makeTool("P", "search")], true),
+    });
+
+    expect(callRoute({ package_id: "P", tool_id: "newly_available" })).toEqual({
+      status: 200,
+      body: {
+        package_id: "P",
+        requested_tool_id: "newly_available",
+        namespaced_tool_id: "P__newly_available",
+        outcome: "unavailable",
+        reason: "connecting",
+        package_status: "connecting",
         generated_at: expect.any(String),
       },
     });
