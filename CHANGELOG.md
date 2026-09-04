@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## [2.8.0] - 2026-09-04
+
+### Added
+- **Typed connector-target resolution endpoint.** `GET /api/tools/resolve` exposes exact-match `present`, `absent`, or `unavailable` results for one package/tool target.
+- **Structured tool-detail outcomes.** `get_tool_details` now returns its per-entry results as additive `structuredContent` alongside the existing text response.
+
+### Changed
+- **One resolver now owns connector-target identity.** `resolveToolTarget` is shared by `use_tool`, `get_tool_details`, and the HTTP probe, so callers cannot drift onto different matching rules. A catalogue refresh in flight reports `unavailable` rather than reading stale state as an absence.
+
 ## [2.7.7] - 2026-08-26
 
 ### Added
