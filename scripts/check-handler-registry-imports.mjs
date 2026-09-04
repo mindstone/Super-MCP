@@ -19,10 +19,11 @@ const defaultHandlersDir = path.resolve(
 const handlersDir = process.argv[2]
   ? path.resolve(process.argv[2])
   : defaultHandlersDir;
-const registryImport = /^[ \t]*import\s+(type\s+)?((?:[$A-Z_a-z][$\w]*\s*,\s*)?(?:\{[^}]*\}|\*\s+as\s+[$A-Z_a-z][$\w]*)|[$A-Z_a-z][$\w]*)\s+from\s+["'][^"'\r\n]*registry\.js["'][ \t]*;?/gm;
+const registryImportOrExport = /^[ \t]*(?:import|export)\s+(type\s+)?((?:[$A-Z_a-z][$\w]*\s*,\s*)?(?:\{[^}]*\}|\*(?:\s+as\s+[$A-Z_a-z][$\w]*)?)|[$A-Z_a-z][$\w]*)\s+from\s+["'][^"'\r\n]*registry\.js["'][ \t]*;?/gm;
+const typeOnlySpecifier = /^type\s+[$A-Z_a-z][$\w]*(?:\s+as\s+[$A-Z_a-z][$\w]*)?$/;
 const violations = [];
 
-function isTypeOnlyImport(match) {
+function isTypeOnlyDeclaration(match) {
   if (match[1]) return true;
 
   const importClause = match[2].trim();
@@ -43,7 +44,7 @@ function isTypeOnlyImport(match) {
 
   return (
     specifiers.length > 0 &&
-    specifiers.every((specifier) => /^type\s+/.test(specifier))
+    specifiers.every((specifier) => typeOnlySpecifier.test(specifier))
   );
 }
 
@@ -51,8 +52,8 @@ for (const entry of await readdir(handlersDir, { withFileTypes: true })) {
   if (!entry.isFile() || !entry.name.endsWith(".ts")) continue;
   const source = await readFile(path.join(handlersDir, entry.name), "utf8");
   const hasRuntimeRegistryImport = Array.from(
-    source.matchAll(registryImport),
-  ).some((match) => !isTypeOnlyImport(match));
+    source.matchAll(registryImportOrExport),
+  ).some((match) => !isTypeOnlyDeclaration(match));
   if (!hasRuntimeRegistryImport) continue;
   if (explicitExecutionHandlers.has(entry.name)) continue;
 
