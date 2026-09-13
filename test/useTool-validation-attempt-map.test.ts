@@ -90,11 +90,20 @@ async function failingCall(
   toolId: string,
   mocks: Mocks,
   useToolImpl: typeof handleUseTool = handleUseTool,
+  // Default to an attributable scope so the threshold cases below keep testing
+  // the threshold. The UNSCOPED path is exercised explicitly by its own test:
+  // pass `null` for "the host sent no scope".
+  scope: string | null = "scope-default",
 ): Promise<{ code: unknown; message: string }> {
   let caught: unknown;
   try {
     await useToolImpl(
-      { package_id: packageId, tool_id: toolId, args: {} },
+      {
+        package_id: packageId,
+        tool_id: toolId,
+        args: {},
+        ...(scope === null ? {} : { _rebel_attempt_scope: scope }),
+      },
       mocks.mockRegistry,
       mocks.mockCatalog,
       mocks.validator,
@@ -121,6 +130,48 @@ describe("useTool validationAttemptMap — threshold and bounded LRU", () => {
     expect(first.message).not.toContain(STOP_RETRYING_SUBSTRING);
     expect(second.message).not.toContain(STOP_RETRYING_SUBSTRING);
     expect(third.message).toContain(STOP_RETRYING_SUBSTRING);
+  });
+
+  // The bug this scope dimension exists to kill. Before it, the counter was keyed
+  // `${package_id}::${tool_id}` in a process serving every session at once, so two
+  // failures in an unrelated conversation plus one here fired the terminal
+  // stop-retrying message — which the host surfaces as "Rebel needs a bit more from
+  // you" — on this caller's FIRST failure. The user was told to act on a count they
+  // neither generated nor could see.
+  it("does NOT pool failures across scopes: two in scope A plus one in scope B stays below the threshold", async () => {
+    const mocks = makeMocks();
+    const packageId = "pkg-shared";
+    const toolId = "tool-shared";
+
+    const a1 = await failingCall(packageId, toolId, mocks, handleUseTool, "scope-A");
+    const a2 = await failingCall(packageId, toolId, mocks, handleUseTool, "scope-A");
+    expect(a1.message).not.toContain(STOP_RETRYING_SUBSTRING);
+    expect(a2.message).not.toContain(STOP_RETRYING_SUBSTRING);
+
+    // Scope B's FIRST failure on the same (package, tool). Under the old global key
+    // this was attempt 3 and carried the terminal message.
+    const b1 = await failingCall(packageId, toolId, mocks, handleUseTool, "scope-B");
+    expect(b1.message).not.toContain(STOP_RETRYING_SUBSTRING);
+
+    // And scope A is unaffected — its own third failure still trips, so the fix
+    // narrows attribution without disarming the detector.
+    const a3 = await failingCall(packageId, toolId, mocks, handleUseTool, "scope-A");
+    expect(a3.message).toContain(STOP_RETRYING_SUBSTRING);
+  });
+
+  // An unattributable count must not reach a user-facing "act on this" prompt.
+  // A direct MCP client, another host, or a host older than this field sends no
+  // scope; its failures still COUNT (schema-help escalation is useful to every
+  // caller) but they never produce the ask.
+  it("never trips the stop-retrying ask when the host supplied no scope", async () => {
+    const mocks = makeMocks();
+    const packageId = "pkg-unscoped";
+    const toolId = "tool-unscoped";
+
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const result = await failingCall(packageId, toolId, mocks, handleUseTool, null);
+      expect(result.message).not.toContain(STOP_RETRYING_SUBSTRING);
+    }
   });
 
   it("past capacity, evicts ONLY the oldest entry and preserves a recently-touched counter (clear() regression)", async () => {

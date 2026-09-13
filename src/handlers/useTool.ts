@@ -646,8 +646,40 @@ function truncateToolResultTextContent(
   };
 }
 
-function getValidationAttemptKey(packageId: string, toolId: string): string {
-  return `${packageId}::${toolId}`;
+/**
+ * Sentinel scope for a caller that supplied no `_rebel_attempt_scope`: a direct
+ * MCP client, another host, or a host older than this field. Such calls still
+ * COUNT — the count drives schema-help escalation, which is useful to every
+ * caller — but they never reach the stop-retrying ASK. See
+ * {@link scopeIsAttributable}.
+ */
+const UNSCOPED_ATTEMPT_SCOPE = "__unscoped__";
+
+/**
+ * Whether an attempt count can be attributed to one caller's own retries.
+ *
+ * The stop-retrying message is surfaced by the host as a terminal, act-on-this
+ * prompt. It may only fire on a count the person in front of it actually
+ * generated, so an unattributable count must not reach it: this process serves
+ * every session at once, and before the scope dimension existed two failures
+ * from an unrelated conversation plus one here fired that prompt on a user's
+ * FIRST failure of the turn.
+ */
+function scopeIsAttributable(scope: string): boolean {
+  return scope !== UNSCOPED_ATTEMPT_SCOPE;
+}
+
+/**
+ * Attempt-counter key. The scope comes first so a scope's entries cluster in the
+ * bounded map's insertion order, which keeps one busy scope from evicting a
+ * different scope's in-flight count ahead of its own older ones.
+ */
+function getValidationAttemptKey(
+  scope: string,
+  packageId: string,
+  toolId: string,
+): string {
+  return `${scope}::${packageId}::${toolId}`;
 }
 
 function incrementValidationAttempt(key: string): number {
@@ -1235,7 +1267,11 @@ function buildRepairTicket(
 }
 
 export async function handleUseTool(
-  input: UseToolInput & { _rebel_staged?: boolean; _rebel_staged_message?: string },
+  input: UseToolInput & {
+    _rebel_staged?: boolean;
+    _rebel_staged_message?: string;
+    _rebel_attempt_scope?: string;
+  },
   registry: PackageRegistry,
   catalog: Catalog,
   validator: { validate: (schema: any, data: any, context?: { package_id?: string; tool_id?: string }) => ValidationResult }
@@ -1264,7 +1300,12 @@ export async function handleUseTool(
   input = parseUseToolInput(input);
 
   // Continuation: retrieve cached truncated result (before any validation/security)
-  const { _rebel_staged: _, _rebel_staged_message: __, ...cleanForContinuation } = input;
+  const {
+    _rebel_staged: _,
+    _rebel_staged_message: __,
+    _rebel_attempt_scope: ___,
+    ...cleanForContinuation
+  } = input;
   if (cleanForContinuation.output_offset !== undefined) {
     cleanForContinuation.output_offset = coerceStringifiedNumber(cleanForContinuation.output_offset, {
       handler: "use_tool",
@@ -1296,7 +1337,19 @@ export async function handleUseTool(
   }
 
   // Strip rebel-internal flags so they never leak to downstream tool handlers
-  const { _rebel_staged, _rebel_staged_message, ...cleanInput } = input;
+  const {
+    _rebel_staged,
+    _rebel_staged_message,
+    _rebel_attempt_scope,
+    ...cleanInput
+  } = input;
+  // Attribution for the attempt counter only. A non-empty string is a caller we
+  // can hold a count against; anything else is unattributable and must not reach
+  // the stop-retrying ask (see scopeIsAttributable).
+  const attemptScope =
+    typeof _rebel_attempt_scope === "string" && _rebel_attempt_scope.trim() !== ""
+      ? _rebel_attempt_scope
+      : UNSCOPED_ATTEMPT_SCOPE;
 
   let { package_id, tool_id, args, dry_run = false, max_output_chars, schema_hash } = cleanInput;
 
@@ -1555,7 +1608,7 @@ export async function handleUseTool(
   // for the auto-repair pass below. We keep the snapshot approach rather than
   // making the validator non-mutating because in-place stripping is a contract
   // existing callers/tests rely on (MA0b).
-  const validationAttemptKey = getValidationAttemptKey(package_id, tool_id);
+  const validationAttemptKey = getValidationAttemptKey(attemptScope, package_id, tool_id);
   const downstreamValidationAttemptKey = `${validationAttemptKey}::downstream`;
   const preValidationSnapshot =
     args && typeof args === "object" && !Array.isArray(args)
@@ -1687,7 +1740,7 @@ export async function handleUseTool(
       attempt,
       misplacedParams,
     );
-    const shouldStopRetrying = attempt >= STOP_RETRYING_THRESHOLD;
+    const shouldStopRetrying = attempt >= STOP_RETRYING_THRESHOLD && scopeIsAttributable(attemptScope);
 
     throw {
       code: ERROR_CODES.ARG_VALIDATION_FAILED,
@@ -1839,7 +1892,7 @@ export async function handleUseTool(
         package_id,
         tool_id,
         repairTicket,
-        attempt >= STOP_RETRYING_THRESHOLD,
+        attempt >= STOP_RETRYING_THRESHOLD && scopeIsAttributable(attemptScope),
         misplacedParams,
       ),
       data: {
@@ -2197,7 +2250,7 @@ export async function handleUseTool(
 
     if (error instanceof McpError && error.code === SdkErrorCode.InvalidParams) {
       const attempt = incrementValidationAttempt(downstreamValidationAttemptKey);
-      const shouldStopRetrying = attempt >= STOP_RETRYING_THRESHOLD;
+      const shouldStopRetrying = attempt >= STOP_RETRYING_THRESHOLD && scopeIsAttributable(attemptScope);
       const includeFullSchema = attempt >= FULL_SCHEMA_THRESHOLD;
       const providedArgs = isRecord(args) ? Object.keys(args) : [];
       const schemaFragments = buildSchemaFragments(schema, new Set(providedArgs), includeFullSchema);

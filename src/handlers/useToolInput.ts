@@ -15,6 +15,17 @@ import {
 type UseToolHandlerInput = UseToolInput & {
   _rebel_staged?: boolean;
   _rebel_staged_message?: string;
+  /**
+   * Host-supplied attempt scope: an opaque id for the context this call belongs
+   * to (a turn or conversation). It exists ONLY to key the arg-validation
+   * attempt counter, which decides whether the model is told to stop retrying —
+   * a message the host surfaces to the user as "Rebel needs a bit more from
+   * you". Without it the counter is process-global and pools failures from
+   * unrelated callers, so a user can be told to act on a count another session
+   * generated. Never forwarded to a downstream tool; see the strip sites in
+   * useTool.ts.
+   */
+  _rebel_attempt_scope?: string;
 };
 
 const RECOVERY_GUIDANCE =
@@ -53,6 +64,7 @@ const useToolEnvelopeSchema = z.object({
   ...metaParamShape,
   _rebel_staged: z.unknown().optional(),
   _rebel_staged_message: z.unknown().optional(),
+  _rebel_attempt_scope: z.unknown().optional(),
 }).passthrough();
 
 function getValueKind(value: unknown): string {
