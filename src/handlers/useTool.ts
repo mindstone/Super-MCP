@@ -647,15 +647,6 @@ function truncateToolResultTextContent(
 }
 
 /**
- * Sentinel scope for a caller that supplied no `_rebel_attempt_scope`: a direct
- * MCP client, another host, or a host older than this field. Such calls still
- * COUNT — the count drives schema-help escalation, which is useful to every
- * caller — but they never reach the stop-retrying ASK. See
- * {@link scopeIsAttributable}.
- */
-const UNSCOPED_ATTEMPT_SCOPE = "__unscoped__";
-
-/**
  * Whether an attempt count can be attributed to one caller's own retries.
  *
  * The stop-retrying message is surfaced by the host as a terminal, act-on-this
@@ -665,21 +656,24 @@ const UNSCOPED_ATTEMPT_SCOPE = "__unscoped__";
  * from an unrelated conversation plus one here fired that prompt on a user's
  * FIRST failure of the turn.
  */
-function scopeIsAttributable(scope: string): boolean {
-  return scope !== UNSCOPED_ATTEMPT_SCOPE;
+function scopeIsAttributable(scope: string | null): boolean {
+  return scope !== null;
 }
 
+type ValidationAttemptPhase = "validation" | "downstream";
+
 /**
- * Attempt-counter key. The scope comes first so a scope's entries cluster in the
- * bounded map's insertion order, which keeps one busy scope from evicting a
- * different scope's in-flight count ahead of its own older ones.
+ * Attempt-counter key. Tuple encoding keeps opaque identifiers and the phase
+ * collision-free without changing the handler's already-resolved values.
+ * JSON escaping preserves opaque field boundaries, null distinguishes absence from every string, and phase remains its own tuple member.
  */
 function getValidationAttemptKey(
-  scope: string,
+  scope: string | null,
   packageId: string,
   toolId: string,
+  phase: ValidationAttemptPhase,
 ): string {
-  return `${scope}::${packageId}::${toolId}`;
+  return JSON.stringify([scope, packageId, toolId, phase]);
 }
 
 function incrementValidationAttempt(key: string): number {
@@ -1349,7 +1343,7 @@ export async function handleUseTool(
   const attemptScope =
     typeof _rebel_attempt_scope === "string" && _rebel_attempt_scope.trim() !== ""
       ? _rebel_attempt_scope
-      : UNSCOPED_ATTEMPT_SCOPE;
+      : null;
 
   let { package_id, tool_id, args, dry_run = false, max_output_chars, schema_hash } = cleanInput;
 
@@ -1608,8 +1602,8 @@ export async function handleUseTool(
   // for the auto-repair pass below. We keep the snapshot approach rather than
   // making the validator non-mutating because in-place stripping is a contract
   // existing callers/tests rely on (MA0b).
-  const validationAttemptKey = getValidationAttemptKey(attemptScope, package_id, tool_id);
-  const downstreamValidationAttemptKey = `${validationAttemptKey}::downstream`;
+  const validationAttemptKey = getValidationAttemptKey(attemptScope, package_id, tool_id, "validation");
+  const downstreamValidationAttemptKey = getValidationAttemptKey(attemptScope, package_id, tool_id, "downstream");
   const preValidationSnapshot =
     args && typeof args === "object" && !Array.isArray(args)
       ? (structuredClone(args) as Record<string, unknown>)

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Fixed
+- **Caller-scoped validation guidance now stays isolated for every accepted identity.** Retry counters use collision-free caller/package/tool/phase identities, so delimiter-bearing values, a literal `__unscoped__` caller id, and validation tools whose names resemble the downstream phase cannot share progress accidentally. Calls without an attributable scope still count and receive schema help, but never receive threshold-driven terminal guidance.
+
 ## [2.8.0] - 2026-09-04
 
 ### Added

@@ -25,11 +25,10 @@ import { appendErrorAdvice } from "../src/server.js";
 
 /**
  * The envelope's own structural fields, mirroring the explicit literals in
- * handlers/useToolInput.ts. The `_rebel_staged*` pair is host-internal and not part of
- * `UseToolInput`, so it is asserted separately.
+ * handlers/useToolInput.ts. Host-internal fields are never model-facing meta-params.
  */
 const ENVELOPE_STRUCTURAL_KEYS = ["package_id", "tool_id", "args"] as const;
-const HOST_INTERNAL_KEYS = ["_rebel_staged", "_rebel_staged_message"] as const;
+const HOST_INTERNAL_KEYS = ["_rebel_staged", "_rebel_staged_message", "_rebel_attempt_scope"] as const;
 
 describe("use_tool meta-param SSOT contract", () => {
   it("classifies every UseToolInput field, and the meta ones are exactly the SSOT", () => {

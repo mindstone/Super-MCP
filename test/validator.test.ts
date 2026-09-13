@@ -1,9 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { Validator, ValidationError } from "../src/validator.js";
-import {
-  handleUseTool,
-  STOP_RETRYING_THRESHOLD,
-} from "../src/handlers/useTool.js";
+import { handleUseTool } from "../src/handlers/useTool.js";
 import { ERROR_CODES } from "../src/types.js";
 import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { getLogger } from "../src/logging.js";
@@ -554,6 +551,7 @@ describe("use_tool repair tickets", () => {
   it("escalates on repeated failures with circuit breaker behavior", async () => {
     const packageId = nextId("pkg");
     const toolId = nextId("tool");
+    const extraInput = { _rebel_attempt_scope: nextId("scope") };
     const schema = {
       type: "object",
       properties: {
@@ -563,17 +561,17 @@ describe("use_tool repair tickets", () => {
       additionalProperties: false,
     };
 
-    const first = await runValidationFailure({ schema, args: {}, packageId, toolId });
+    const first = await runValidationFailure({ schema, args: {}, packageId, toolId, extraInput });
     const firstTicket = expectRepairTicket(first);
     expect(firstTicket.attempt).toBe(1);
     expect(firstTicket.schema_fragments).not.toHaveProperty("__full_schema");
 
-    const second = await runValidationFailure({ schema, args: {}, packageId, toolId });
+    const second = await runValidationFailure({ schema, args: {}, packageId, toolId, extraInput });
     const secondTicket = expectRepairTicket(second);
     expect(secondTicket.attempt).toBe(2);
     expect(secondTicket.schema_fragments).toHaveProperty("__full_schema");
 
-    const third = await runValidationFailure({ schema, args: {}, packageId, toolId });
+    const third = await runValidationFailure({ schema, args: {}, packageId, toolId, extraInput });
     const thirdTicket = expectRepairTicket(third);
     expect(thirdTicket.attempt).toBe(3);
     expect(thirdTicket.schema_fragments).toHaveProperty("__full_schema");
@@ -1327,24 +1325,26 @@ describe("REBEL-7JD: misplaced use_tool meta-params in the repair ticket", () =>
   it("emits misplacement-specific terminal guidance instead of the shared stop message", async () => {
     const packageId = nextId("pkg");
     const toolId = nextId("tool");
+    const scope = nextId("scope");
     const schema = {
       type: "object",
       properties: {},
     };
 
     let error: any;
-    for (let attempt = 0; attempt < STOP_RETRYING_THRESHOLD; attempt += 1) {
+    for (const attempt of [1, 2, 3]) {
       error = await runValidationFailure({
         schema,
         args: { dry_run: true },
         packageId,
         toolId,
-        extraInput: { dry_run: undefined },
+        extraInput: { dry_run: undefined, _rebel_attempt_scope: scope },
       });
+      expect(expectRepairTicket(error).attempt).toBe(attempt);
     }
 
     const repairTicket = expectRepairTicket(error);
-    expect(repairTicket.attempt).toBe(STOP_RETRYING_THRESHOLD);
+    expect(repairTicket.attempt).toBe(3);
     expect(error.message).toContain("Stop re-sending this call shape");
     expect(error.message).toContain("belongs at the top level of use_tool");
     // Never routes a self-fixable misplacement to the user.
@@ -1355,6 +1355,7 @@ describe("REBEL-7JD: misplaced use_tool meta-params in the repair ticket", () =>
   it("keeps the shared stop message for non-misplacement validation failures", async () => {
     const packageId = nextId("pkg");
     const toolId = nextId("tool");
+    const extraInput = { _rebel_attempt_scope: nextId("scope") };
     const schema = {
       type: "object",
       properties: {
@@ -1365,12 +1366,13 @@ describe("REBEL-7JD: misplaced use_tool meta-params in the repair ticket", () =>
     };
 
     let error: any;
-    for (let attempt = 0; attempt < STOP_RETRYING_THRESHOLD; attempt += 1) {
-      error = await runValidationFailure({ schema, args: {}, packageId, toolId });
+    for (const attempt of [1, 2, 3]) {
+      error = await runValidationFailure({ schema, args: {}, packageId, toolId, extraInput });
+      expect(expectRepairTicket(error).attempt).toBe(attempt);
     }
 
     expect(error.message).toContain("These arguments have failed validation several times");
-    expect(error.message).not.toContain("stop re-sending this call shape");
+    expect(error.message.toLowerCase()).not.toContain("stop re-sending this call shape");
   });
 });
 
@@ -2231,6 +2233,7 @@ describe("REBEL-7JD: declared-property misplacement gate", () => {
     const callTool = vi.fn(async () => ({ ok: true }));
     const packageId = nextId("pkg");
     const toolId = nextId("tool");
+    const scope = nextId("scope");
     const { registry, catalog, validator } = createUseToolDeps(
       {
         type: "object",
@@ -2241,13 +2244,14 @@ describe("REBEL-7JD: declared-property misplacement gate", () => {
     );
 
     let error: any;
-    for (let attempt = 0; attempt < STOP_RETRYING_THRESHOLD; attempt += 1) {
+    for (const attempt of [1, 2, 3]) {
       try {
         await handleUseTool(
           {
             package_id: packageId,
             tool_id: toolId,
             args: { query: "hello", dry_run: true },
+            _rebel_attempt_scope: scope,
           },
           registry as any,
           catalog as any,
@@ -2257,9 +2261,10 @@ describe("REBEL-7JD: declared-property misplacement gate", () => {
       } catch (caught) {
         error = caught;
       }
+      expect(expectRepairTicket(error).attempt).toBe(attempt);
     }
 
-    expect(error.data?.repair_ticket?.attempt).toBe(STOP_RETRYING_THRESHOLD);
+    expect(error.data?.repair_ticket?.attempt).toBe(3);
     // Byte-identical terminal line (invariant 3) — deliberately NOT the shared
     // STOP_RETRYING_MESSAGE, and deliberately NOT matching isArgValidationExhausted.
     expect(error.message).toContain("Stop re-sending this call shape");
