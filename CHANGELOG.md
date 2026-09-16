@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Fixed
+- **Shutdown now drains every registry-owned MCP client before completing.** New client admission latches closed synchronously, clients remain owned from construction through publication or closure, and connected, connecting, retrying, evicting, and leased clients share one exactly-once close barrier. This prevents late child processes from surviving an otherwise successful router shutdown while keeping cleanup failures observable.
 - **Caller-scoped validation guidance now stays isolated for every accepted identity.** Retry counters use collision-free caller/package/tool/phase identities, so delimiter-bearing values, a literal `__unscoped__` caller id, and validation tools whose names resemble the downstream phase cannot share progress accidentally. Calls without an attributable scope still count and receive schema help, but never receive threshold-driven terminal guidance.
 
 ## [2.8.0] - 2026-09-04

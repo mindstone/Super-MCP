@@ -354,6 +354,31 @@ export interface ChildCatalogStatsView {
   };
 }
 
+export class RegistryClosedError extends Error {
+  readonly code = "ERR_REGISTRY_CLOSED";
+
+  constructor(packageId?: string) {
+    super(
+      packageId
+        ? `MCP package registry is closed; cannot admit '${packageId}'`
+        : "MCP package registry is closed",
+    );
+    this.name = "RegistryClosedError";
+  }
+}
+
+interface ClientCloseOperation {
+  packageId: string;
+  phase: string;
+  promise: Promise<void>;
+}
+
+interface ClientCleanupFailure {
+  packageId: string;
+  phase: string;
+  error: unknown;
+}
+
 export class PackageRegistry {
   private config: SuperMcpConfig;
   private packages: PackageConfig[];
@@ -367,6 +392,17 @@ export class PackageRegistry {
   private authRequiredPackages = new Set<string>();
   private evictionPromises = new Map<string, Promise<void>>();
   private leaseDrainWaiters = new Map<string, Array<() => void>>();
+  /** Clients constructed by the registry but not yet safely published or closed. */
+  private constructedClients = new Map<McpClient, string>();
+  /** Permanent identity map: every registry-initiated close is exactly once. */
+  private clientClosePromises = new WeakMap<McpClient, Promise<void>>();
+  /** Strong ownership for close operations that have not terminally settled. */
+  private activeCloseOperations = new Map<McpClient, ClientCloseOperation>();
+  private terminalCleanupFailures: ClientCleanupFailure[] = [];
+  /** Per-client counts for leases from cached-client acquisition through tool dispatch. */
+  private activeLeaseClients = new Map<string, Map<McpClient, number>>();
+  private terminal = false;
+  private closeBarrier: Promise<void> | null = null;
 
   // ── Stage 4b lifecycle counters ────────────────────────────────────
   // Cumulative per-package counters backing GET /stats.
@@ -415,12 +451,259 @@ export class PackageRegistry {
     this.packages = this.normalizeConfig(config);
   }
 
+  private assertAdmissionOpen(packageId?: string): void {
+    if (this.terminal) {
+      throw new RegistryClosedError(packageId);
+    }
+  }
+
+  private terminalConnectOutcome(packageId: string): ConnectOutcome {
+    return {
+      kind: "transient_failure",
+      failureClass: "transport_error",
+      error: new RegistryClosedError(packageId),
+    };
+  }
+
+  private terminalRestartResult(packageId: string): { success: false; message: string } {
+    return {
+      success: false,
+      message: `Package '${packageId}' cannot be restarted because the registry is shutting down`,
+    };
+  }
+
+  private ownConstructedClient(packageId: string, client: McpClient): void {
+    if (this.clientClosePromises.has(client)) return;
+    if (!this.clients.has(packageId)) {
+      this.constructedClients.set(client, packageId);
+    }
+  }
+
+  private closeClientExactlyOnce(
+    packageId: string,
+    client: McpClient,
+    phase: string,
+  ): Promise<void> {
+    const existing = this.clientClosePromises.get(client);
+    if (existing) {
+      return existing;
+    }
+
+    let resolveClose!: () => void;
+    let rejectClose!: (error: unknown) => void;
+    const invokedClose = new Promise<void>((resolve, reject) => {
+      resolveClose = resolve;
+      rejectClose = reject;
+    });
+    const operation: ClientCloseOperation = {
+      packageId,
+      phase,
+      promise: Promise.resolve(),
+    };
+    const closePromise = invokedClose
+      .catch((error) => {
+        if (this.terminal) {
+          this.terminalCleanupFailures.push({ packageId, phase, error });
+        }
+        throw error;
+      })
+      .finally(() => {
+        this.constructedClients.delete(client);
+        if (this.activeCloseOperations.get(client) === operation) {
+          this.activeCloseOperations.delete(client);
+        }
+      });
+    operation.promise = closePromise;
+    this.clientClosePromises.set(client, closePromise);
+    this.activeCloseOperations.set(client, operation);
+    try {
+      Promise.resolve(client.close()).then(resolveClose, rejectClose);
+    } catch (error) {
+      rejectClose(error);
+    }
+    return closePromise;
+  }
+
+  private async closeAfterFailure(
+    packageId: string,
+    client: McpClient,
+    phase: string,
+    message: string,
+    context: Record<string, unknown> = {},
+  ): Promise<void> {
+    try {
+      await this.closeClientExactlyOnce(packageId, client, phase);
+    } catch (error) {
+      logger.warn(message, {
+        package_id: packageId,
+        ...context,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private beginTerminalCloses(): void {
+    for (const [packageId, client] of this.clients) {
+      void this.closeClientExactlyOnce(packageId, client, "shutdown").catch(() => undefined);
+    }
+    this.clients.clear();
+
+    for (const [client, packageId] of this.constructedClients) {
+      void this.closeClientExactlyOnce(packageId, client, "shutdown_constructed").catch(
+        () => undefined,
+      );
+    }
+  }
+
+  private reconcileNonDrainableTerminalLeases(): void {
+    for (const [packageId, leaseCount] of this.activeLeases) {
+      const leaseClients = this.activeLeaseClients.get(packageId);
+      if (!leaseClients) continue;
+
+      const boundLeaseCount = Array.from(leaseClients.values()).reduce(
+        (total, count) => total + count,
+        0,
+      );
+      if (boundLeaseCount !== leaseCount) continue;
+      if (this.clients.has(packageId) || this.clientPromises.has(packageId)) continue;
+      if (
+        Array.from(this.constructedClients.values()).some(
+          (constructedPackageId) => constructedPackageId === packageId,
+        )
+      ) {
+        continue;
+      }
+      if (
+        Array.from(this.activeCloseOperations.values()).some(
+          (operation) => operation.packageId === packageId,
+        )
+      ) {
+        continue;
+      }
+
+      let terminallyClosedWithoutPendingWork = true;
+      for (const client of leaseClients.keys()) {
+        if (
+          !this.clientClosePromises.has(client) ||
+          this.activeCloseOperations.has(client)
+        ) {
+          terminallyClosedWithoutPendingWork = false;
+          break;
+        }
+        try {
+          if (client.hasPendingRequests?.() !== false) {
+            terminallyClosedWithoutPendingWork = false;
+            break;
+          }
+        } catch {
+          terminallyClosedWithoutPendingWork = false;
+          break;
+        }
+      }
+      if (!terminallyClosedWithoutPendingWork) continue;
+
+      const error = new Error(
+        `Terminal close discarded ${packageId} work with ${leaseCount} active lease(s)`,
+      );
+      this.terminalCleanupFailures.push({
+        packageId,
+        phase: "lease_accounting",
+        error,
+      });
+      this.activeLeases.delete(packageId);
+      this.activeLeaseClients.delete(packageId);
+      const waiters = this.leaseDrainWaiters.get(packageId) ?? [];
+      this.leaseDrainWaiters.delete(packageId);
+      for (const resolve of waiters) resolve();
+    }
+  }
+
+  private async drainTerminalOwnership(): Promise<void> {
+    while (true) {
+      // Closing connected clients comes first: it interrupts in-flight tool calls,
+      // allowing their active-use leases to drain without an internal timeout.
+      this.beginTerminalCloses();
+
+      // First let every operation that can still release a lease settle. An
+      // eviction parked on a lease is deliberately handled after reconciliation:
+      // it consumes the waiter but cannot release the lease itself.
+      const releasingOperations = [
+        ...this.clientPromises.values(),
+        ...Array.from(this.activeCloseOperations.values(), ({ promise }) => promise),
+      ];
+      if (releasingOperations.length > 0) {
+        await Promise.allSettled(releasingOperations);
+        continue;
+      }
+
+      this.reconcileNonDrainableTerminalLeases();
+      const leaseAccountingChange = this.waitForAnyActiveLeaseChange();
+      if (leaseAccountingChange) {
+        await leaseAccountingChange;
+        continue;
+      }
+      const pending = [...this.evictionPromises.values()];
+
+      if (
+        pending.length === 0 &&
+        this.clients.size === 0 &&
+        this.constructedClients.size === 0 &&
+        this.activeLeases.size === 0 &&
+        this.activeLeaseClients.size === 0
+      ) {
+        break;
+      }
+
+      if (pending.length === 0 && this.constructedClients.size > 0) {
+        for (const [client, packageId] of this.constructedClients) {
+          this.terminalCleanupFailures.push({
+            packageId,
+            phase: "ownership_accounting",
+            error: new Error("Constructed client ownership had no terminal operation"),
+          });
+        }
+        this.constructedClients.clear();
+        continue;
+      }
+
+      await Promise.allSettled(pending);
+    }
+
+    this.lastActivity.clear();
+    this.authRequiredPackages.clear();
+    this.leaseDrainWaiters.clear();
+    this.clientPromises.clear();
+    this.evictionPromises.clear();
+    this.activeCloseOperations.clear();
+    this.activeLeaseClients.clear();
+
+    if (this.terminalCleanupFailures.length > 0) {
+      const failures = this.terminalCleanupFailures.splice(0);
+      for (const failure of failures) {
+        logger.error("MCP client cleanup failed during registry shutdown", {
+          package_id: failure.packageId,
+          phase: failure.phase,
+          error: failure.error instanceof Error
+            ? failure.error.message
+            : String(failure.error),
+        });
+      }
+      throw new AggregateError(
+        failures.map(({ error }) => error),
+        `Failed to close ${failures.length} MCP client(s) during registry shutdown`,
+      );
+    }
+
+    logger.info("All clients closed");
+  }
+
   subscribeLifecycle(listener: (event: RegistryLifecycleEvent) => void): () => void {
     this.lifecycleListeners.add(listener);
     return () => this.lifecycleListeners.delete(listener);
   }
 
   notifyAuthOutcome(packageId: string, outcome: "auth_required" | "authenticated"): void {
+    if (this.terminal) return;
     if (outcome === "auth_required") {
       this.authRequiredPackages.add(packageId);
     } else {
@@ -1073,11 +1356,14 @@ export class PackageRegistry {
     packageId: string,
     reason: "unhealthy" | "explicit" | "restart" | "idle" | "shutdown" = "explicit",
   ): Promise<void> {
+    if (this.terminal) return;
     const previousEviction = this.evictionPromises.get(packageId);
     let eviction!: Promise<void>;
     eviction = (async () => {
       if (previousEviction) await previousEviction;
+      if (this.terminal) return;
       await this.waitForActiveLeases(packageId);
+      if (this.terminal) return;
 
       const client = this.clients.get(packageId);
       if (!client) return;
@@ -1089,7 +1375,7 @@ export class PackageRegistry {
         );
       }
       try {
-        await client.close();
+        await this.closeClientExactlyOnce(packageId, client, `eviction:${reason}`);
       } catch (error) {
         logger.warn("Failed to close evicted MCP client", {
           package_id: packageId,
@@ -1097,8 +1383,10 @@ export class PackageRegistry {
           error: error instanceof Error ? error.message : String(error),
         });
       } finally {
-        this.lastActivity.delete(packageId);
-        this.emitLifecycle({ type: "client_evicted", packageId, reason });
+        if (!this.terminal) {
+          this.lastActivity.delete(packageId);
+          this.emitLifecycle({ type: "client_evicted", packageId, reason });
+        }
       }
     })().finally(() => {
       if (this.evictionPromises.get(packageId) === eviction) {
@@ -1113,6 +1401,7 @@ export class PackageRegistry {
     packageId: string,
     options: { forceReconnect?: boolean } = {},
   ): Promise<ConnectOutcome> {
+    if (this.terminal) return this.terminalConnectOutcome(packageId);
     const config = this.getPackage(packageId);
     if (!config) {
       return {
@@ -1126,11 +1415,13 @@ export class PackageRegistry {
     }
     if (options.forceReconnect) {
       await this.evictClient(packageId, "explicit");
+      if (this.terminal) return this.terminalConnectOutcome(packageId);
     }
 
     try {
       const client = await this.getClient(packageId);
       const health = await client.healthCheck?.();
+      if (this.terminal) return this.terminalConnectOutcome(packageId);
       if (health === "needs_auth") {
         const error = new Error(`Authentication required for MCP package '${packageId}'`);
         this.notifyAuthOutcome(packageId, "auth_required");
@@ -1145,6 +1436,9 @@ export class PackageRegistry {
       }
       return { kind: "connected", client };
     } catch (error) {
+      if (error instanceof RegistryClosedError || this.terminal) {
+        return this.terminalConnectOutcome(packageId);
+      }
       if (isAuthConnectFailure(config, error)) {
         const client = this.clients.get(packageId);
         if (client) {
@@ -1168,6 +1462,7 @@ export class PackageRegistry {
   }
 
   async getClient(packageId: string): Promise<McpClient> {
+    this.assertAdmissionOpen(packageId);
     const configuredPackage = this.getPackage(packageId);
     if (configuredPackage?.setupStatus?.state === "blocked") {
       throw new Error(
@@ -1181,6 +1476,7 @@ export class PackageRegistry {
       // For HTTP clients, check if they're actually connected
       if (client.healthCheck) {
         const health = await client.healthCheck();
+        this.assertAdmissionOpen(packageId);
         if (health === "ok") {
           if (this.authRequiredPackages.has(packageId)) {
             this.notifyAuthOutcome(packageId, "authenticated");
@@ -1208,13 +1504,14 @@ export class PackageRegistry {
         const deleted = this.clients.delete(packageId);
         if (deleted) {
           try {
-            await client.close();
+            await this.closeClientExactlyOnce(packageId, client, "unhealthy");
           } catch (error) {
             logger.warn("Failed to close unhealthy MCP client", {
               package_id: packageId,
               error: error instanceof Error ? error.message : String(error),
             });
           }
+          this.assertAdmissionOpen(packageId);
           this.evictionCounts.set(
             packageId,
             (this.evictionCounts.get(packageId) ?? 0) + 1,
@@ -1242,7 +1539,9 @@ export class PackageRegistry {
       logger.debug("Client creation already in progress, waiting", {
         package_id: packageId,
       });
-      return clientPromise;
+      client = await clientPromise;
+      this.assertAdmissionOpen(packageId);
+      return client;
     }
     
     // Create new client
@@ -1265,7 +1564,10 @@ export class PackageRegistry {
     
     try {
       client = await clientPromise;
+      this.ownConstructedClient(packageId, client);
+      this.assertAdmissionOpen(packageId);
       this.clients.set(packageId, client);
+      this.constructedClients.delete(client);
       this.emitLifecycle({ type: "client_created", packageId });
       // Stage 4b: increment per-package spawn counter exactly once per
       // successful `createAndConnectClient()` completion (initial create path).
@@ -1278,6 +1580,11 @@ export class PackageRegistry {
       }
       return client;
     } catch (error) {
+      if (this.terminal) {
+        throw error instanceof RegistryClosedError
+          ? error
+          : new RegistryClosedError(packageId);
+      }
       // Add helpful context to connection errors
       const errorMessage = error instanceof Error ? error.message : String(error);
       if (!errorMessage.includes("MCP") && !errorMessage.includes("diagnostic")) {
@@ -1314,25 +1621,103 @@ export class PackageRegistry {
    * synchronously before this async method returns. Re-entry is supported via
    * the counter (nested/concurrent calls each hold their own ref).
    */
-  private async acquireLease(packageId: string): Promise<void> {
+  private async acquireLease(packageId: string): Promise<McpClient | undefined> {
     while (true) {
+      this.assertAdmissionOpen(packageId);
       const eviction = this.evictionPromises.get(packageId);
       if (eviction) {
         await eviction;
+        this.assertAdmissionOpen(packageId);
         continue;
       }
       this.activeLeases.set(packageId, (this.activeLeases.get(packageId) ?? 0) + 1);
-      return;
+      // Bind atomically with lease admission. `getClient()` health-probes this
+      // cached client, and terminal close can discard that queued probe before
+      // `getClient()` returns to the caller.
+      const client = this.clients.get(packageId);
+      if (client) {
+        this.bindLeaseToClient(packageId, client);
+      }
+      return client;
     }
   }
 
-  private waitForActiveLeases(packageId: string): Promise<void> {
+  private waitForLeaseAccountingChange(packageId: string): Promise<void> {
     if ((this.activeLeases.get(packageId) ?? 0) === 0) return Promise.resolve();
     return new Promise<void>((resolve) => {
       const waiters = this.leaseDrainWaiters.get(packageId) ?? [];
       waiters.push(resolve);
       this.leaseDrainWaiters.set(packageId, waiters);
     });
+  }
+
+  private async waitForActiveLeases(packageId: string): Promise<void> {
+    while ((this.activeLeases.get(packageId) ?? 0) > 0) {
+      await this.waitForLeaseAccountingChange(packageId);
+    }
+  }
+
+  private waitForAnyActiveLeaseChange(): Promise<void> | null {
+    const packageIds = Array.from(this.activeLeases.keys());
+    if (packageIds.length === 0) return null;
+
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const wake = (): void => {
+        if (settled) return;
+        settled = true;
+        for (const packageId of packageIds) {
+          const waiters = this.leaseDrainWaiters.get(packageId);
+          if (!waiters) continue;
+          const remaining = waiters.filter((waiter) => waiter !== wake);
+          if (remaining.length > 0) {
+            this.leaseDrainWaiters.set(packageId, remaining);
+          } else {
+            this.leaseDrainWaiters.delete(packageId);
+          }
+        }
+        resolve();
+      };
+
+      for (const packageId of packageIds) {
+        const waiters = this.leaseDrainWaiters.get(packageId) ?? [];
+        waiters.push(wake);
+        this.leaseDrainWaiters.set(packageId, waiters);
+      }
+    });
+  }
+
+  private bindLeaseToClient(packageId: string, client: McpClient): void {
+    const clients = this.activeLeaseClients.get(packageId) ?? new Map<McpClient, number>();
+    clients.set(client, (clients.get(client) ?? 0) + 1);
+    this.activeLeaseClients.set(packageId, clients);
+  }
+
+  private unbindLeaseFromClient(packageId: string, client: McpClient): void {
+    const clients = this.activeLeaseClients.get(packageId);
+    if (!clients) return;
+    const next = (clients.get(client) ?? 0) - 1;
+    if (next <= 0) {
+      clients.delete(client);
+    } else {
+      clients.set(client, next);
+    }
+    if (clients.size === 0) {
+      this.activeLeaseClients.delete(packageId);
+    }
+  }
+
+  private moveLeaseToClient(
+    packageId: string,
+    currentClient: McpClient | undefined,
+    nextClient: McpClient,
+  ): McpClient {
+    if (currentClient === nextClient) return nextClient;
+    if (currentClient) {
+      this.unbindLeaseFromClient(packageId, currentClient);
+    }
+    this.bindLeaseToClient(packageId, nextClient);
+    return nextClient;
   }
 
   /**
@@ -1343,12 +1728,12 @@ export class PackageRegistry {
     const next = (this.activeLeases.get(packageId) ?? 0) - 1;
     if (next <= 0) {
       this.activeLeases.delete(packageId);
-      const waiters = this.leaseDrainWaiters.get(packageId) ?? [];
-      this.leaseDrainWaiters.delete(packageId);
-      for (const resolve of waiters) resolve();
     } else {
       this.activeLeases.set(packageId, next);
     }
+    const waiters = this.leaseDrainWaiters.get(packageId) ?? [];
+    this.leaseDrainWaiters.delete(packageId);
+    for (const resolve of waiters) resolve();
   }
 
   /**
@@ -1366,11 +1751,12 @@ export class PackageRegistry {
    * happens ONLY when `isTransportClosed()` is true before `client.callTool` is
    * invoked; the actual `client.callTool` call has no retry around it, so an
    * in-flight close propagates -32000 to the caller unchanged.
-   */
+  */
   async callTool(packageId: string, toolId: string, args: any): Promise<any> {
-    await this.acquireLease(packageId);
+    let leaseClient = await this.acquireLease(packageId);
     try {
       let client = await this.getClient(packageId);
+      leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
       // Pre-send liveness re-check: the lease blocks the reaper, but the client
       // could already have a dead transport (e.g. closed between a prior reap
       // sweep and this call, or never spawned). Re-establishing here is safe
@@ -1383,10 +1769,14 @@ export class PackageRegistry {
         this.reestablishCounts.set(packageId, (this.reestablishCounts.get(packageId) ?? 0) + 1);
         this.clients.delete(packageId);
         client = await this.getClient(packageId);
+        leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
       }
       // No retry wraps this call: a mid-call close propagates -32000 as-is.
       return await client.callTool(toolId, args);
     } finally {
+      if (leaseClient) {
+        this.unbindLeaseFromClient(packageId, leaseClient);
+      }
       this.releaseLease(packageId);
     }
   }
@@ -1396,6 +1786,7 @@ export class PackageRegistry {
    * Resets the idle timer for the given package.
    */
   notifyActivity(packageId: string): void {
+    if (this.terminal) return;
     this.lastActivity.set(packageId, Date.now());
   }
 
@@ -1405,6 +1796,7 @@ export class PackageRegistry {
    * A value of 0 disables reaping entirely. Idempotent — safe to call multiple times.
    */
   startIdleReaper(): void {
+    if (this.terminal) return;
     // Already running — no-op
     if (this.reaperInterval) {
       return;
@@ -1450,6 +1842,7 @@ export class PackageRegistry {
    * Only targets stdio clients — HTTP clients are stateless and don't hold child processes.
    */
   private sweepIdleClients(): void {
+    if (this.terminal) return;
     const now = Date.now();
     const reaped: string[] = [];
 
@@ -1488,7 +1881,7 @@ export class PackageRegistry {
       }
 
       // Reap this client
-      client.close().catch((error) => {
+      this.closeClientExactlyOnce(packageId, client, "idle_reap").catch((error) => {
         logger.warn("Error closing idle client during reap", {
           package_id: packageId,
           error: error instanceof Error ? error.message : String(error),
@@ -1522,6 +1915,7 @@ export class PackageRegistry {
         config,
         (client) => {
           firstClient = client;
+          this.ownConstructedClient(packageId, client);
         },
       );
       const connectedClient = clientFromConnectOutcome(outcome);
@@ -1529,16 +1923,23 @@ export class PackageRegistry {
       throw errorFromConnectOutcome(outcome);
     } catch (firstError) {
       if (firstClient) {
-        try {
-          await firstClient.close();
-        } catch (cleanupError) {
-          logger.warn("Failed to close MCP client after failed connect", {
-            package_id: packageId,
-            attempt: 1,
-            error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
-          });
-        }
+        await this.closeAfterFailure(
+          packageId,
+          firstClient,
+          "connect_attempt_1",
+          "Failed to close MCP client after failed connect",
+          { attempt: 1 },
+        );
       }
+
+      if (this.terminal) {
+        logger.warn("MCP client connect failed; retry suppressed during registry shutdown", {
+          package_id: packageId,
+          attempt: 1,
+          error: firstError instanceof Error ? firstError.message : String(firstError),
+        });
+      }
+      this.assertAdmissionOpen(packageId);
 
       if (isPermanentConnectFailure(firstError)) {
         this.connectRetrySkippedPermanentCounts.set(
@@ -1563,16 +1964,35 @@ export class PackageRegistry {
         error: firstError instanceof Error ? firstError.message : String(firstError),
       });
 
+      let secondClient: McpClient | undefined;
       try {
-        const outcome = await this.createAndConnectClient(packageId, config);
+        const outcome = await this.createAndConnectClient(
+          packageId,
+          config,
+          (client) => {
+            secondClient = client;
+            this.ownConstructedClient(packageId, client);
+          },
+        );
         const client = clientFromConnectOutcome(outcome);
         if (!client) throw errorFromConnectOutcome(outcome);
+        this.assertAdmissionOpen(packageId);
         this.connectRetryRecoveredCounts.set(
           packageId,
           (this.connectRetryRecoveredCounts.get(packageId) ?? 0) + 1,
         );
         return client;
       } catch (secondError) {
+        if (secondClient) {
+          await this.closeAfterFailure(
+            packageId,
+            secondClient,
+            "connect_attempt_2",
+            "Failed to close MCP client after failed retry",
+            { attempt: 2 },
+          );
+        }
+        this.assertAdmissionOpen(packageId);
         this.connectRetryFailedCounts.set(
           packageId,
           (this.connectRetryFailedCounts.get(packageId) ?? 0) + 1,
@@ -1588,6 +2008,7 @@ export class PackageRegistry {
     config: PackageConfig,
     onClientCreated?: (client: McpClient) => void,
   ): Promise<ConnectOutcome> {
+    this.assertAdmissionOpen(packageId);
     if (config.setupStatus?.state === "blocked") {
       return { kind: "setup_incomplete", reason: config.setupStatus.reason };
     }
@@ -1606,9 +2027,11 @@ export class PackageRegistry {
       let oauthPort: number | undefined;
       if (config.oauth) {
         oauthPort = await SimpleOAuthProvider.getSavedClientPort(packageId);
+        this.assertAdmissionOpen(packageId);
       }
       client = new HttpMcpClient(packageId, config, oauthPort ? { oauthPort } : undefined);
     }
+    this.ownConstructedClient(packageId, client);
     onClientCreated?.(client);
 
     try {
@@ -1619,14 +2042,12 @@ export class PackageRegistry {
       connectPromise.then(
         async () => {
           if (!timedOut) return;
-          try {
-            await client.close();
-          } catch (cleanupError) {
-            logger.warn("Failed to close MCP client after late connect completion", {
-              package_id: packageId,
-              error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
-            });
-          }
+          await this.closeAfterFailure(
+            packageId,
+            client,
+            "late_connect_completion",
+            "Failed to close MCP client after late connect completion",
+          );
         },
         () => undefined,
       );
@@ -1642,6 +2063,15 @@ export class PackageRegistry {
         if (timeoutHandle) clearTimeout(timeoutHandle);
       }
     } catch (error) {
+      if (this.terminal) {
+        await this.closeAfterFailure(
+          packageId,
+          client,
+          "terminal_connect",
+          "Failed to close MCP client during registry shutdown",
+        );
+        throw new RegistryClosedError(packageId);
+      }
       // Preserve the current caller-visible auth behavior while returning a
       // typed outcome for the Stage 4 catalog writer.
       if (isAuthConnectFailure(config, error)) {
@@ -1654,14 +2084,12 @@ export class PackageRegistry {
         return { kind: "auth_required", client, error };
       }
 
-      try {
-        await client.close();
-      } catch (cleanupError) {
-        logger.warn("Failed to close MCP client after connect failure", {
-          package_id: packageId,
-          error: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
-        });
-      }
+      await this.closeAfterFailure(
+        packageId,
+        client,
+        "connect_failure",
+        "Failed to close MCP client after connect failure",
+      );
 
       if (isPermanentConnectFailure(error)) {
         return {
@@ -1676,7 +2104,16 @@ export class PackageRegistry {
         error,
       };
     }
-    
+
+    if (this.terminal) {
+      await this.closeAfterFailure(
+        packageId,
+        client,
+        "terminal_connect",
+        "Failed to close MCP client during registry shutdown",
+      );
+      throw new RegistryClosedError(packageId);
+    }
     return { kind: "connected", client };
   }
 
@@ -1725,6 +2162,9 @@ export class PackageRegistry {
    * Next tool call will reconnect with fresh configuration.
    */
   async restartPackage(packageId: string): Promise<{ success: boolean; message: string }> {
+    if (this.terminal) {
+      return this.terminalRestartResult(packageId);
+    }
     logger.info("Restarting package", { package_id: packageId });
     
     // Check if package exists
@@ -1739,9 +2179,18 @@ export class PackageRegistry {
       logger.debug("Waiting for pending connection before restart", { package_id: packageId });
       try {
         const pendingClient = await pendingPromise;
-        await pendingClient.close();
-      } catch {
+        await this.closeClientExactlyOnce(packageId, pendingClient, "restart_pending");
+      } catch (error) {
+        if (!this.terminal) {
+          logger.debug("Pending connection did not survive package restart", {
+            package_id: packageId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
         // Ignore errors - connection may have failed
+      }
+      if (this.terminal) {
+        return this.terminalRestartResult(packageId);
       }
       this.clientPromises.delete(packageId);
     }
@@ -1750,13 +2199,16 @@ export class PackageRegistry {
     const client = this.clients.get(packageId);
     if (client) {
       try {
-        await client.close();
+        await this.closeClientExactlyOnce(packageId, client, "restart");
         logger.debug("Closed existing client", { package_id: packageId });
       } catch (error) {
         logger.warn("Error closing client during restart", {
           package_id: packageId,
           error: error instanceof Error ? error.message : String(error)
         });
+      }
+      if (this.terminal) {
+        return this.terminalRestartResult(packageId);
       }
       this.clients.delete(packageId);
       this.emitLifecycle({ type: "client_evicted", packageId, reason: "restart" });
@@ -1796,27 +2248,27 @@ export class PackageRegistry {
     };
   }
 
-  async closeAll(): Promise<void> {
+  closeAll(): Promise<void> {
+    if (this.closeBarrier) return this.closeBarrier;
+
+    this.terminal = true;
     this.stopIdleReaper();
 
     logger.info("Closing all clients", {
       client_count: this.clients.size,
+      connecting_count: this.clientPromises.size,
+      constructed_count: this.constructedClients.size,
     });
 
-    const closePromises = Array.from(this.clients.values()).map(client => 
-      client.close().catch(error => 
-        logger.error("Error closing client", {
-          error: error instanceof Error ? error.message : String(error),
-        })
-      )
-    );
-
-    await Promise.allSettled(closePromises);
-    this.clients.clear();
-    this.lastActivity.clear();
-    this.authRequiredPackages.clear();
-
-    logger.info("All clients closed");
+    let resolveBarrier!: () => void;
+    let rejectBarrier!: (error: unknown) => void;
+    const barrier = new Promise<void>((resolve, reject) => {
+      resolveBarrier = resolve;
+      rejectBarrier = reject;
+    });
+    this.closeBarrier = barrier;
+    void this.drainTerminalOwnership().then(resolveBarrier, rejectBarrier);
+    return barrier;
   }
 
   /**
