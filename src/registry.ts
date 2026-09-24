@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import { isDeepStrictEqual } from "util";
 import {
   SuperMcpConfig,
   PackageConfig,
@@ -227,6 +228,37 @@ function preserveFirstAttemptDiagnostics(
  * Supports ${VAR} syntax for environment variable substitution.
  * Returns undefined if input is undefined to maintain compatibility.
  */
+/** Outcome of `PackageRegistry.refreshPackageEnvFromConfigFiles`. */
+export type PackageEnvRefreshResult =
+  | { status: "failed" }
+  | {
+      status: "ok";
+      /** Packages whose cached env was replaced; `changedKeys` are names only, never values. */
+      updated: Array<{ packageId: string; changedKeys: string[] }>;
+      /** Changes this path leaves to a whole-router reload. */
+      notApplied: Array<{
+        packageId: string;
+        reason: "added" | "removed" | "identity_changed" | "not_stdio";
+      }>;
+    };
+
+/** Names of env keys added, removed or changed between two env maps (sorted). */
+function changedEnvKeys(
+  before: Record<string, string> | undefined,
+  after: Record<string, string> | undefined,
+): string[] {
+  const a = before ?? {};
+  const b = after ?? {};
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  return [...keys]
+    .filter((key) => {
+      const inA = Object.prototype.hasOwnProperty.call(a, key);
+      const inB = Object.prototype.hasOwnProperty.call(b, key);
+      return !inA || !inB || a[key] !== b[key];
+    })
+    .sort();
+}
+
 function expandEnvironmentVariables(env?: Record<string, string>, packageId?: string): Record<string, string> | undefined {
   if (!env) return undefined;
   
@@ -799,6 +831,187 @@ export class PackageRegistry {
   static async fromConfigFiles(configPaths: string[]): Promise<PackageRegistry> {
     logger.info("Loading configurations", { config_paths: configPaths });
 
+    const { mergedConfig, loadOrder } = await PackageRegistry.loadMergedConfigFiles(configPaths);
+
+    const registry = new PackageRegistry(mergedConfig);
+
+    // Initialize security policy
+    const securityConfig: SecurityConfig = mergedConfig.security || {};
+    const securityPolicy = new SecurityPolicy(securityConfig);
+
+    // Set user-disabled tools on the security policy
+    if (mergedConfig.userDisabledToolsByServer) {
+      securityPolicy.setUserDisabledTools(mergedConfig.userDisabledToolsByServer);
+    }
+
+    // Set admin-disabled tools on the security policy
+    if (mergedConfig.adminDisabledToolsByCatalogId) {
+      securityPolicy.setAdminDisabledTools(mergedConfig.adminDisabledToolsByCatalogId);
+    }
+
+    setSecurityPolicy(securityPolicy);
+
+    const secSummary = securityPolicy.getSummary();
+    const userDisabledSummary = securityPolicy.getUserDisabledSummary();
+    const adminDisabledSummary = securityPolicy.getAdminDisabledSummary();
+    if (secSummary.mode !== "disabled" || userDisabledSummary.totalDisabled > 0 || adminDisabledSummary.totalDisabled > 0) {
+      logger.info("Security policy active", {
+        ...secSummary,
+        user_disabled_servers: userDisabledSummary.serverCount,
+        user_disabled_tools: userDisabledSummary.totalDisabled,
+        admin_disabled_catalogs: adminDisabledSummary.catalogCount,
+        admin_disabled_tools: adminDisabledSummary.totalDisabled,
+      });
+    }
+
+    // Validate normalized config - skip invalid entries instead of throwing -
+    // and filter out disabled servers
+    const { packages, skipped, disabledServers } =
+      PackageRegistry.validateAndFilterPackages(mergedConfig, registry.packages);
+    registry.packages = packages;
+    registry.skippedPackages = skipped;
+
+    // Emit skipped packages to stderr as structured JSON for consumers (e.g., Rebel) to parse
+    if (skipped.length > 0) {
+      const skippedJson = JSON.stringify({ packages: skipped });
+      console.error(`SUPER_MCP_SKIPPED_PACKAGES:${skippedJson}`);
+      logger.warn("Some MCP packages were skipped due to validation errors", {
+        skipped_count: skipped.length,
+        skipped_packages: skipped
+      });
+    }
+
+    // Check for placeholder values
+    PackageRegistry.checkForPlaceholders(registry.packages);
+
+    logger.info("Configurations loaded successfully", {
+      config_count: loadOrder.length,
+      root_configs: configPaths.length,
+      total_packages: registry.packages.length,
+      skipped_packages: skipped.length,
+      disabled_servers: disabledServers.length,
+      packages: registry.packages.map(p => ({ id: p.id, transport: p.transport })),
+      load_order: loadOrder
+    });
+
+    return registry;
+  }
+
+  /**
+   * Validate normalized packages (skipping invalid entries instead of throwing)
+   * and drop disabled servers. Shared by startup and the config-change env
+   * refresh so both accept exactly the same packages.
+   */
+  private static validateAndFilterPackages(
+    mergedConfig: SuperMcpConfig,
+    normalized: PackageConfig[],
+  ): { packages: PackageConfig[]; skipped: SkippedPackage[]; disabledServers: string[] } {
+    const validationResult = PackageRegistry.validateConfig(normalized);
+    let packages = validationResult.valid;
+
+    const disabledServers = mergedConfig.disabledServers || [];
+    if (disabledServers.length > 0) {
+      const disabledSet = new Set(disabledServers);
+      const filteredOut = packages.filter(p => disabledSet.has(p.id));
+      packages = packages.filter(p => !disabledSet.has(p.id));
+      if (filteredOut.length > 0) {
+        logger.info("Filtering disabled servers", {
+          disabled_servers: filteredOut.map(p => p.id),
+          filtered_count: filteredOut.length,
+          remaining_count: packages.length
+        });
+      }
+    }
+
+    return { packages, skipped: validationResult.skipped, disabledServers };
+  }
+
+  /**
+   * Re-read the config files after a change and refresh the cached env of
+   * existing stdio packages whose env changed and nothing else about them did,
+   * so their NEXT spawn uses it (e.g. a rotated OAuth refresh token the host
+   * persisted). Live clients and in-flight calls are left alone.
+   *
+   * Deliberately narrow: packages added, removed, or changed in any other
+   * field (command, args, cwd, transport, ...) are logged and left to the
+   * host's whole-router reload. On a read or parse failure the cached configs
+   * are kept. Env values are credentials: only package ids and key names are
+   * logged. Never throws.
+   */
+  async refreshPackageEnvFromConfigFiles(configPaths: string[]): Promise<PackageEnvRefreshResult> {
+    if (this.terminal) {
+      return { status: "ok", updated: [], notApplied: [] };
+    }
+
+    let mergedConfig: SuperMcpConfig;
+    let fresh: PackageConfig[];
+    try {
+      ({ mergedConfig } = await PackageRegistry.loadMergedConfigFiles(configPaths));
+      fresh = PackageRegistry.validateAndFilterPackages(
+        mergedConfig,
+        this.normalizeConfig(mergedConfig),
+      ).packages;
+    } catch (error) {
+      logger.error("Failed to re-read package configs after a config change, keeping cached configs", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { status: "failed" };
+    }
+
+    const freshById = new Map(fresh.map((pkg) => [pkg.id, pkg]));
+    const updated: PackageEnvRefreshResult & { status: "ok" } = { status: "ok", updated: [], notApplied: [] };
+
+    for (let i = 0; i < this.packages.length; i++) {
+      const current = this.packages[i];
+      const next = freshById.get(current.id);
+      freshById.delete(current.id);
+      if (!next) {
+        updated.notApplied.push({ packageId: current.id, reason: "removed" });
+        continue;
+      }
+      const changedKeys = changedEnvKeys(current.env, next.env);
+      if (changedKeys.length === 0) continue;
+      if (current.transport !== "stdio" || next.transport !== "stdio") {
+        updated.notApplied.push({ packageId: current.id, reason: "not_stdio" });
+        continue;
+      }
+      if (!isDeepStrictEqual({ ...current, env: undefined }, { ...next, env: undefined })) {
+        updated.notApplied.push({ packageId: current.id, reason: "identity_changed" });
+        continue;
+      }
+      this.packages[i] = next;
+      // Keep the raw entry in step, so a later restartPackage (which
+      // re-normalises from it) does not bring the old env back.
+      const rawEntry = mergedConfig.mcpServers?.[current.id];
+      if (rawEntry && this.config.mcpServers) {
+        this.config.mcpServers[current.id] = rawEntry;
+      }
+      updated.updated.push({ packageId: current.id, changedKeys });
+    }
+    for (const addedId of freshById.keys()) {
+      updated.notApplied.push({ packageId: addedId, reason: "added" });
+    }
+
+    if (updated.updated.length > 0) {
+      logger.info("Refreshed package env from changed config; applies from the next spawn", {
+        packages: updated.updated.map((u) => ({ package_id: u.packageId, changed_keys: u.changedKeys })),
+      });
+    }
+    if (updated.notApplied.length > 0) {
+      logger.info("Config change not applied by the env refresh; needs a router reload", {
+        packages: updated.notApplied.map((n) => ({ package_id: n.packageId, reason: n.reason })),
+      });
+    }
+    return updated;
+  }
+
+  /**
+   * Read the config files (following configPaths references) and merge them.
+   * Throws on a missing, unreadable or unparsable file.
+   */
+  private static async loadMergedConfigFiles(
+    configPaths: string[],
+  ): Promise<{ mergedConfig: SuperMcpConfig; loadOrder: string[] }> {
     // Merged configuration
     const mergedConfig: SuperMcpConfig = {
       mcpServers: {},
@@ -1092,81 +1305,7 @@ export class PackageRegistry {
       }
     }
 
-    const registry = new PackageRegistry(mergedConfig);
-
-    // Initialize security policy
-    const securityConfig: SecurityConfig = mergedConfig.security || {};
-    const securityPolicy = new SecurityPolicy(securityConfig);
-    
-    // Set user-disabled tools on the security policy
-    if (mergedConfig.userDisabledToolsByServer) {
-      securityPolicy.setUserDisabledTools(mergedConfig.userDisabledToolsByServer);
-    }
-    
-    // Set admin-disabled tools on the security policy
-    if (mergedConfig.adminDisabledToolsByCatalogId) {
-      securityPolicy.setAdminDisabledTools(mergedConfig.adminDisabledToolsByCatalogId);
-    }
-    
-    setSecurityPolicy(securityPolicy);
-    
-    const secSummary = securityPolicy.getSummary();
-    const userDisabledSummary = securityPolicy.getUserDisabledSummary();
-    const adminDisabledSummary = securityPolicy.getAdminDisabledSummary();
-    if (secSummary.mode !== "disabled" || userDisabledSummary.totalDisabled > 0 || adminDisabledSummary.totalDisabled > 0) {
-      logger.info("Security policy active", {
-        ...secSummary,
-        user_disabled_servers: userDisabledSummary.serverCount,
-        user_disabled_tools: userDisabledSummary.totalDisabled,
-        admin_disabled_catalogs: adminDisabledSummary.catalogCount,
-        admin_disabled_tools: adminDisabledSummary.totalDisabled,
-      });
-    }
-
-    // Validate normalized config - skip invalid entries instead of throwing
-    const validationResult = PackageRegistry.validateConfig(registry.packages);
-    registry.packages = validationResult.valid;
-    registry.skippedPackages = validationResult.skipped;
-    
-    // Emit skipped packages to stderr as structured JSON for consumers (e.g., Rebel) to parse
-    if (validationResult.skipped.length > 0) {
-      const skippedJson = JSON.stringify({ packages: validationResult.skipped });
-      console.error(`SUPER_MCP_SKIPPED_PACKAGES:${skippedJson}`);
-      logger.warn("Some MCP packages were skipped due to validation errors", {
-        skipped_count: validationResult.skipped.length,
-        skipped_packages: validationResult.skipped
-      });
-    }
-
-    // Filter out disabled servers
-    const disabledServers = mergedConfig.disabledServers || [];
-    if (disabledServers.length > 0) {
-      const disabledSet = new Set(disabledServers);
-      const filteredOut = registry.packages.filter(p => disabledSet.has(p.id));
-      registry.packages = registry.packages.filter(p => !disabledSet.has(p.id));
-      if (filteredOut.length > 0) {
-        logger.info("Filtering disabled servers", {
-          disabled_servers: filteredOut.map(p => p.id),
-          filtered_count: filteredOut.length,
-          remaining_count: registry.packages.length
-        });
-      }
-    }
-
-    // Check for placeholder values
-    PackageRegistry.checkForPlaceholders(registry.packages);
-
-    logger.info("Configurations loaded successfully", {
-      config_count: loadOrder.length,
-      root_configs: configPaths.length,
-      total_packages: registry.packages.length,
-      skipped_packages: validationResult.skipped.length,
-      disabled_servers: disabledServers.length,
-      packages: registry.packages.map(p => ({ id: p.id, transport: p.transport })),
-      load_order: loadOrder
-    });
-
-    return registry;
+    return { mergedConfig, loadOrder };
   }
 
   /**

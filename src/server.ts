@@ -16,7 +16,7 @@ import {
 import { getValidator } from "./validator.js";
 import { getLogger } from "./logging.js";
 import { registerSuperMcpHealthRoute } from "./health.js";
-import { ConfigWatcher } from "./configWatcher.js";
+import { ConfigWatcher, handleConfigurationChange } from "./configWatcher.js";
 import { getSecurityPolicy } from "./security.js";
 import {
   handleListToolPackages,
@@ -522,9 +522,9 @@ export async function startServer(options: {
     catalogRefresher.start();
     const validator = getValidator();
     
-    const configWatcher = new ConfigWatcher(paths, () => {
-      catalogRefresher.configurationChanged();
-    });
+    const configWatcher = new ConfigWatcher(paths, () =>
+      handleConfigurationChange(registry, catalogRefresher, paths),
+    );
     await configWatcher.start();
 
     function createMcpServer(): Server {

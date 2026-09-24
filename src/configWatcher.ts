@@ -8,6 +8,27 @@ import { getLogger } from "./logging.js";
 const logger = getLogger();
 
 const MAX_CONFIG_DEPTH = 20;
+
+/**
+ * What the router does when its watched config changes: refresh the cached
+ * env of stdio packages for their next spawn (a rotated OAuth refresh token
+ * the host persisted, say), then let the catalog reconcile. The env refresh
+ * runs first so any spawn the catalog triggers already sees the new env.
+ */
+export async function handleConfigurationChange(
+  registry: { refreshPackageEnvFromConfigFiles(configPaths: string[]): Promise<unknown> },
+  catalogRefresher: { configurationChanged(): void },
+  configPaths: string[],
+): Promise<void> {
+  try {
+    await registry.refreshPackageEnvFromConfigFiles(configPaths);
+  } catch (error) {
+    logger.error("Failed to refresh package env after a config change", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  catalogRefresher.configurationChanged();
+}
 const DEBOUNCE_MS = 500;
 
 export class ConfigWatcher {
