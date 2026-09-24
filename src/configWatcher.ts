@@ -22,10 +22,8 @@ export async function handleConfigurationChange(
 ): Promise<void> {
   try {
     await registry.refreshPackageEnvFromConfigFiles(configPaths);
-  } catch (error) {
-    logger.error("Failed to refresh package env after a config change", {
-      error: error instanceof Error ? error.message : String(error),
-    });
+  } catch {
+    logger.error("Failed to refresh package env after a config change");
   }
   catalogRefresher.configurationChanged();
 }
@@ -224,12 +222,12 @@ export class ConfigWatcher {
       let config: SuperMcpConfig;
       try {
         config = JSON.parse(configData);
-      } catch (error) {
+      } catch {
         logger.warn("Invalid JSON in config file during reload", {
           path: normalizedPath,
-          error: error instanceof Error ? error.message : String(error),
         });
-        throw error;
+        // The parser message can contain credentials from the file.
+        throw new Error("Invalid JSON in watched config file");
       }
 
       // Merge security config

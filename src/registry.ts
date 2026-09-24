@@ -259,7 +259,7 @@ function changedEnvKeys(
     .sort();
 }
 
-function expandEnvironmentVariables(env?: Record<string, string>, packageId?: string): Record<string, string> | undefined {
+function expandEnvironmentVariables(env?: Record<string, string>, packageId?: string, safeDiagnostics = false): Record<string, string> | undefined {
   if (!env) return undefined;
   
   const expanded: Record<string, string> = {};
@@ -276,8 +276,7 @@ function expandEnvironmentVariables(env?: Record<string, string>, packageId?: st
             logger.debug("Expanded environment variable", {
               package_id: packageId,
               key,
-              var_name: varName,
-              original: match,
+              ...(!safeDiagnostics ? { var_name: varName, original: match } : {}),
               // Don't log the actual value for security
               has_value: true
             });
@@ -288,9 +287,11 @@ function expandEnvironmentVariables(env?: Record<string, string>, packageId?: st
           logger.warn("Environment variable not found", {
             package_id: packageId,
             key,
-            var_name: varName,
-            original: match,
-            suggestion: `Set the environment variable: export ${varName}="your-value"`
+            ...(!safeDiagnostics ? {
+              var_name: varName,
+              original: match,
+              suggestion: `Set the environment variable: export ${varName}="your-value"`,
+            } : {}),
           });
           return match; // Keep original if not found
         })
@@ -300,8 +301,7 @@ function expandEnvironmentVariables(env?: Record<string, string>, packageId?: st
             logger.debug("Expanded environment variable", {
               package_id: packageId,
               key,
-              var_name: varName,
-              original: match,
+              ...(!safeDiagnostics ? { var_name: varName, original: match } : {}),
               has_value: true
             });
             return envValue;
@@ -413,6 +413,8 @@ interface ClientCleanupFailure {
 
 export class PackageRegistry {
   private config: SuperMcpConfig;
+  private configPaths?: string[];
+  private envRefreshQueue: Promise<unknown> = Promise.resolve();
   private packages: PackageConfig[];
   private clients: Map<string, McpClient> = new Map();
   private clientPromises: Map<string, Promise<McpClient>> = new Map();
@@ -758,12 +760,12 @@ export class PackageRegistry {
     }
   }
 
-  private normalizeConfig(config: SuperMcpConfig): PackageConfig[] {
+  private normalizeConfig(config: SuperMcpConfig, safeDiagnostics = false): PackageConfig[] {
     // If using legacy packages format, expand env vars and return
     if (config.packages) {
       return config.packages.map(pkg => ({
         ...pkg,
-        env: expandEnvironmentVariables(pkg.env, pkg.id)
+        env: expandEnvironmentVariables(pkg.env, pkg.id, safeDiagnostics)
       }));
     }
 
@@ -802,7 +804,7 @@ export class PackageRegistry {
           transportType,
           command: extConfig.command,
           args: extConfig.args,
-          env: expandEnvironmentVariables(extConfig.env, id),
+          env: expandEnvironmentVariables(extConfig.env, id, safeDiagnostics),
           cwd: extConfig.cwd,
           base_url: baseUrl,
           auth: extConfig.auth,
@@ -834,6 +836,7 @@ export class PackageRegistry {
     const { mergedConfig, loadOrder } = await PackageRegistry.loadMergedConfigFiles(configPaths);
 
     const registry = new PackageRegistry(mergedConfig);
+    registry.configPaths = configPaths.map((configPath) => path.resolve(configPath));
 
     // Initialize security policy
     const securityConfig: SecurityConfig = mergedConfig.security || {};
@@ -905,8 +908,9 @@ export class PackageRegistry {
   private static validateAndFilterPackages(
     mergedConfig: SuperMcpConfig,
     normalized: PackageConfig[],
+    safeDiagnostics = false,
   ): { packages: PackageConfig[]; skipped: SkippedPackage[]; disabledServers: string[] } {
-    const validationResult = PackageRegistry.validateConfig(normalized);
+    const validationResult = PackageRegistry.validateConfig(normalized, safeDiagnostics);
     let packages = validationResult.valid;
 
     const disabledServers = mergedConfig.disabledServers || [];
@@ -939,6 +943,13 @@ export class PackageRegistry {
    * logged. Never throws.
    */
   async refreshPackageEnvFromConfigFiles(configPaths: string[]): Promise<PackageEnvRefreshResult> {
+    const refresh = this.envRefreshQueue.then(() => this.refreshPackageEnvFromConfigFilesNow(configPaths));
+    // The caller receives the rejection; subsequent refreshes must still run.
+    this.envRefreshQueue = refresh.then(() => undefined, () => undefined);
+    return refresh;
+  }
+
+  private async refreshPackageEnvFromConfigFilesNow(configPaths: string[]): Promise<PackageEnvRefreshResult> {
     if (this.terminal) {
       return { status: "ok", updated: [], notApplied: [] };
     }
@@ -949,14 +960,16 @@ export class PackageRegistry {
       ({ mergedConfig } = await PackageRegistry.loadMergedConfigFiles(configPaths));
       fresh = PackageRegistry.validateAndFilterPackages(
         mergedConfig,
-        this.normalizeConfig(mergedConfig),
+        this.normalizeConfig(mergedConfig, true),
+        true,
       ).packages;
-    } catch (error) {
-      logger.error("Failed to re-read package configs after a config change, keeping cached configs", {
-        error: error instanceof Error ? error.message : String(error),
-      });
+    } catch {
+      // Parser and I/O errors can quote credentials from config content.
+      logger.error("Failed to re-read package configs after a config change, keeping cached configs");
       return { status: "failed" };
     }
+
+    if (this.terminal) return { status: "ok", updated: [], notApplied: [] };
 
     const freshById = new Map(fresh.map((pkg) => [pkg.id, pkg]));
     const updated: PackageEnvRefreshResult & { status: "ok" } = { status: "ok", updated: [], notApplied: [] };
@@ -1324,7 +1337,7 @@ export class PackageRegistry {
    * - http transport: base_url is required and must be a valid URL
    * - visibility: if present, must be "default" or "hidden"
    */
-  private static validateConfig(packages: PackageConfig[]): ValidationResult {
+  private static validateConfig(packages: PackageConfig[], safeDiagnostics = false): ValidationResult {
     const valid: PackageConfig[] = [];
     const skipped: SkippedPackage[] = [];
 
@@ -1365,7 +1378,7 @@ export class PackageRegistry {
       // Use shared validation helper for remaining field checks
       const fieldError = PackageRegistry.validatePackageFields(pkg);
       if (fieldError) {
-        logger.warn(`Skipping invalid package: ${fieldError}`, { package_id: pkgId });
+        logger.warn(safeDiagnostics ? "Skipping invalid package: invalid field" : `Skipping invalid package: ${fieldError}`, { package_id: pkgId });
         skipped.push({ id: pkgId, reason: fieldError });
         continue;
       }
@@ -2043,10 +2056,28 @@ export class PackageRegistry {
     }
   }
 
+  private async configForNextSpawn(packageId: string, config: PackageConfig): Promise<PackageConfig> {
+    if (config.transport === "stdio" && this.configPaths) {
+      await this.refreshPackageEnvFromConfigFiles(this.configPaths);
+      this.assertAdmissionOpen(packageId);
+      const refreshed = this.getPackage(packageId);
+      if (!refreshed) throw new Error(`Package '${packageId}' is no longer configured`);
+      return refreshed;
+    }
+    return config;
+  }
+
   private async createAndConnectClientWithOneRetry(
     packageId: string,
     config: PackageConfig,
   ): Promise<McpClient> {
+    // Watcher delivery is debounced. Refresh at spawn admission as well so a
+    // reap/crash/restart immediately after persistence cannot reuse stale env.
+    // getClient owns clientPromises throughout this await, so concurrent callers
+    // still share one spawn. An already connecting/live child stays untouched.
+    if (this.configPaths && config.transport === "stdio") {
+      config = await this.configForNextSpawn(packageId, config);
+    }
     let firstClient: McpClient | undefined;
     try {
       const outcome = await this.createAndConnectClient(
@@ -2105,6 +2136,9 @@ export class PackageRegistry {
 
       let secondClient: McpClient | undefined;
       try {
+        if (this.configPaths && config.transport === "stdio") {
+          config = await this.configForNextSpawn(packageId, config);
+        }
         const outcome = await this.createAndConnectClient(
           packageId,
           config,
