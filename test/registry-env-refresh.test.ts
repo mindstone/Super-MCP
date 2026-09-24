@@ -351,4 +351,34 @@ describe('PackageRegistry.refreshPackageEnvFromConfigFiles', () => {
       await watcher.stop();
     }
   });
+  it('the shared config loader never logs parser text, for root or referenced files, at startup or on refresh (FR-F1)', async () => {
+    // Kept short so V8 quotes the whole fragment in its parser message.
+    const fragment = 'sk-f1q';
+    const malformed = `{"t":${fragment}}`;
+    expect(() => JSON.parse(malformed)).toThrow(fragment);
+    const referenced = path.join(dir, 'referenced.json');
+    const withReference = JSON.stringify({ ...JSON.parse(configWith()), configPaths: ['referenced.json'] });
+
+    // Refresh path: a malformed referenced file, then a malformed root file.
+    await fs.writeFile(referenced, malformed);
+    await fs.writeFile(configPath, withReference);
+    loggerCalls.length = 0;
+    expect((await registry.refreshPackageEnvFromConfigFiles([configPath])).status).toBe('failed');
+    await fs.writeFile(configPath, malformed);
+    expect((await registry.refreshPackageEnvFromConfigFiles([configPath])).status).toBe('failed');
+    expect(registry.getPackage('QuickBooks')?.env?.QUICKBOOKS_REFRESH_TOKEN).toBe(OLD_TOKEN);
+
+    // Startup path: the same loader, which still throws.
+    await expect(PackageRegistry.fromConfigFiles([configPath])).rejects.toThrow();
+    await fs.writeFile(configPath, withReference);
+    await expect(PackageRegistry.fromConfigFiles([configPath])).rejects.toThrow();
+
+    const logged = loggerCalls.map((args) => JSON.stringify(args, (_key, value) =>
+      value instanceof Error ? { name: value.name, message: value.message, stack: value.stack } : value,
+    ));
+    expect(logged.length).toBeGreaterThan(0);
+    for (const entry of logged) expect(entry).not.toContain(fragment);
+    expect(logged.join('\n')).toContain('Failed to load config file');
+    expect(logged.join('\n')).toContain(referenced);
+  });
 });

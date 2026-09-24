@@ -228,6 +228,29 @@ function preserveFirstAttemptDiagnostics(
  * Supports ${VAR} syntax for environment variable substitution.
  * Returns undefined if input is undefined to maintain compatibility.
  */
+/**
+ * A config file failed to load. The message is unchanged from before (the
+ * caller at startup reports it); the other fields are safe to log, because
+ * the message can quote file content, and file content holds credentials.
+ */
+class ConfigLoadError extends Error {
+  readonly causeName: string | undefined;
+  readonly causeCode: string | undefined;
+
+  constructor(
+    readonly category: "not_found" | "read_failed" | "invalid_json" | "circular_reference" | "max_depth",
+    readonly filePath: string,
+    cause: unknown,
+    message: string,
+  ) {
+    super(message);
+    this.name = "Error";
+    this.causeName = cause instanceof Error ? cause.name : undefined;
+    const code = (cause as { code?: unknown } | undefined)?.code;
+    this.causeCode = typeof code === "string" ? code : undefined;
+  }
+}
+
 /** Outcome of `PackageRegistry.refreshPackageEnvFromConfigFiles`. */
 export type PackageEnvRefreshResult =
   | { status: "failed" }
@@ -1056,7 +1079,7 @@ export class PackageRegistry {
       // Check for circular references
       if (visitedPaths.has(normalizedPath)) {
         const chain = [...loadOrder, normalizedPath].join('\n  -> ');
-        throw new Error(
+        throw new ConfigLoadError("circular_reference", normalizedPath, undefined,
           `Circular configPaths reference detected:\n  ${chain}\n` +
           `Config "${normalizedPath}" was already loaded.`
         );
@@ -1064,7 +1087,7 @@ export class PackageRegistry {
 
       // Check max depth
       if (depth > MAX_CONFIG_DEPTH) {
-        throw new Error(
+        throw new ConfigLoadError("max_depth", normalizedPath, undefined,
           `Maximum config nesting depth (${MAX_CONFIG_DEPTH}) exceeded.\n` +
           `This may indicate circular references or excessively deep nesting.\n` +
           `Load chain: ${loadOrder.join(' -> ')}`
@@ -1081,9 +1104,9 @@ export class PackageRegistry {
       } catch (error: any) {
         const context = referencedFrom ? `\nReferenced from: ${referencedFrom}` : '';
         if (error.code === 'ENOENT') {
-          throw new Error(`Config file not found: ${normalizedPath}${context}`);
+          throw new ConfigLoadError("not_found", normalizedPath, error, `Config file not found: ${normalizedPath}${context}`);
         }
-        throw new Error(`Failed to read config file ${normalizedPath}: ${error.message}${context}`);
+        throw new ConfigLoadError("read_failed", normalizedPath, error, `Failed to read config file ${normalizedPath}: ${error.message}${context}`);
       }
 
       let config: SuperMcpConfig;
@@ -1091,7 +1114,7 @@ export class PackageRegistry {
         config = JSON.parse(configData);
       } catch (error: any) {
         const context = referencedFrom ? `\nReferenced from: ${referencedFrom}` : '';
-        throw new Error(`Invalid JSON in config file ${normalizedPath}: ${error.message}${context}`);
+        throw new ConfigLoadError("invalid_json", normalizedPath, error, `Invalid JSON in config file ${normalizedPath}: ${error.message}${context}`);
       }
 
       logger.info("Loading config file", { 
@@ -1283,7 +1306,8 @@ export class PackageRegistry {
           if (typeof refPath !== 'string' || !refPath.trim()) {
             logger.warn("Invalid configPaths entry (not a string), skipping", {
               config_file: normalizedPath,
-              entry: refPath
+              // Config values can be credentials: log the shape, not the value.
+              entry_type: Array.isArray(refPath) ? "array" : typeof refPath,
             });
             continue;
           }
@@ -1309,10 +1333,16 @@ export class PackageRegistry {
     for (const configPath of configPaths) {
       try {
         await loadConfigFile(configPath, null, 0);
-      } catch (error: any) {
-        logger.error("Failed to load config file", { 
-          path: configPath, 
-          error: error.message 
+      } catch (error: unknown) {
+        // Static fields only: a parser or I/O message can quote config text,
+        // and config text holds credentials. Callers get the full error.
+        const failure = error instanceof ConfigLoadError ? error : undefined;
+        logger.error("Failed to load config file", {
+          path: configPath,
+          failed_file: failure?.filePath ?? path.resolve(configPath),
+          reason: failure?.category ?? "unknown",
+          error_name: failure?.causeName ?? (error instanceof Error ? error.name : typeof error),
+          ...(failure?.causeCode ? { error_code: failure.causeCode } : {}),
         });
         throw error;
       }
@@ -2058,6 +2088,11 @@ export class PackageRegistry {
 
   private async configForNextSpawn(packageId: string, config: PackageConfig): Promise<PackageConfig> {
     if (config.transport === "stdio" && this.configPaths) {
+      // Deliberate exception to "never spawn with stale env": if the refresh
+      // fails (a config file is unreadable or malformed), it returns
+      // {status:"failed"} and the next spawn uses the cached config, as
+      // startup would have; the failure is logged. Failing closed here would
+      // stop every connector over one hand-edited config file.
       await this.refreshPackageEnvFromConfigFiles(this.configPaths);
       this.assertAdmissionOpen(packageId);
       const refreshed = this.getPackage(packageId);
