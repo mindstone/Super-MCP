@@ -1265,6 +1265,7 @@ export async function handleUseTool(
     _rebel_staged?: boolean;
     _rebel_staged_message?: string;
     _rebel_attempt_scope?: string;
+    _rebel_meeting_dispatch_capability?: string;
   },
   registry: PackageRegistry,
   catalog: Catalog,
@@ -1298,6 +1299,7 @@ export async function handleUseTool(
     _rebel_staged: _,
     _rebel_staged_message: __,
     _rebel_attempt_scope: ___,
+    _rebel_meeting_dispatch_capability: ____,
     ...cleanForContinuation
   } = input;
   if (cleanForContinuation.output_offset !== undefined) {
@@ -1335,6 +1337,7 @@ export async function handleUseTool(
     _rebel_staged,
     _rebel_staged_message,
     _rebel_attempt_scope,
+    _rebel_meeting_dispatch_capability,
     ...cleanInput
   } = input;
   // Attribution for the attempt counter only. A non-empty string is a caller we
@@ -1946,7 +1949,11 @@ export async function handleUseTool(
     // reaper cannot close the client mid-flight and a transport that closed
     // before any bytes were sent is re-established (no auto-retry on mid-call
     // close). Replaces the separate `getClient` + `client.callTool` seam.
-    let toolResult = await registry.callTool(package_id, tool_id, args);
+    const connectorArgs = package_id === 'RebelMeetings' && tool_id === 'rebel_meetings_schedule_bot' &&
+      typeof _rebel_meeting_dispatch_capability === 'string' && _rebel_meeting_dispatch_capability.length > 0
+      ? { ...args, _rebelMeetingDispatchCapability: _rebel_meeting_dispatch_capability }
+      : args;
+    let toolResult = await registry.callTool(package_id, tool_id, connectorArgs);
     const downstreamIsError = isRecord(toolResult) && toolResult.isError === true;
     // Capture spec-passthrough fields off the inner tool_result BEFORE any
     // truncation/safety-net/materialisation rewrites. See

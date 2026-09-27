@@ -44,6 +44,8 @@ function createUseToolMocks(toolResult: unknown) {
   const getTool = (packageId: string, toolId: string) =>
     packageId === "google_workspace_demo" && toolId === "compose_workspace_email"
       ? { packageId, tool: { name: toolId, inputSchema: { type: "object" } }, schemaHash: "" }
+      : packageId === "RebelMeetings" && toolId === "rebel_meetings_schedule_bot"
+      ? { packageId, tool: { name: toolId, inputSchema: { type: "object" } }, schemaHash: "" }
       : undefined;
   const mockCatalog = {
     ensurePackageLoaded: vi.fn().mockResolvedValue(undefined),
@@ -96,6 +98,21 @@ describe("useTool passthrough contract", () => {
     process.env.REBEL_WORKSPACE_PATH = originalWorkspacePath;
     await fs.rm(tempWorkspace, { recursive: true, force: true });
     vi.restoreAllMocks();
+  });
+
+  it('passes the host meeting capability only to the connector, never into result args', async () => {
+    const secret = 'private-execution-capability';
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createUseToolMocks({ content: [{ type: 'text', text: 'ok' }] });
+    const response = await handleUseTool({
+      package_id: 'RebelMeetings', tool_id: 'rebel_meetings_schedule_bot',
+      args: { meetingUrl: 'https://zoom.us/j/123' },
+      _rebel_meeting_dispatch_capability: secret,
+    }, mockRegistry, mockCatalog, mockValidator);
+    expect(mockClient.callTool).toHaveBeenCalledWith('rebel_meetings_schedule_bot', {
+      meetingUrl: 'https://zoom.us/j/123', _rebelMeetingDispatchCapability: secret,
+    });
+    expect(JSON.stringify(response)).not.toContain(secret);
+    expect(parseEnvelope(response).args_used).toEqual({ meetingUrl: 'https://zoom.us/j/123' });
   });
 
   it("Contract — JSON use_tool envelopes expose package_id within the consumer prefix window", async () => {

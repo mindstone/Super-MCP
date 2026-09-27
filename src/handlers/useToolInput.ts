@@ -26,6 +26,7 @@ type UseToolHandlerInput = UseToolInput & {
    * useTool.ts.
    */
   _rebel_attempt_scope?: string;
+  _rebel_meeting_dispatch_capability?: string;
 };
 
 const RECOVERY_GUIDANCE =
@@ -65,6 +66,7 @@ const useToolEnvelopeSchema = z.object({
   _rebel_staged: z.unknown().optional(),
   _rebel_staged_message: z.unknown().optional(),
   _rebel_attempt_scope: z.unknown().optional(),
+  _rebel_meeting_dispatch_capability: z.unknown().optional(),
 }).passthrough();
 
 function getValueKind(value: unknown): string {
