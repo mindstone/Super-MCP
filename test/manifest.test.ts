@@ -259,6 +259,40 @@ describe("Catalog.computePackageEmbeddingHash", () => {
       expect(hashFor(structuredClone(schema))).toBe(hashFor(structuredClone(schema)));
     });
   });
+
+  // A cached tool without a schema hash contributes an empty one: the package
+  // hash is still deterministic, and it differs from the hash of the same tool
+  // once its schema hash is known.
+  describe("a cached tool without a schema hash", () => {
+    function hashWithSchemaHash(schemaHash: string | undefined): string {
+      const registry = createMockRegistry([
+        { id: "alpha", name: "Alpha", transport: "stdio", visibility: "default" },
+      ]);
+      const catalog = new Catalog(registry);
+      seedCatalogPackage(catalog, "alpha", [
+        {
+          name: "search",
+          description: "Search records",
+          inputSchema: { type: "object", properties: { query: { type: "string" } } },
+        },
+      ]);
+      (catalog as any).cache.get("alpha").tools[0].schemaHash = schemaHash;
+      return catalog.computePackageEmbeddingHash("alpha");
+    }
+
+    it("hashes deterministically", () => {
+      const withoutHash = hashWithSchemaHash(undefined);
+
+      expect(withoutHash).toMatch(/^[a-f0-9]{64}$/);
+      expect(hashWithSchemaHash(undefined)).toBe(withoutHash);
+      // An empty string and a missing hash are the same fallback.
+      expect(hashWithSchemaHash("")).toBe(withoutHash);
+    });
+
+    it("differs from the same tool with a schema hash", () => {
+      expect(hashWithSchemaHash("sha256:search")).not.toBe(hashWithSchemaHash(undefined));
+    });
+  });
 });
 
 describe("/api/tools package filtering", () => {

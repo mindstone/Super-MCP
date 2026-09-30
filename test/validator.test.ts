@@ -2334,6 +2334,32 @@ describe("use_tool validation errors report the argument keys the caller sent", 
     expect(error.data.provided_args).toEqual(["channel", "thread_ts"]);
   });
 
+  it("lists the keys the caller wrote when args arrive as a JSON string", async () => {
+    // A stringified `args` object is parsed at the dispatch boundary, before the
+    // keys are captured, so the keys are the ones inside the string.
+    const error = await runValidationFailure({
+      schema: threadSchema,
+      args: JSON.stringify({ channel: "C1", thread_ts: "1.0" }),
+    });
+
+    const repairTicket = expectRepairTicket(error);
+    expect(repairTicket.unknown_fields).toEqual(["thread_ts"]);
+    expect(repairTicket.missing_required).toEqual(["ts"]);
+    expect(error.data.provided_args).toEqual(["channel", "thread_ts"]);
+  });
+
+  it("reports the sent key, not its alias target, when a JSON-string aliased call then fails", async () => {
+    const error = await runValidationFailure({
+      schema: aliasedSearchSchema,
+      args: JSON.stringify({ limit: 5 }),
+      packageId: "Slack",
+      toolId: "search_slack_messages",
+    });
+
+    expectRepairTicket(error);
+    expect(error.data.provided_args).toEqual(["limit"]);
+  });
+
   it("reports the sent key, not its alias target, when an aliased call then fails", async () => {
     // `limit` is rewritten to `count` for this tool before validation; the call
     // still fails because `query` is missing.
