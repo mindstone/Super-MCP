@@ -237,3 +237,55 @@ describe("search_tools BM25 cache and build coordination", () => {
     expect(bm25Factory).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("search_tools results carry argument names", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    vi.clearAllMocks();
+  });
+
+  it("returns each tool's schema properties and args_skeleton", async () => {
+    const { handleSearchTools } = await import("../searchTools.js");
+    const { argsSkeleton } = await import("../../summarize.js");
+    const inputSchema = {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        limit: { type: "integer" },
+        include_archived: { type: "boolean" },
+      },
+      required: ["query"],
+    };
+    const registry = createRegistry(["pkg-a"]);
+    const catalog = createCatalogStub({
+      etag: () => "etag-args",
+      getPackageTools: (packageId) => [
+        {
+          ...createCachedTool(packageId, "find_records"),
+          tool: {
+            name: "find_records",
+            description: "Find records",
+            inputSchema,
+          },
+          argsSkeleton: argsSkeleton(inputSchema),
+        },
+      ],
+    });
+
+    const result = await handleSearchTools({ query: "records", limit: 5 }, registry, catalog);
+    const parsed = JSON.parse(result.content[0].text) as {
+      results: Array<{
+        tool_id: string;
+        schema?: { properties?: Record<string, unknown>; required?: string[] };
+        args_skeleton?: Record<string, unknown>;
+      }>;
+    };
+
+    expect(parsed.results).toHaveLength(1);
+    const [tool] = parsed.results;
+    expect(tool?.tool_id).toBe("pkg-a__find_records");
+    expect(Object.keys(tool?.schema?.properties ?? {})).toEqual(["query", "limit", "include_archived"]);
+    expect(tool?.schema?.required).toEqual(["query"]);
+    expect(Object.keys(tool?.args_skeleton ?? {})).toEqual(["query", "limit", "include_archived"]);
+  });
+});

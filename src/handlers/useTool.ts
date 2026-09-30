@@ -835,7 +835,7 @@ type MisplacedParamMap = Record<string, MisplacedParamFix>;
  *
  * Two callers supply the candidate key set:
  *   - the stripping path passes `strippedArgs` (the validator's pre-strip key
- *     names — NOT the post-strip `provided_args`, because the validator deletes
+ *     names — NOT the keys left on `args`, because the validator deletes
  *     unknown keys in place);
  *   - the declared-property gate passes the keys IT computed (residue R1), because
  *     on a permissive schema nothing is stripped and `strippedArgs` is empty.
@@ -1582,6 +1582,12 @@ export async function handleUseTool(
   // the validate-before-send auto-repair seam (see below). Runs after R1/R2/R5 so
   // we know the final package/tool id. Target-wins on collision. See
   // super-mcp/src/config/paramAliasMap.ts for the (shrunk) map and rationale.
+  //
+  // `sentArgKeys` is the caller's own call shape, captured BEFORE the alias
+  // rewrite here and BEFORE the validator's in-place strip below. Every
+  // `provided_args` on a validation error reads it, so the error names the keys
+  // that were actually sent — including the ones that were rejected.
+  const sentArgKeys = isRecord(args) ? Object.keys(args) : [];
   {
     const { args: rewritten, breadcrumbs } = normalizeArgKeys(args, {
       handler: "use_tool",
@@ -1748,8 +1754,8 @@ export async function handleUseTool(
       data: {
         package_id,
         tool_id,
+        provided_args: sentArgKeys,
         errors: validationResult.errors,
-        provided_args: args ? Object.keys(args) : [],
         repair_ticket: repairTicket,
       },
     };
@@ -1892,8 +1898,8 @@ export async function handleUseTool(
       data: {
         package_id,
         tool_id,
+        provided_args: sentArgKeys,
         errors: renameValidationErrors,
-        provided_args: isRecord(args) ? Object.keys(args) : [],
         repair_ticket: repairTicket,
       },
     };
@@ -2258,6 +2264,9 @@ export async function handleUseTool(
         data: {
           package_id,
           tool_id,
+          // `provided_args`: the keys the caller sent. `args_provided`: the keys
+          // dispatched downstream, after alias and auto-repair rewrites.
+          provided_args: sentArgKeys,
           duration_ms: duration,
           args_provided: providedArgs,
           mcp_error_code: error.code,

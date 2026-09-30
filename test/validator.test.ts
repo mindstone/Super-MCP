@@ -2300,3 +2300,129 @@ describe("REBEL-7JD: declared-property misplacement gate", () => {
     expect(callTool).toHaveBeenCalledTimes(1);
   });
 });
+
+describe("use_tool validation errors report the argument keys the caller sent", () => {
+  // `provided_args` is the caller's own call shape. It is captured before the
+  // per-tool key aliases rewrite `args` and before the validator strips unknown
+  // keys in place, so a consumer of the error can see which key was rejected.
+  const threadSchema = {
+    type: "object",
+    properties: {
+      channel: { type: "string" },
+      ts: { type: "string" },
+    },
+    required: ["channel", "ts"],
+  };
+  const aliasedSearchSchema = {
+    type: "object",
+    properties: {
+      query: { type: "string" },
+      count: { type: "integer" },
+    },
+    required: ["query"],
+  };
+
+  it("keeps a stripped unknown key in provided_args", async () => {
+    const error = await runValidationFailure({
+      schema: threadSchema,
+      args: { channel: "C1", thread_ts: "1.0" },
+    });
+
+    const repairTicket = expectRepairTicket(error);
+    expect(repairTicket.unknown_fields).toEqual(["thread_ts"]);
+    expect(repairTicket.missing_required).toEqual(["ts"]);
+    expect(error.data.provided_args).toEqual(["channel", "thread_ts"]);
+  });
+
+  it("reports the sent key, not its alias target, when an aliased call then fails", async () => {
+    // `limit` is rewritten to `count` for this tool before validation; the call
+    // still fails because `query` is missing.
+    const error = await runValidationFailure({
+      schema: aliasedSearchSchema,
+      args: { limit: 5 },
+      packageId: "Slack",
+      toolId: "search_slack_messages",
+    });
+
+    const repairTicket = expectRepairTicket(error);
+    expect(repairTicket.missing_required).toEqual(["query"]);
+    expect(repairTicket.unknown_fields).toEqual([]);
+    expect(error.data.provided_args).toEqual(["limit"]);
+    expect(error.data.provided_args).not.toContain("count");
+  });
+
+  it("places provided_args before errors and leaves the message text unchanged", async () => {
+    const packageId = nextId("pkg");
+    const toolId = nextId("tool");
+    const error = await runValidationFailure({
+      schema: aliasedSearchSchema,
+      args: {},
+      packageId,
+      toolId,
+    });
+
+    expectRepairTicket(error);
+    expect(Object.keys(error.data)).toEqual([
+      "package_id",
+      "tool_id",
+      "provided_args",
+      "errors",
+      "repair_ticket",
+    ]);
+    expect(error.data.provided_args).toEqual([]);
+    expect(error.message).toBe(
+      `Argument validation failed for tool '${toolId}' in package '${packageId}'. Missing required: query.`,
+    );
+  });
+
+  it("places provided_args before errors on the misplaced meta-param ticket", async () => {
+    const { registry, catalog, validator } = createUseToolDeps({
+      type: "object",
+      properties: { query: { type: "string" } },
+      additionalProperties: true,
+    });
+
+    let error: any;
+    try {
+      await handleUseTool(
+        {
+          package_id: nextId("pkg"),
+          tool_id: nextId("tool"),
+          args: { query: "x", result_id: "r1" },
+        },
+        registry as any,
+        catalog as any,
+        validator,
+      );
+      throw new Error("Expected the misplacement gate to reject the call");
+    } catch (caught) {
+      error = caught;
+    }
+
+    expect(error.code).toBe(ERROR_CODES.ARG_VALIDATION_FAILED);
+    expect(error.data?.repair_ticket?.misplaced_params).toEqual(["result_id"]);
+    expect(error.data?.provided_args).toEqual(["query", "result_id"]);
+    expect(Object.keys(error.data)).toEqual([
+      "package_id",
+      "tool_id",
+      "provided_args",
+      "errors",
+      "repair_ticket",
+    ]);
+  });
+
+  it("adds provided_args to a downstream rejection and keeps args_provided as dispatched", async () => {
+    const error = await runDownstreamInvalidParams({
+      schema: aliasedSearchSchema,
+      args: { query: "hello", limit: 5 },
+      packageId: "Slack",
+      toolId: "search_slack_messages",
+    });
+
+    expectRepairTicket(error);
+    // What the caller sent.
+    expect(error.data.provided_args).toEqual(["query", "limit"]);
+    // What was dispatched downstream, after the alias rewrite (unchanged key).
+    expect(error.data.args_provided).toEqual(["query", "count"]);
+  });
+});

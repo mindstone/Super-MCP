@@ -214,6 +214,51 @@ describe("Catalog.computePackageEmbeddingHash", () => {
 
     expect(secondHash).toBe(firstHash);
   });
+
+  // The per-tool schema hash is part of the package hash, so a consumer that
+  // stores schemas per package refreshes when a schema changes without any
+  // parameter being added, removed or renamed.
+  describe("schema changes that keep the parameter names", () => {
+    function hashFor(inputSchema: unknown): string {
+      const registry = createMockRegistry([
+        { id: "alpha", name: "Alpha", transport: "stdio", visibility: "default" },
+      ]);
+      const catalog = new Catalog(registry);
+      const committed = catalog.commitReady(
+        "alpha",
+        [{ name: "search", description: "Search records", inputSchema }],
+        catalog.getConfigurationGeneration(),
+      );
+      expect(committed).toBe(true);
+      return catalog.computePackageEmbeddingHash("alpha");
+    }
+
+    const properties = { query: { type: "string" }, limit: { type: "number" } };
+
+    it("changes when only `required` changes", () => {
+      const optionalQuery = hashFor({ type: "object", properties });
+      const requiredQuery = hashFor({ type: "object", properties, required: ["query"] });
+
+      expect(optionalQuery).toMatch(/^[a-f0-9]{64}$/);
+      expect(requiredQuery).not.toBe(optionalQuery);
+    });
+
+    it("changes when only a parameter type changes", () => {
+      const numberLimit = hashFor({ type: "object", properties });
+      const integerLimit = hashFor({
+        type: "object",
+        properties: { ...properties, limit: { type: "integer" } },
+      });
+
+      expect(integerLimit).not.toBe(numberLimit);
+    });
+
+    it("is equal for identical catalogs", () => {
+      const schema = { type: "object", properties, required: ["query"] };
+
+      expect(hashFor(structuredClone(schema))).toBe(hashFor(structuredClone(schema)));
+    });
+  });
 });
 
 describe("/api/tools package filtering", () => {

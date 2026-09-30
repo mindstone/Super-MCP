@@ -526,6 +526,10 @@ export class Catalog implements CatalogView {
         cachedTool.tool?.name || "",
         cachedTool.summary || cachedTool.tool?.description || "",
         paramNames,
+        // Schema hash last: a change to `required`, a type or an enum keeps the
+        // parameter names but must still mark the package as changed, so
+        // consumers that store schemas per package refresh them.
+        cachedTool.schemaHash || "",
       ].join(":");
     }).sort();
 
