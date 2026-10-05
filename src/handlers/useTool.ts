@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { extractRecoveryEvidenceV1, stripConnectorRecoveryEvidence, type RecoveryEvidenceV1 } from "./recoveryEvidence.js";
 import {
   UseToolInput,
   UseToolOutput,
@@ -430,6 +431,8 @@ interface SuperMcpResolution {
 }
 
 interface SuperMcpTelemetryMeta {
+  /** Constructed result control evidence; never logged or classified upstream. */
+  recoveryEvidenceV1?: RecoveryEvidenceV1;
   packageId: string;
   toolId: string;
   durationMs: number;
@@ -509,6 +512,7 @@ function applyOuterMeta(
       packageId: options.superMcp.packageId,
       toolId: options.superMcp.toolId,
       durationMs: options.superMcp.durationMs,
+      ...(options.superMcp.recoveryEvidenceV1 ? { recoveryEvidenceV1: options.superMcp.recoveryEvidenceV1 } : {}),
       ...(options.superMcp.outputChars !== undefined ? { outputChars: options.superMcp.outputChars } : {}),
       ...(options.superMcp.truncated !== undefined ? { truncated: options.superMcp.truncated } : {}),
       ...(options.superMcp.resultId !== undefined ? { resultId: options.superMcp.resultId } : {}),
@@ -1955,6 +1959,8 @@ export async function handleUseTool(
       : args;
     let toolResult = await registry.callTool(package_id, tool_id, connectorArgs);
     const downstreamIsError = isRecord(toolResult) && toolResult.isError === true;
+    const recoveryEvidenceV1 = extractRecoveryEvidenceV1(toolResult);
+    toolResult = stripConnectorRecoveryEvidence(toolResult);
     // Capture spec-passthrough fields off the inner tool_result BEFORE any
     // truncation/safety-net/materialisation rewrites. See
     // docs/project/SUPER_MCP_PASSTHROUGH_CONTRACT.md.
@@ -2019,6 +2025,7 @@ export async function handleUseTool(
               packageId: package_id,
               toolId: tool_id,
               durationMs: duration,
+              ...(recoveryEvidenceV1 ? { recoveryEvidenceV1 } : {}),
               outputChars: envelopeJson.length,
               ...(normalisations.length > 0 ? { normalisations: [...normalisations] } : {}),
               ...(packageResolution ? { packageResolution } : {}),
@@ -2205,6 +2212,7 @@ export async function handleUseTool(
         packageId: package_id,
         toolId: tool_id,
         durationMs: duration,
+        ...(recoveryEvidenceV1 ? { recoveryEvidenceV1 } : {}),
         outputChars: typeof result.telemetry.output_chars === "number"
           ? result.telemetry.output_chars
           : outputJson.length,
