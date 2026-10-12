@@ -69,6 +69,7 @@ import {
   normalizeNoteText,
   type LiveToolNote,
   type ToolNoteEntry,
+  type ToolNotesStore,
 } from "../src/toolNotes.js";
 import { ERROR_CODES } from "../src/types.js";
 
@@ -159,12 +160,22 @@ function pastIso(days: number, from = new Date()): string {
   return new Date(from.getTime() - days * 24 * 60 * 60 * 1000).toISOString();
 }
 
+// Filling the store to its global cap is MAX_NOTES_GLOBAL serial locked
+// writes: about 0.1 s here, but over 5 s (Vitest's default) on a loaded
+// two-core CI runner, where it timed out. The work is real, so the
+// budget is set to fit it rather than shrinking what the test proves.
+const CAPACITY_TEST_TIMEOUT_MS = 30_000;
+
 describe("ToolNotesStore", () => {
   let tempDir: string;
   let notesFile: string;
   let now: Date;
+  // Every store a test makes, so teardown can wait out the compaction a
+  // readSnapshot leaves running before it deletes the directory.
+  let stores: ToolNotesStore[];
 
   beforeEach(async () => {
+    stores = [];
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "super-mcp-tool-notes-"));
     notesFile = path.join(tempDir, "tool-notes.json");
     now = new Date("2026-08-17T12:00:00.000Z");
@@ -176,11 +187,14 @@ describe("ToolNotesStore", () => {
   });
 
   afterEach(async () => {
+    await Promise.all(stores.map((subject) => subject.whenIdle()));
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
   function store(filePath = notesFile) {
-    return createToolNotesStore(filePath, () => now);
+    const subject = createToolNotesStore(filePath, () => now);
+    stores.push(subject);
+    return subject;
   }
 
   function liveEntry(note: string, schemaHash = "hash-1"): ToolNoteEntry {
@@ -384,6 +398,29 @@ describe("ToolNotesStore", () => {
     expect(await subject.readSnapshot()).toEqual([]);
   });
 
+  it("finishes the compaction a read started before whenIdle resolves", async () => {
+    const subject = store();
+    await writeRaw(
+      JSON.stringify({
+        version: STORE_VERSION,
+        notes: {
+          [makeToolNoteKey("pkg", "tool")]: liveEntry(
+            "hidden",
+            "h".repeat(MAX_SCHEMA_HASH_CHARS + 1),
+          ),
+        },
+      }),
+    );
+    expect(await subject.readSnapshot()).toEqual([]);
+
+    await subject.whenIdle();
+
+    expect(await readPersistedNotes()).toEqual({});
+    await expect(fs.access(`${notesFile}.lock`)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+  });
+
   it("rejects new keys at global capacity without evicting live notes", async () => {
     const subject = store();
     for (let index = 0; index < MAX_NOTES_GLOBAL; index += 1) {
@@ -408,7 +445,7 @@ describe("ToolNotesStore", () => {
     expect(snapshot).toHaveLength(MAX_NOTES_GLOBAL);
     expect(findNote(snapshot, "pkg_0", "tool_0")?.note).toBe("note 0");
     expect(findNote(snapshot, "pkg_overflow", "overflow")).toBeUndefined();
-  });
+  }, CAPACITY_TEST_TIMEOUT_MS);
 
   it("allows replacement and deletion at capacity, then permits a freed slot", async () => {
     const subject = store();

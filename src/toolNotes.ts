@@ -287,10 +287,26 @@ export function createToolNotesStore(
 }
 
 export class ToolNotesStore {
+  /** Best-effort compactions a read started and nobody awaits; see whenIdle. */
+  private readonly backgroundWork = new Set<Promise<void>>();
+
   constructor(
     private readonly filePath: string,
     private readonly clock: () => Date = () => new Date(),
   ) {}
+
+  /**
+   * Resolves once no compaction started by readSnapshot is still running.
+   * readSnapshot does not wait for its compaction, so anything that removes
+   * the notes directory afterwards (a test's teardown, a shutdown) must wait
+   * here first, or the compaction's lock and temp file land in a directory
+   * being deleted.
+   */
+  async whenIdle(): Promise<void> {
+    while (this.backgroundWork.size > 0) {
+      await Promise.allSettled([...this.backgroundWork]);
+    }
+  }
 
   async readSnapshot(): Promise<LiveToolNote[]> {
     const state = await this.readFileState();
@@ -572,16 +588,21 @@ export class ToolNotesStore {
   private scheduleBestEffortCompaction(
     observation: CompactionObservation,
   ): void {
-    void this.compactEntries([], observation).catch((error) => {
-      logger.warn(
-        "tool notes compaction failed; read snapshot remains usable",
-        {
-          file_path: this.filePath,
-          error_code: getErrorCode(error),
-          error_name: error instanceof Error ? error.name : typeof error,
-        },
-      );
-    });
+    const work = this.compactEntries([], observation)
+      .catch((error) => {
+        logger.warn(
+          "tool notes compaction failed; read snapshot remains usable",
+          {
+            file_path: this.filePath,
+            error_code: getErrorCode(error),
+            error_name: error instanceof Error ? error.name : typeof error,
+          },
+        );
+      })
+      .finally(() => {
+        this.backgroundWork.delete(work);
+      });
+    this.backgroundWork.add(work);
   }
 
   /**
