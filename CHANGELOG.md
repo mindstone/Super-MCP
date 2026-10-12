@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+### Added
+- **`ToolNotesStore.whenIdle()`** resolves once any compaction a `readSnapshot()` started in the background has finished. `readSnapshot()` still does not wait for it; call `whenIdle()` before deleting the notes directory (tests, shutdown) so the compaction's lock and temp file cannot land in a directory being removed.
+
 ### Fixed
 - **Control evidence survives large tool-result materialization.** `use_tool` projects bounded primitive controls from the original result into a reserved, versioned outer metadata field before output shaping. Connector-supplied copies of that field are removed; error text, credentials and arbitrary metadata are never copied into evidence. Output budgets, UI passthrough and continuation behavior are unchanged, and consumers retain responsibility for classification.
 - **`use_tool` validation errors now report the argument keys the caller sent.** `provided_args` was read after per-tool key aliases had rewritten the arguments and after unknown keys had been stripped, so it listed an alias target the caller never sent and omitted exactly the keys that were rejected. It is now captured before both steps, placed ahead of `errors` in the error `data`, and also added to downstream parameter rejections (`args_provided` there is unchanged and still lists the keys that were dispatched). Message text and the repair ticket are unchanged.
