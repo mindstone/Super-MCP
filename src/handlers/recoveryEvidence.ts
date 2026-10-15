@@ -77,7 +77,7 @@ export function stripConnectorRecoveryEvidence(result: unknown): unknown {
   const outer = record(result);
   const meta = record(outer?._meta);
   const superMcp = record(meta?.superMcp);
-  if (!outer || !meta || !superMcp || !("recoveryEvidenceV1" in superMcp)) return result;
-  const { recoveryEvidenceV1: _privateEvidence, ...retained } = superMcp;
+  if (!outer || !meta || !superMcp || !Object.keys(superMcp).some((key) => key === 'recoveryEvidenceV1' || /^progressDigestV[0-9]+$/.test(key))) return result;
+  const retained = Object.fromEntries(Object.entries(superMcp).filter(([key]) => key !== 'recoveryEvidenceV1' && !/^progressDigestV[0-9]+$/.test(key)));
   return { ...outer, _meta: { ...meta, superMcp: retained } };
 }

@@ -958,7 +958,9 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
               handleGetToolDetails(args as any, catalog, registry, catalogRefresher));
 
           case "use_tool":
-            return await handleUseTool(args as any, registry, catalog, validator);
+            return await handleUseTool(args as any, registry, catalog, validator,
+              request.params._meta?.['rebel/captureProgressDigest'] === true
+                ? { captureProgressDigest: true } : undefined);
 
           case "bulk_export":
             return await handleBulkExport(args as any, registry, catalog, extra?.signal);
