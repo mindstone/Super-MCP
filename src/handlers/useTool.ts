@@ -1,4 +1,5 @@
 import { randomUUID } from "crypto";
+import { computeProgressDigest, type ProgressDigestV1 } from './progressDigest.js';
 import { extractRecoveryEvidenceV1, stripConnectorRecoveryEvidence, type RecoveryEvidenceV1 } from "./recoveryEvidence.js";
 import {
   UseToolInput,
@@ -450,6 +451,12 @@ interface SuperMcpTelemetryMeta {
   toolResolution?: SuperMcpResolution & { packageId: string };
 }
 
+interface SuperMcpProducerMeta extends SuperMcpTelemetryMeta {
+  progressDigestV1?: ProgressDigestV1;
+}
+
+export interface UseToolCallContext { captureProgressDigest?: true }
+
 interface MaterializationMeta {
   status: "materialized" | "oversized_output";
   originalChars?: number;
@@ -502,7 +509,7 @@ function applyOuterMeta(
   outer: { content: Array<unknown>; isError?: boolean; _meta?: Record<string, unknown>; structuredContent?: unknown },
   options: {
     passthrough: OuterPassthroughMeta;
-    superMcp: SuperMcpTelemetryMeta;
+    superMcp: SuperMcpProducerMeta;
     materialization?: MaterializationMeta;
     isError: boolean;
   },
@@ -513,6 +520,7 @@ function applyOuterMeta(
       toolId: options.superMcp.toolId,
       durationMs: options.superMcp.durationMs,
       ...(options.superMcp.recoveryEvidenceV1 ? { recoveryEvidenceV1: options.superMcp.recoveryEvidenceV1 } : {}),
+      ...(!options.isError && options.superMcp.progressDigestV1 ? { progressDigestV1: options.superMcp.progressDigestV1 } : {}),
       ...(options.superMcp.outputChars !== undefined ? { outputChars: options.superMcp.outputChars } : {}),
       ...(options.superMcp.truncated !== undefined ? { truncated: options.superMcp.truncated } : {}),
       ...(options.superMcp.resultId !== undefined ? { resultId: options.superMcp.resultId } : {}),
@@ -555,7 +563,7 @@ interface UseToolOuter {
 function buildOuter(args: {
   content: Array<unknown>;
   isError: boolean;
-  superMcp: SuperMcpTelemetryMeta & { dryRun?: boolean; continuation?: boolean; staged?: boolean };
+  superMcp: SuperMcpProducerMeta & { dryRun?: boolean; continuation?: boolean; staged?: boolean };
   passthrough?: OuterPassthroughMeta;
   materialization?: MaterializationMeta;
 }): UseToolOuter {
@@ -1273,7 +1281,8 @@ export async function handleUseTool(
   },
   registry: PackageRegistry,
   catalog: Catalog,
-  validator: { validate: (schema: any, data: any, context?: { package_id?: string; tool_id?: string }) => ValidationResult }
+  validator: { validate: (schema: any, data: any, context?: { package_id?: string; tool_id?: string }) => ValidationResult },
+  context?: UseToolCallContext,
 ): Promise<any> {
   // Staged tool calls: the host process (toolSafetyService PreToolUse hook) intercepted
   // this call for deferred user approval. It sets _rebel_staged via updatedInput so the
@@ -1961,6 +1970,14 @@ export async function handleUseTool(
     const downstreamIsError = isRecord(toolResult) && toolResult.isError === true;
     const recoveryEvidenceV1 = extractRecoveryEvidenceV1(toolResult);
     toolResult = stripConnectorRecoveryEvidence(toolResult);
+    let progressDigestV1: ProgressDigestV1 | undefined;
+    if (context?.captureProgressDigest === true && !downstreamIsError) {
+      try {
+        progressDigestV1 = computeProgressDigest(toolResult);
+      } catch {
+        logger.warn('Complete result progress digest unavailable', { reason: 'unsupported-result' });
+      }
+    }
     // Capture spec-passthrough fields off the inner tool_result BEFORE any
     // truncation/safety-net/materialisation rewrites. See
     // docs/project/SUPER_MCP_PASSTHROUGH_CONTRACT.md.
@@ -2026,6 +2043,7 @@ export async function handleUseTool(
               toolId: tool_id,
               durationMs: duration,
               ...(recoveryEvidenceV1 ? { recoveryEvidenceV1 } : {}),
+              ...(progressDigestV1 ? { progressDigestV1 } : {}),
               outputChars: envelopeJson.length,
               ...(normalisations.length > 0 ? { normalisations: [...normalisations] } : {}),
               ...(packageResolution ? { packageResolution } : {}),
@@ -2213,6 +2231,7 @@ export async function handleUseTool(
         toolId: tool_id,
         durationMs: duration,
         ...(recoveryEvidenceV1 ? { recoveryEvidenceV1 } : {}),
+        ...(progressDigestV1 ? { progressDigestV1 } : {}),
         outputChars: typeof result.telemetry.output_chars === "number"
           ? result.telemetry.output_chars
           : outputJson.length,

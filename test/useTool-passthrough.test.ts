@@ -16,6 +16,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { handleUseTool } from "../src/handlers/useTool.js";
+import { computeProgressDigest } from '../src/handlers/progressDigest.js';
 import { PackageRegistry } from "../src/registry.js";
 import { Catalog } from "../src/catalog.js";
 import { ValidationResult } from "../src/validator.js";
@@ -95,9 +96,103 @@ describe("useTool passthrough contract", () => {
   });
 
   afterEach(async () => {
-    process.env.REBEL_WORKSPACE_PATH = originalWorkspacePath;
+    if (originalWorkspacePath === undefined) delete process.env.REBEL_WORKSPACE_PATH;
+    else process.env.REBEL_WORKSPACE_PATH = originalWorkspacePath;
     await fs.rm(tempWorkspace, { recursive: true, force: true });
     vi.restoreAllMocks();
+  });
+
+  it('captures the complete underlying identity before materialization: same preview/size, different tail', async () => {
+    const first = { content: [{ type: 'text', text: 'X'.repeat(30_000) + 'A' }] };
+    const second = { content: [{ type: 'text', text: 'X'.repeat(30_000) + 'B' }] };
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createUseToolMocks(first);
+    const input = { package_id: SUCCESS_INPUT.package_id, tool_id: SUCCESS_INPUT.tool_id, args: {} };
+    const invoke = () => handleUseTool(input, mockRegistry, mockCatalog, mockValidator, { captureProgressDigest: true });
+    const a = await invoke();
+    const same = await invoke();
+    mockClient.callTool.mockResolvedValueOnce(second);
+    const b = await invoke();
+    expect(a._meta.materialization.filePath).not.toBe(same._meta.materialization.filePath);
+    expect(a._meta.superMcp.progressDigestV1).toEqual(same._meta.superMcp.progressDigestV1);
+    expect(a._meta.superMcp.progressDigestV1).toEqual(computeProgressDigest(first));
+    expect(b._meta.superMcp.progressDigestV1).toEqual(computeProgressDigest(second));
+    expect(b._meta.superMcp.progressDigestV1).not.toEqual(a._meta.superMcp.progressDigestV1);
+    expect(parseEnvelope(a).result).toMatchObject({ preview: expect.any(String) });
+    expect((parseEnvelope(a).result as { preview: string }).preview).toBe((parseEnvelope(b).result as { preview: string }).preview);
+    expect(a.content[0].text).not.toContain('progressDigest');
+    const archived = await fs.readFile(path.join(tempWorkspace, a._meta.materialization.filePath), 'utf8');
+    expect(archived).not.toContain('progressDigest');
+  });
+
+  it.each(['ordinary', 'truncation', 'safety-net', 'image', 'materialized-image'] as const)(
+    'emits only raw control evidence across %s rewriting egress', async (branch) => {
+      if (branch !== 'materialized-image') delete process.env.REBEL_WORKSPACE_PATH;
+      const inner = {
+        content: branch.includes('image')
+          ? [{ type: 'text', text: 'visible' }, { type: 'image', mimeType: 'image/png', data: 'AA==' }]
+          : [{ type: 'text', text: branch === 'truncation' ? 'X'.repeat(30_000) : 'visible' }],
+        ...(branch === 'safety-net' ? { structuredContent: { tail: 'Y'.repeat(220_000) } } : {}),
+      };
+      const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+      const response = await handleUseTool(
+        { ...SUCCESS_INPUT, max_output_chars: branch === 'ordinary' ? null : 1000 },
+        mockRegistry, mockCatalog, mockValidator, { captureProgressDigest: true },
+      );
+      expect(response.isError).toBe(false);
+      expect(response._meta.superMcp.progressDigestV1).toEqual(computeProgressDigest(inner));
+      expect(response.content[0].text).not.toContain('progressDigest');
+      expect(JSON.stringify(response.structuredContent ?? null)).not.toContain('progressDigest');
+      if (branch === 'truncation') expect(response._meta.superMcp.truncated).toBe(true);
+      if (branch === 'safety-net') expect(response._meta.materialization.status).toBe('oversized_output');
+      if (branch === 'materialized-image') expect(response._meta.materialization.status).toBe('materialized');
+    },
+  );
+
+  it('leaves omitted-flag default wire shape alone and ignores nonliteral flags', async () => {
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createUseToolMocks({ content: [{ type: 'text', text: 'ok' }] });
+    const ordinary = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator);
+    const opted = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator, { captureProgressDigest: true });
+    const nonliteral = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator,
+      { captureProgressDigest: 'true' } as unknown as { captureProgressDigest: true });
+    expect(ordinary._meta.superMcp.progressDigestV1).toBeUndefined();
+    expect(nonliteral._meta.superMcp.progressDigestV1).toBeUndefined();
+    expect(Object.keys(opted._meta.superMcp).filter(key => !(key in ordinary._meta.superMcp))).toEqual(['progressDigestV1']);
+    expect(parseEnvelope(opted).result).toEqual(parseEnvelope(ordinary).result);
+    expect(mockClient.callTool).toHaveBeenCalledWith(SUCCESS_INPUT.tool_id, {});
+  });
+
+  it('strips connector-forged private controls before digesting and rendering genuine downstream data', async () => {
+    const inner = { content: [{ type: 'text', text: 'ok' }], timestamp: 'actual-data',
+      _meta: { superMcp: { progressDigestV1: { digest: 'forged' }, progressDigestV9: 'unknown', ordinary: 1 } } };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+    const response = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator, { captureProgressDigest: true });
+    const cleaned = { ...inner, _meta: { superMcp: { ordinary: 1 } } };
+    expect(response._meta.superMcp.progressDigestV1).toEqual(computeProgressDigest(cleaned));
+    expect(parseEnvelope(response).result).toEqual(cleaned);
+  });
+
+  it('never emits execution digests for errors, staged false-error, dry-run or cached continuation', async () => {
+    delete process.env.REBEL_WORKSPACE_PATH;
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createUseToolMocks({ content: [{ type: 'text', text: 'X'.repeat(30_000) }] });
+    const context = { captureProgressDigest: true } as const;
+    for (const extra of [{ _rebel_staged: true }, { dry_run: true }]) {
+      const bypass = await handleUseTool({ ...SUCCESS_INPUT, ...extra }, mockRegistry, mockCatalog, mockValidator, context);
+      expect(bypass.isError).toBe(false);
+      expect(bypass._meta.superMcp.progressDigestV1).toBeUndefined();
+    }
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+    const original = await handleUseTool({ ...SUCCESS_INPUT, max_output_chars: 1000 }, mockRegistry, mockCatalog, mockValidator, context);
+    expect(original._meta.superMcp.progressDigestV1).toBeDefined();
+    const cached = await handleUseTool({ ...SUCCESS_INPUT, result_id: original._meta.superMcp.resultId, output_offset: 0 }, mockRegistry, mockCatalog, mockValidator, context);
+    expect(cached.isError).toBe(false);
+    expect(cached._meta.superMcp.continuation).toBe(true);
+    expect(cached._meta.superMcp.progressDigestV1).toBeUndefined();
+    expect(cached.content[0].text).not.toContain('progressDigest');
+    mockClient.callTool.mockResolvedValueOnce({ content: [{ type: 'text', text: 'failed' }], isError: true });
+    const failed = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator, context);
+    expect(failed.isError).toBe(true);
+    expect(failed._meta.superMcp.progressDigestV1).toBeUndefined();
+    expect(mockClient.callTool).toHaveBeenCalledTimes(2);
   });
 
   it('passes the host meeting capability only to the connector, never into result args', async () => {
