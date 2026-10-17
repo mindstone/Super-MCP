@@ -966,6 +966,24 @@ export class HttpMcpClient implements McpClient {
     const timeout = this.config.timeout ||
                     parseInt(process.env.SUPER_MCP_TOOL_TIMEOUT || '14400000');
 
+    // Defensive: ensure args is an object before forwarding to the MCP SDK.
+    // Some callers may pass a JSON string instead of a parsed object.
+    let resolvedArgs = args;
+    if (typeof args === 'string') {
+      try {
+        const parsed = JSON.parse(args);
+        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+          resolvedArgs = parsed;
+          logger.info("Coerced args from JSON string to object in callTool", {
+            package_id: this.packageId,
+            tool_name: name,
+          });
+        }
+      } catch {
+        // Not valid JSON — pass through and let the child server reject it
+      }
+    }
+
     logger.info("Calling tool on HTTP MCP", {
       package_id: this.packageId,
       tool_name: name,
@@ -978,7 +996,7 @@ export class HttpMcpClient implements McpClient {
       try {
         const response = await this.client.callTool({
           name,
-          arguments: args || {},
+          arguments: resolvedArgs || {},
         }, undefined, {
           timeout,
           resetTimeoutOnProgress: true,

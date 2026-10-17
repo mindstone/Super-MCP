@@ -82,6 +82,9 @@ web_modules/
 .env.production.local
 .env.local
 
+# Local config files (may contain API keys)
+super-mcp-config.json
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache
