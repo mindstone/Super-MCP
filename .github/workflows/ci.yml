@@ -35,6 +35,9 @@ jobs:
     - name: Check TypeScript compilation
       run: npx tsc --noEmit
 
+    - name: Build and tests leave the tree unchanged
+      run: test -z "$(git status --porcelain)" || { git status --porcelain; exit 1; }
+
   lint:
     runs-on: ubuntu-latest
     
