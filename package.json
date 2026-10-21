@@ -46,7 +46,7 @@
   },
   "homepage": "https://github.com/mindstone/Super-MCP#readme",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.19.0"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.25.2",
