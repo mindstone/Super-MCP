@@ -193,7 +193,7 @@ function classifyOAuthDiscoveryStatus(status: unknown): OAuthDiscoveryStatusClas
  * This wrapper detects the mismatch and re-creates the Response using
  * `globalThis.Response` so the SDK's instanceof check succeeds.
  */
-function createResponseNormalizingFetch(
+export function createResponseNormalizingFetch(
   baseFetch: typeof fetch,
   onOAuthError?: (error: OAuthErrorSummary) => void,
   refreshProvider?: SimpleOAuthProvider,

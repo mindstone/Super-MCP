@@ -1,4 +1,5 @@
 import * as fs from "fs/promises";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { OAuthTokensSchema } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { getLogger } from "../logging.js";
@@ -6,6 +7,8 @@ import {
   SimpleOAuthProvider,
   OBTAINED_AT_FIELD,
   stripObtainedAtStamp,
+  isRenewalHeld,
+  buildRenewalPausedMessage,
   type OAuthErrorSummary,
 } from "./providers/simple.js";
 import { withTokenRefreshLock } from "./tokenRefreshLock.js";
@@ -15,6 +18,14 @@ const logger = getLogger();
 // Treat an access token as "still valid" only if it has at least this much life
 // left, so we never short-circuit onto a token that expires mid-request.
 const ACCESS_TOKEN_SKEW_MS = 60_000;
+
+// A host `refresh` op asks for at least this much remaining life, so a token
+// with less is renewed rather than short-circuited (see auth/hostOps.ts).
+const minRemainingScope = new AsyncLocalStorage<number>();
+
+export function withRefreshMinRemaining<T>(minRemainingMs: number, fn: () => Promise<T>): Promise<T> {
+  return minRemainingScope.run(minRemainingMs, fn);
+}
 
 // Bounded backoff used to absorb the FM5 TOCTOU window: the loser of a race can
 // receive invalid_grant *before* the winner has durably persisted its rotated
@@ -52,7 +63,7 @@ function tokenFp(token: unknown): string {
 }
 
 /** Compute remaining lifetime (ms) of a persisted access token, or undefined. */
-function remainingLifetimeMs(diskTokens: any): number | undefined {
+export function remainingLifetimeMs(diskTokens: any): number | undefined {
   const obtainedAt = diskTokens?.[OBTAINED_AT_FIELD];
   const expiresIn = diskTokens?.expires_in;
   if (typeof obtainedAt !== "number" || typeof expiresIn !== "number") {
@@ -270,13 +281,24 @@ export async function runRefreshTransaction(
     // refreshed). Avoid a network POST AND avoid burning a single-use refresh
     // token. The SDK parses the synthesized response and re-persists idempotently.
     const remaining = disk?.access_token ? remainingLifetimeMs(disk) : undefined;
-    if (disk?.access_token && typeof remaining === "number" && remaining > ACCESS_TOKEN_SKEW_MS) {
+    const minRemainingMs = Math.max(ACCESS_TOKEN_SKEW_MS, minRemainingScope.getStore() ?? 0);
+    if (disk?.access_token && typeof remaining === "number" && remaining > minRemainingMs) {
       logger.info("Refresh short-circuited: on-disk access token still valid", {
         package_id: packageId,
         remaining_ms: remaining,
       });
       await provider.clearNeedsReconnectMarker();
       return synthesizeTokenResponse(disk);
+    }
+
+    // Plan item S3-1a: another machine owns this refresh token. Refuse before
+    // any POST: no SDK-supplied fallback, no marker, no synthesized success.
+    if (isRenewalHeld(disk)) {
+      logger.info("Refresh refused: renewal is held by the host", { package_id: packageId });
+      return new Response(
+        JSON.stringify({ error: "temporarily_unavailable", error_description: buildRenewalPausedMessage(packageId) }),
+        { status: 503, headers: { "Content-Type": "application/json" } },
+      );
     }
 
     // (3) Refresh genuinely needed. Present the FRESHEST on-disk refresh token

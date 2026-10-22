@@ -40,8 +40,27 @@ export function stripObtainedAtStamp(tokens: any): any {
   if (!tokens || typeof tokens !== "object") {
     return tokens;
   }
-  const { [OBTAINED_AT_FIELD]: _omit, ...rest } = tokens;
+  const { [OBTAINED_AT_FIELD]: _omit, [RENEWAL_HELD_FIELD]: _held, ...rest } = tokens;
   return rest;
+}
+
+/**
+ * Private field a host (via POST /api/oauth/host or SUPER_MCP_HOLD_RENEWAL) sets
+ * on a token file whose refresh token another machine owns. A held file is never
+ * used to POST a refresh, never gets a refresh token back from a non-interactive
+ * save, and is never cleared by a dead-grant verdict here. Standalone use never
+ * writes it. Stripped before the SDK, like the obtained-at stamp.
+ */
+export const RENEWAL_HELD_FIELD = "__superMcpRenewalHeldByHost";
+
+export function isRenewalHeld(tokens: unknown): boolean {
+  return !!tokens && typeof tokens === "object" && (tokens as any)[RENEWAL_HELD_FIELD] === true;
+}
+
+/** Tool-facing text while a held package waits for its host to renew it. */
+export function buildRenewalPausedMessage(packageId: string): string {
+  const appName = process.env.SUPER_MCP_APP_NAME || "the host app";
+  return `${packageId} is paused until ${appName} can renew its sign-in. It will resume automatically, with no need to reconnect.`;
 }
 
 /**
@@ -365,6 +384,21 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     return this.packageId;
   }
 
+  /** Absolute path of the persisted DCR client registration for this package. */
+  getClientFilePath(): string {
+    return path.join(this.tokenStoragePath, `${this.packageId}_client.json`);
+  }
+
+  /** True when the token file is held by the host and no reconnect is flagged. */
+  async isRenewalPaused(): Promise<boolean> {
+    const disk = await this.readDiskTokens().catch(() => undefined);
+    if (!isRenewalHeld(disk)) {
+      return false;
+    }
+    const marker = await SimpleOAuthProvider.readNeedsReconnectMarkerState(this.packageId);
+    return marker.state === "absent";
+  }
+
   /**
    * Read the on-disk token set fresh, bypassing the in-memory mirror.
    * Returns undefined when the file is absent (ENOENT). A read/parse failure for
@@ -460,6 +494,21 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     // not make the next app launch require full browser authentication.
     if (!tokens?.refresh_token && mergeBase?.refresh_token) {
       mergedTokens.refresh_token = mergeBase.refresh_token;
+    }
+
+    // Plan item S3-1b: on a held file only an interactive authorization-code
+    // save (this provider opened the browser) may write a refresh token; every
+    // other save keeps disk's refresh token, or none. The field always stays, so
+    // a new grant is held until the host exports it.
+    if (isRenewalHeld(onDisk)) {
+      mergedTokens[RENEWAL_HELD_FIELD] = true;
+      if (!this.redirectStarted) {
+        if (typeof onDisk.refresh_token === "string") {
+          mergedTokens.refresh_token = onDisk.refresh_token;
+        } else {
+          delete mergedTokens.refresh_token;
+        }
+      }
     }
 
     // STALE-WRITE GUARD (non-authoritative writes only). Apply it to the MERGED
@@ -636,12 +685,14 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
    * reader sees the old file or the new file in full, never a torn intermediate.
    * graceful-fs (installed at boot) retries transient EPERM/EMFILE, incl. the
    * Windows file-in-use window on rename. Throws on failure — no silent swallow.
+   * Host ops also write the client and pending-export files through it
+   * (`targetPath`), holding withTokenRefreshLock for this package.
    */
-  private async atomicWriteTokens(mergedTokens: any): Promise<void> {
-    await fs.mkdir(this.tokenStoragePath, { recursive: true, mode: 0o700 });
-    const tokenPath = this.getTokenFilePath();
+  async atomicWriteTokens(mergedTokens: any, targetPath: string = this.getTokenFilePath()): Promise<void> {
+    const targetDir = path.dirname(targetPath);
+    await fs.mkdir(targetDir, { recursive: true, mode: 0o700 });
     const tempPath = path.join(
-      this.tokenStoragePath,
+      targetDir,
       `.${this.packageId}_tokens.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
     );
 
@@ -658,12 +709,12 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       }
       wrote = true;
 
-      await fs.rename(tempPath, tokenPath);
+      await fs.rename(tempPath, targetPath);
       // Flush the directory entry so the rename itself is durable (a crash after
       // rename but before the dir metadata is flushed could otherwise revert to
       // the old, now-consumed token file). Best-effort: some platforms (Windows)
       // do not permit opening a directory for fsync — tolerate that specific case.
-      await this.fsyncDir(this.tokenStoragePath);
+      await this.fsyncDir(targetDir);
     } catch (error) {
       // Best-effort cleanup of the temp file if anything failed after we created
       // it; surface the original failure (no silent swallow).
@@ -948,6 +999,12 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
    * after bounded backoff). Idempotent.
    */
   async clearTokensAndMarkNeedsReconnect(reason: OAuthErrorSummary | undefined): Promise<void> {
+    // Plan item S3-1c: a held file is never cleared by a verdict on this machine;
+    // only the owner of the refresh token may declare the grant dead.
+    if (isRenewalHeld(await this.readDiskTokens().catch(() => undefined))) {
+      logger.warn("Dead-grant clear skipped: renewal is held by the host", { package_id: this.packageId });
+      return;
+    }
     this.savedTokens = undefined;
     this.authoritativeTokenEchoes = [];
     const tokenPath = this.getTokenFilePath();
@@ -1007,6 +1064,14 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       disk = await this.readDiskTokens();
     } catch {
       disk = undefined;
+    }
+
+    if (isRenewalHeld(disk)) {
+      // Plan item S3-1c: never clear a held file (see clearTokensAndMarkNeedsReconnect).
+      logger.warn("Token invalidation (refresh-only): renewal held by the host, preserving", {
+        package_id: this.packageId,
+      });
+      return;
     }
 
     if (!disk) {

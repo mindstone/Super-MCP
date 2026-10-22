@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Added
+- **Host-held token renewal.** A host that keeps a package's refresh token on another machine can hold it here, so this router never spends it. `SUPER_MCP_HOLD_RENEWAL` (comma-separated package ids) holds token files before discovery starts, and the loopback-only, JSON-only `POST /api/oauth/host` runs `hold`, `resume`, `export` (into `SUPER_MCP_EXPORT_DIR`), `cache`, `install`, `remove` and `refresh` under each package's token lock. A held file is never used for a refresh POST, never regains a refresh token from a non-interactive save, and is never cleared by a dead-grant verdict; once its access token expires, tools report that the package is paused until the host (`SUPER_MCP_APP_NAME`) renews it. `refresh` renews without connecting the MCP server and returns `fresh`, `needs_reconnect`, `unavailable` or `setup_required`. Nothing changes unless a host uses these.
 - **`ToolNotesStore.whenIdle()`** resolves once any compaction a `readSnapshot()` started in the background has finished. `readSnapshot()` still does not wait for it; call `whenIdle()` before deleting the notes directory (tests, shutdown) so the compaction's lock and temp file cannot land in a directory being removed.
 
 ### Fixed

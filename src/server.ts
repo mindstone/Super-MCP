@@ -46,6 +46,7 @@ import {
   drainInFlightTokenRefreshes,
 } from "./auth/tokenRefreshLock.js";
 import { resolveToolTarget } from "./toolTargetResolution.js";
+import { applyStartupRenewalHold, handleHostOpRequest } from "./auth/hostOps.js";
 
 // FM6 (260706_mcp-oauth-fm6-graceful-drain): give an in-flight single-use
 // refresh-token rotation time to finish its atomic persist before we exit, so a
@@ -448,6 +449,25 @@ export function registerHttpApiRoutes(
     }
   });
 
+  // Host-only OAuth file operations (auth/hostOps.ts). Loopback + JSON only: a
+  // cross-origin form POST can't send application/json without a preflight.
+  app.post("/api/oauth/host", dnsRebindingGuard, async (req, res) => {
+    if (!req.is("application/json")) {
+      res.status(415).json({ status: "error", code: "unsupported_media_type" });
+      return;
+    }
+    const result = await handleHostOpRequest(req.body, {
+      getPackage: (packageId) => registry.getPackage(packageId),
+      onCredentialsChanged: async (packageId) => {
+        if (!registry.getPackage(packageId)) return;
+        await registry.restartPackage(packageId);
+        catalog.clearPackage(packageId);
+        catalogRefresher?.scheduleRefresh(packageId);
+      },
+    });
+    res.status(result.httpStatus).json(result.body);
+  });
+
   // Stage 4b of docs/plans/260423_secondary_process_cpu_observability.md:
   // lightweight per-child lifecycle/activity metadata for Rebel's perf
   // diagnostic. Localhost-only (dnsRebindingGuard is defense-in-depth).
@@ -515,6 +535,9 @@ export async function startServer(options: {
   });
 
   try {
+    // Plan item S3-2: hold host-owned refresh tokens before any discovery can
+    // spend one (a no-op unless SUPER_MCP_HOLD_RENEWAL is set).
+    await applyStartupRenewalHold();
     const registry = await PackageRegistry.fromConfigFiles(paths);
     registry.startIdleReaper();
     const catalog = new Catalog(registry);

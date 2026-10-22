@@ -1,6 +1,6 @@
 import { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import { getLogger } from "../../logging.js";
-import { SimpleOAuthProvider } from "./simple.js";
+import { SimpleOAuthProvider, buildRenewalPausedMessage } from "./simple.js";
 import type { OAuthErrorSummary } from "./simple.js";
 
 const logger = getLogger();
@@ -54,6 +54,11 @@ export class RefreshOnlyOAuthProvider implements OAuthClientProvider {
   }
   
   async redirectToAuthorization(_authUrl: URL): Promise<void> {
+    // Plan item S3-1d: a held package waits for its host to renew it, so say
+    // "paused", not "sign in" (the person needs no action).
+    if (await this.delegate.isRenewalPaused()) {
+      throw new Error(buildRenewalPausedMessage(this.delegate.getPackageId()));
+    }
     logger.info("OAuth browser redirect blocked (refresh-only mode)", {
       message: "Use authenticate() to sign in"
     });
