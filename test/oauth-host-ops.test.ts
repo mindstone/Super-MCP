@@ -28,7 +28,7 @@ import {
 } from "../src/auth/providers/simple.js";
 import { RefreshOnlyOAuthProvider } from "../src/auth/providers/refreshOnly.js";
 import { withTokenRefreshLock } from "../src/auth/tokenRefreshLock.js";
-import { applyStartupRenewalHold, runHostOp, type HostOpsDeps } from "../src/auth/hostOps.js";
+import { applyStartupRenewalHold, handleHostOpRequest, runHostOp, type HostOpsDeps } from "../src/auth/hostOps.js";
 import { registerHttpApiRoutes } from "../src/server.js";
 import type { PackageConfig } from "../src/types.js";
 import type { PackageRegistry } from "../src/registry.js";
@@ -149,6 +149,31 @@ describe("spender boundary on a held file", () => {
     expect(endpoint.callCount()).toBe(0);
     expect(await exists(markerPath())).toBe(false);
     expect((await readJson(tokenPath()))[RENEWAL_HELD_FIELD]).toBe(true);
+  });
+
+  it("a held file with valid access gets no synthesized 200 and keeps its marker", async () => {
+    const endpoint = createMockTokenEndpoint({ initialRefreshToken: "refresh-r0" });
+    await writeJson(tokenPath(), { ...tokensWithRemaining(undefined, 10 * 60_000), [RENEWAL_HELD_FIELD]: true });
+    await writeJson(markerPath(), { needs_reconnect: true, error: "owner_ended" });
+    const provider = new SimpleOAuthProvider(PKG);
+    const wrapped = createResponseNormalizingFetch(endpoint.fetch, undefined, provider);
+    let status: number | undefined;
+    const observing = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const response = await wrapped(input, init);
+      status = response.status;
+      return response;
+    }) as typeof fetch;
+    await expect(
+      refreshAuthorization(metadata().issuer, {
+        metadata: metadata(),
+        clientInformation: { client_id: "public-client" } as any,
+        refreshToken: "refresh-stale",
+        fetchFn: observing,
+      }),
+    ).rejects.toThrow(/is paused until/);
+    expect(status).toBe(503);
+    expect(endpoint.callCount()).toBe(0);
+    expect(await readJson(markerPath())).toEqual({ needs_reconnect: true, error: "owner_ended" });
   });
 
   it("a held file that still has its refresh token is not spent either", async () => {
@@ -441,7 +466,8 @@ describe("refresh (owner side, no MCP connection)", () => {
   }
 
   it("renews below min_remaining_ms and completes (the op takes no outer lock)", async () => {
-    await seedOwner(30 * 60_000);
+    // 1 h lifetime: the threshold is min(60 min, 20 min) = 20 min, and 15 min are left.
+    await seedOwner(15 * 60_000);
     const endpoint = createMockTokenEndpoint({ initialRefreshToken: "refresh-r0" });
     const result = await runHostOp(
       { op: "refresh", package_id: PKG, min_remaining_ms: 60 * 60_000 },
@@ -592,6 +618,38 @@ describe("refresh (owner side, no MCP connection)", () => {
     for (const forbidden of [REFRESH_SENTINEL, CLIENT_SENTINEL, "refresh_token", OBTAINED_AT_FIELD, RENEWAL_HELD_FIELD]) {
       expect(wire).not.toContain(forbidden);
     }
+  });
+
+  it("renews a short-lived token below a third of its lifetime, not on every borrow", async () => {
+    const endpoint = createMockTokenEndpoint({ initialRefreshToken: "refresh-r0", expiresIn: 540 });
+    const borrow = () =>
+      runHostOp({ op: "refresh", package_id: PKG, min_remaining_ms: 15 * 60_000 }, deps({ baseFetch: sdkNetwork(endpoint) }));
+    await writeJson(clientPath(), { client_id: "public-client" });
+
+    // 9-minute lifetime: the threshold is min(15 min, 3 min) = 3 min.
+    await writeJson(tokenPath(), tokensWithRemaining("refresh-r0", 5 * 60_000, 540));
+    expect((await borrow()).status).toBe("fresh");
+    expect(endpoint.callCount()).toBe(0);
+
+    await writeJson(tokenPath(), tokensWithRemaining("refresh-r0", 2 * 60_000, 540));
+    expect((await borrow()).status).toBe("fresh");
+    expect(endpoint.callCount()).toBe(1);
+  });
+
+  it("cache accepts exactly the access shape refresh returns, including no expiry", async () => {
+    await writeJson(tokenPath("Owner"), { access_token: "access-forever", token_type: "Bearer" });
+    const borrowed = await handleHostOpRequest({ op: "refresh", package_id: "Owner", min_remaining_ms: 15 * 60_000 }, deps());
+    expect(borrowed.body).toEqual({ status: "fresh", access: { access_token: "access-forever", token_type: "Bearer" } });
+
+    await writeJson(tokenPath(), { ...tokensWithRemaining(undefined, -1000), [RENEWAL_HELD_FIELD]: true });
+    const cached = await handleHostOpRequest({ op: "cache", package_id: PKG, access: borrowed.body.access }, deps());
+    expect(cached).toEqual({ httpStatus: 200, body: { status: "cached" } });
+    const disk = await readJson(tokenPath());
+    expect(disk).not.toHaveProperty("expires_in");
+    expect(disk[RENEWAL_HELD_FIELD]).toBe(true);
+    expect((await handleHostOpRequest({ op: "refresh", package_id: PKG, min_remaining_ms: 15 * 60_000 }, deps())).body).toEqual(
+      borrowed.body,
+    );
   });
 
   it("verifies a reconnect marker beside a refresh token with a real refresh, even with life left, and clears it", async () => {

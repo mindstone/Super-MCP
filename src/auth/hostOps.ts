@@ -33,20 +33,23 @@ const PackageId = z
   .max(200)
   .refine((id) => !/[\\/\0]/.test(id) && !id.startsWith("."), "invalid package id");
 
+/**
+ * The borrowed-access shape: what `refresh` returns and `cache` accepts. No
+ * `expires_in` means the token states no expiry.
+ */
+const AccessSchema = z.object({
+  access_token: z.string().min(1),
+  token_type: z.string().min(1),
+  scope: z.string().optional(),
+  expires_in: z.number().int().nonnegative().optional(),
+});
+export type BorrowedAccess = z.infer<typeof AccessSchema>;
+
 const HostOpSchema = z.discriminatedUnion("op", [
   z.object({ op: z.literal("hold"), package_id: PackageId }),
   z.object({ op: z.literal("resume"), package_id: PackageId }),
   z.object({ op: z.literal("export"), package_id: PackageId, discard: z.boolean() }),
-  z.object({
-    op: z.literal("cache"),
-    package_id: PackageId,
-    access: z.object({
-      access_token: z.string().min(1),
-      token_type: z.string().min(1),
-      scope: z.string().optional(),
-      expires_in: z.number().nonnegative(),
-    }),
-  }),
+  z.object({ op: z.literal("cache"), package_id: PackageId, access: AccessSchema }),
   z.object({
     op: z.literal("install"),
     package_id: PackageId,
@@ -197,7 +200,13 @@ async function refreshOp(
   }
   const hasRefreshToken = typeof before.refresh_token === "string";
   const verifyMarker = marked && hasRefreshToken;
-  if (!verifyMarker && remainingMs(before) >= op.min_remaining_ms) {
+  // A short-lived token is renewed below a third of its lifetime, not on every
+  // borrow: only super-mcp knows the lifetime (`expires_in` at obtain time).
+  const minRemainingMs =
+    typeof before.expires_in === "number"
+      ? Math.min(op.min_remaining_ms, (before.expires_in * 1000) / 3)
+      : op.min_remaining_ms;
+  if (!verifyMarker && remainingMs(before) >= minRemainingMs) {
     return marked ? { status: "needs_reconnect" } : accessResult(before);
   }
   if (!hasRefreshToken) {
@@ -234,7 +243,7 @@ async function refreshOp(
   const fetchFn = createResponseNormalizingFetch(trackedFetch, (error) => provider.setLastOAuthError(error), provider);
   // Marker verification must reach the provider: no short-circuit on a valid
   // access token. A successful refresh clears the marker.
-  const threshold = verifyMarker ? Number.POSITIVE_INFINITY : op.min_remaining_ms;
+  const threshold = verifyMarker ? Number.POSITIVE_INFINITY : minRemainingMs;
   try {
     await withHostRefreshScope(threshold, () =>
       auth(new RefreshOnlyOAuthProvider(provider), { serverUrl: config.base_url!, fetchFn }),
@@ -270,15 +279,13 @@ function remainingMs(tokens: any): number {
 /** Access-only projection: never the refresh token, client or private fields. */
 function accessResult(tokens: any): HostOpResult {
   const remaining = remainingMs(tokens);
-  return {
-    status: "fresh",
-    access: {
-      access_token: tokens.access_token,
-      token_type: typeof tokens.token_type === "string" ? tokens.token_type : "Bearer",
-      ...(typeof tokens.scope === "string" ? { scope: tokens.scope } : {}),
-      ...(Number.isFinite(remaining) ? { expires_in: Math.max(0, Math.floor(remaining / 1000)) } : {}),
-    },
+  const access: BorrowedAccess = {
+    access_token: tokens.access_token,
+    token_type: typeof tokens.token_type === "string" ? tokens.token_type : "Bearer",
+    ...(typeof tokens.scope === "string" ? { scope: tokens.scope } : {}),
+    ...(Number.isFinite(remaining) ? { expires_in: Math.max(0, Math.floor(remaining / 1000)) } : {}),
   };
+  return { status: "fresh", access };
 }
 
 /** Parse, run and map one POST /api/oauth/host body. Logs only op, package and status. */

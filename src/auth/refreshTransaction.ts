@@ -95,7 +95,7 @@ function synthesizeTokenResponse(diskTokens: any): Response {
   if (typeof expiresInSeconds === "number") {
     payload.expires_in = expiresInSeconds;
   }
-  if (typeof diskTokens.refresh_token === "string" && !isRenewalHeld(diskTokens)) {
+  if (typeof diskTokens.refresh_token === "string") {
     payload.refresh_token = diskTokens.refresh_token;
   }
   if (typeof diskTokens.scope === "string") {
@@ -271,6 +271,17 @@ export async function runRefreshTransaction(
       disk_access_remaining_ms: disk?.access_token ? remainingLifetimeMs(disk) : undefined,
     });
 
+    // Plan item S3-1a: another machine owns this refresh token. Refuse before
+    // any POST: no SDK-supplied fallback, no marker change, no synthesized
+    // success (so not even the valid-access short-circuit below).
+    if (isRenewalHeld(disk)) {
+      logger.info("Refresh refused: renewal is held by the host", { package_id: packageId });
+      return new Response(
+        JSON.stringify({ error: "temporarily_unavailable", error_description: buildRenewalPausedMessage(packageId) }),
+        { status: 503, headers: { "Content-Type": "application/json" } },
+      );
+    }
+
     // (2) Short-circuit: disk already has a still-valid access token (a peer
     // refreshed). Avoid a network POST AND avoid burning a single-use refresh
     // token. The SDK parses the synthesized response and re-persists idempotently.
@@ -285,16 +296,6 @@ export async function runRefreshTransaction(
       });
       await provider.clearNeedsReconnectMarker();
       return synthesizeTokenResponse(disk);
-    }
-
-    // Plan item S3-1a: another machine owns this refresh token. Refuse before
-    // any POST: no SDK-supplied fallback, no marker, no synthesized success.
-    if (isRenewalHeld(disk)) {
-      logger.info("Refresh refused: renewal is held by the host", { package_id: packageId });
-      return new Response(
-        JSON.stringify({ error: "temporarily_unavailable", error_description: buildRenewalPausedMessage(packageId) }),
-        { status: 503, headers: { "Content-Type": "application/json" } },
-      );
     }
 
     // (3) Refresh genuinely needed. Present the FRESHEST on-disk refresh token
