@@ -4,7 +4,7 @@ import * as os from "os";
 import * as path from "path";
 import express from "express";
 import type { AddressInfo } from "node:net";
-import { refreshAuthorization } from "@modelcontextprotocol/sdk/client/auth.js";
+import { auth, refreshAuthorization } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { AuthorizationServerMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
 
 const mockLogger = vi.hoisted(() => ({
@@ -89,25 +89,25 @@ function tokensWithRemaining(refreshToken: string | undefined, remainingMs: numb
   };
 }
 
-function metadata(): AuthorizationServerMetadata {
+function metadata(tokenUrl = TOKEN_URL): AuthorizationServerMetadata {
   return {
     issuer: "https://auth.example.test",
     authorization_endpoint: "https://auth.example.test/authorize",
-    token_endpoint: TOKEN_URL,
+    token_endpoint: tokenUrl,
     response_types_supported: ["code"],
     token_endpoint_auth_methods_supported: ["none"],
   } as AuthorizationServerMetadata;
 }
 
 /** Network for SDK auth(): no protected-resource metadata, AS metadata, token endpoint. */
-function sdkNetwork(endpoint: MockTokenEndpointHandle): typeof fetch {
+function sdkNetwork(endpoint: Pick<MockTokenEndpointHandle, "fetch">, tokenUrl = TOKEN_URL): typeof fetch {
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
     if (url.includes("oauth-protected-resource")) return new Response("not found", { status: 404 });
     if (url.includes("oauth-authorization-server")) {
-      return new Response(JSON.stringify(metadata()), { status: 200, headers: { "Content-Type": "application/json" } });
+      return new Response(JSON.stringify(metadata(tokenUrl)), { status: 200, headers: { "Content-Type": "application/json" } });
     }
-    if (url === TOKEN_URL) return endpoint.fetch(input, init);
+    if (url === tokenUrl) return endpoint.fetch(input, init);
     return new Response("not found", { status: 404 });
   }) as typeof fetch;
 }
@@ -166,6 +166,72 @@ describe("spender boundary on a held file", () => {
     ).rejects.toThrow();
     expect(endpoint.callCount()).toBe(0);
     expect((await readJson(tokenPath())).refresh_token).toBe("refresh-r0");
+  });
+
+  it("a held file never exposes its refresh token to the SDK, even when the token endpoint path has no 'token'", async () => {
+    const RENEW_URL = "https://auth.example.test/renew";
+    const endpoint = createMockTokenEndpoint({ initialRefreshToken: "refresh-r0", tokenUrl: RENEW_URL });
+
+    await writeJson(tokenPath(), { ...tokensWithRemaining("refresh-r0", -1000), [RENEWAL_HELD_FIELD]: true });
+    await writeJson(clientPath(), { client_id: "public-client" });
+    const provider = new SimpleOAuthProvider(PKG);
+    await provider.initialize();
+    expect(await provider.tokens()).not.toHaveProperty("refresh_token");
+    const wrapped = createResponseNormalizingFetch(sdkNetwork(endpoint, RENEW_URL), undefined, provider);
+
+    // The SDK's own auth(): with no refresh token visible it never POSTs.
+    await expect(
+      auth(new RefreshOnlyOAuthProvider(provider), { serverUrl: BASE_URL, fetchFn: wrapped }),
+    ).rejects.toThrow(/is paused until/);
+    // A stale in-memory refresh token sent to /renew is refused under the lock too.
+    await expect(
+      refreshAuthorization(metadata().issuer, {
+        metadata: metadata(RENEW_URL),
+        clientInformation: { client_id: "public-client" } as any,
+        refreshToken: "refresh-r0",
+        fetchFn: wrapped,
+      }),
+    ).rejects.toThrow(/is paused until/);
+    expect(endpoint.callCount()).toBe(0);
+    expect((await readJson(tokenPath())).refresh_token).toBe("refresh-r0");
+  });
+
+  it("a save that read the old unheld file can't restore a refresh token after hold and export", async () => {
+    await writeJson(tokenPath(), tokensWithRemaining("refresh-r0", 600_000));
+    const realWrite = SimpleOAuthProvider.prototype.atomicWriteTokens;
+    let releaseSave!: () => void;
+    let saveParked!: () => void;
+    const parked = new Promise<void>((resolve) => (saveParked = resolve));
+    let first = true;
+    vi.spyOn(SimpleOAuthProvider.prototype, "atomicWriteTokens").mockImplementation(async function (
+      this: SimpleOAuthProvider,
+      data: any,
+      target?: string,
+    ) {
+      if (first) {
+        // The save has merged against the old unheld file; park it before its rename.
+        first = false;
+        saveParked();
+        await new Promise<void>((resolve) => (releaseSave = resolve));
+      }
+      return realWrite.call(this, data, target);
+    });
+    const saving = new SimpleOAuthProvider(PKG).saveTokens({
+      access_token: "access-late",
+      token_type: "Bearer",
+      refresh_token: "refresh-late",
+    });
+    await parked;
+    const exporting = runHostOp({ op: "export", package_id: PKG, discard: false }, deps());
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    releaseSave();
+    await saving;
+    expect(await exporting).toEqual({ status: "exported" });
+    const disk = await readJson(tokenPath());
+    expect(disk.refresh_token).toBeUndefined();
+    expect(disk[RENEWAL_HELD_FIELD]).toBe(true);
+    // The later save landed first, so the export carried it rather than losing it.
+    expect((await readJson(path.join(exportDir, `${PKG}.json`))).tokens.refresh_token).toBe("refresh-late");
   });
 
   it("a delayed save can't restore a refresh token to a held cache", async () => {
@@ -439,6 +505,41 @@ describe("refresh (owner side, no MCP connection)", () => {
     expect(result).toEqual({ status: "unavailable", reason: "provider_error" });
   });
 
+  it("a dead grant with life left but below min_remaining_ms is needs_reconnect, not fresh", async () => {
+    await seedOwner(10 * 60_000);
+    const endpoint = createMockTokenEndpoint({ initialRefreshToken: "refresh-r0" });
+    endpoint.revokeGrant();
+    const result = await runHostOp(
+      { op: "refresh", package_id: PKG, min_remaining_ms: 900_000 },
+      deps({ baseFetch: sdkNetwork(endpoint) }),
+    );
+    expect(result).toEqual({ status: "needs_reconnect" });
+    expect(await exists(markerPath())).toBe(true);
+  }, 10_000);
+
+  it("never logs provider descriptions or parser text on the owner refresh path", async () => {
+    const SENTINEL = "opaque-secret-sentinel";
+    const replies: Array<() => Response> = [
+      () => new Response(JSON.stringify({ error: "invalid_grant", error_description: SENTINEL }), { status: 400, headers: { "Content-Type": "application/json" } }),
+      () => new Response(JSON.stringify({ error: "server_error", error_description: SENTINEL }), { status: 500, headers: { "Content-Type": "application/json" } }),
+      () => new Response(`${SENTINEL} not json`, { status: 200, headers: { "Content-Type": "application/json" } }),
+      () => new Response(JSON.stringify({ error: SENTINEL }), { status: 400, headers: { "Content-Type": "application/json" } }),
+    ];
+    for (const reply of replies) {
+      await seedOwner(-1000);
+      const result = await runHostOp(
+        { op: "refresh", package_id: PKG, min_remaining_ms: 0 },
+        deps({ baseFetch: sdkNetwork({ fetch: (async () => reply()) as typeof fetch }) }),
+      );
+      expect(["needs_reconnect", "unavailable"]).toContain(result.status);
+    }
+    const logged = JSON.stringify(
+      [mockLogger.info, mockLogger.warn, mockLogger.error, mockLogger.debug].map((fn) => fn.mock.calls),
+    );
+    expect(logged).not.toContain(SENTINEL);
+    expect(logged).toContain("invalid_grant");
+  }, 20_000);
+
   it("is setup_required without package config, and needs_reconnect without anything to renew with", async () => {
     expect(await runHostOp({ op: "refresh", package_id: "Unconfigured", min_remaining_ms: 0 }, deps())).toEqual({
       status: "setup_required",
@@ -509,11 +610,12 @@ describe("POST /api/oauth/host", () => {
 });
 
 describe("startup hold and standalone use", () => {
-  it("SUPER_MCP_HOLD_RENEWAL holds each listed package and skips bad or absent ids", async () => {
+  it("SUPER_MCP_HOLD_RENEWAL holds each listed package, skips absent files and rejects bad ids", async () => {
     await writeJson(tokenPath(), tokensWithRemaining("refresh-r0", 600_000));
-    await applyStartupRenewalHold({ SUPER_MCP_HOLD_RENEWAL: ` ${PKG} ,../bad, Absent` });
+    await applyStartupRenewalHold({ SUPER_MCP_HOLD_RENEWAL: ` ${PKG} , Absent` });
     expect((await readJson(tokenPath()))[RENEWAL_HELD_FIELD]).toBe(true);
     expect(await exists(tokenPath("Absent"))).toBe(false);
+    await expect(applyStartupRenewalHold({ SUPER_MCP_HOLD_RENEWAL: "../bad" })).rejects.toThrow();
   });
 
   it("without the environment nothing is held and a normal refresh rotates as before", async () => {

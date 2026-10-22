@@ -10,9 +10,10 @@ import {
   RENEWAL_HELD_FIELD,
   OBTAINED_AT_FIELD,
   isRenewalHeld,
+  withHostRefreshScope,
 } from "./providers/simple.js";
 import { RefreshOnlyOAuthProvider } from "./providers/refreshOnly.js";
-import { remainingLifetimeMs, withRefreshMinRemaining } from "./refreshTransaction.js";
+import { remainingLifetimeMs } from "./refreshTransaction.js";
 import { TokenRefreshLockBusyError, withTokenRefreshLock } from "./tokenRefreshLock.js";
 
 /**
@@ -194,22 +195,10 @@ async function refreshOp(
   const provider = new SimpleOAuthProvider(op.package_id, port, staticCredentials);
   await provider.initialize();
 
-  // Remaining life of the access token on disk; Infinity when the provider
-  // gave no expiry, undefined when there is no usable access token.
-  const remainingOnDisk = async (): Promise<number | undefined> => {
-    const disk = await provider.readDiskTokens().catch(() => undefined);
-    if (!disk?.access_token) return undefined;
-    return remainingLifetimeMs(disk) ?? Number.POSITIVE_INFINITY;
-  };
-  const freshAbove = async (minMs: number): Promise<HostOpResult | undefined> => {
-    const remaining = await remainingOnDisk();
-    if (remaining === undefined || remaining <= minMs) return undefined;
-    return { status: "fresh", ...(Number.isFinite(remaining) ? { remaining_ms: remaining } : {}) };
-  };
   const before = await provider.readDiskTokens().catch(() => undefined);
   if (typeof before?.refresh_token !== "string") {
     // Nothing to renew with: usable access still counts, otherwise reconnect.
-    return (await freshAbove(op.min_remaining_ms)) ?? { status: "needs_reconnect" };
+    return freshResult(before, op.min_remaining_ms) ?? { status: "needs_reconnect" };
   }
   // Without a registration the SDK would register a new client; never do that here.
   if (!(await provider.clientInformation())) {
@@ -230,7 +219,7 @@ async function refreshOp(
   };
   const fetchFn = createResponseNormalizingFetch(trackedFetch, (error) => provider.setLastOAuthError(error), provider);
   try {
-    await withRefreshMinRemaining(op.min_remaining_ms, () =>
+    await withHostRefreshScope(op.min_remaining_ms, () =>
       auth(new RefreshOnlyOAuthProvider(provider), { serverUrl: config.base_url!, fetchFn }),
     );
   } catch (error) {
@@ -248,7 +237,16 @@ async function refreshOp(
     });
     return { status: "unavailable", reason };
   }
-  return (await freshAbove(0)) ?? { status: "unavailable", reason: "provider_error" };
+  const after = await provider.readDiskTokens().catch(() => undefined);
+  return freshResult(after, 0) ?? { status: "unavailable", reason: "provider_error" };
+}
+
+/** `fresh` when the access token has more than `minMs` left (or no stated expiry). */
+function freshResult(tokens: any, minMs: number): HostOpResult | undefined {
+  if (!tokens?.access_token) return undefined;
+  const remaining = remainingLifetimeMs(tokens);
+  if (remaining === undefined) return { status: "fresh" };
+  return remaining > minMs ? { status: "fresh", remaining_ms: remaining } : undefined;
 }
 
 /** Parse, run and map one POST /api/oauth/host body. Logs only op, package and status. */
@@ -286,14 +284,8 @@ export async function handleHostOpRequest(
 export async function applyStartupRenewalHold(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const ids = (env.SUPER_MCP_HOLD_RENEWAL ?? "").split(",").map((id) => id.trim()).filter(Boolean);
   for (const id of ids) {
-    const parsed = PackageId.safeParse(id);
-    if (!parsed.success) {
-      logger.warn("Startup renewal hold skipped an invalid package id");
-      continue;
-    }
-    const result = await handleHostOpRequest({ op: "hold", package_id: parsed.data }, { getPackage: () => undefined });
-    if (result.httpStatus !== 200) {
-      logger.error("Startup renewal hold failed", { package_id: parsed.data, status: result.body.status });
-    }
+    // Plan item S3-2: a hold that can't be applied fails startup rather than
+    // letting discovery spend the token (absent files have nothing to hold).
+    await runHostOp({ op: "hold", package_id: PackageId.parse(id) }, { getPackage: () => undefined });
   }
 }

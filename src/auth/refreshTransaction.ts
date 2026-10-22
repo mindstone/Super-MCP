@@ -1,5 +1,4 @@
 import * as fs from "fs/promises";
-import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import { OAuthTokensSchema } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { getLogger } from "../logging.js";
@@ -9,6 +8,9 @@ import {
   stripObtainedAtStamp,
   isRenewalHeld,
   buildRenewalPausedMessage,
+  hostRefreshMinRemainingMs,
+  oauthErrorLogFields,
+  errorLogText,
   type OAuthErrorSummary,
 } from "./providers/simple.js";
 import { withTokenRefreshLock } from "./tokenRefreshLock.js";
@@ -18,14 +20,6 @@ const logger = getLogger();
 // Treat an access token as "still valid" only if it has at least this much life
 // left, so we never short-circuit onto a token that expires mid-request.
 const ACCESS_TOKEN_SKEW_MS = 60_000;
-
-// A host `refresh` op asks for at least this much remaining life, so a token
-// with less is renewed rather than short-circuited (see auth/hostOps.ts).
-const minRemainingScope = new AsyncLocalStorage<number>();
-
-export function withRefreshMinRemaining<T>(minRemainingMs: number, fn: () => Promise<T>): Promise<T> {
-  return minRemainingScope.run(minRemainingMs, fn);
-}
 
 // Bounded backoff used to absorb the FM5 TOCTOU window: the loser of a race can
 // receive invalid_grant *before* the winner has durably persisted its rotated
@@ -101,7 +95,7 @@ function synthesizeTokenResponse(diskTokens: any): Response {
   if (typeof expiresInSeconds === "number") {
     payload.expires_in = expiresInSeconds;
   }
-  if (typeof diskTokens.refresh_token === "string") {
+  if (typeof diskTokens.refresh_token === "string" && !isRenewalHeld(diskTokens)) {
     payload.refresh_token = diskTokens.refresh_token;
   }
   if (typeof diskTokens.scope === "string") {
@@ -258,7 +252,7 @@ export async function runRefreshTransaction(
         // lock with no disk tokens and persist-or-fail-closed on success.
         logger.warn("Refresh transaction could not read disk tokens; proceeding under lock with no disk tokens", {
           package_id: packageId,
-          error: error instanceof Error ? error.message : String(error),
+          error: errorLogText(error),
         });
       }
       disk = undefined;
@@ -281,7 +275,9 @@ export async function runRefreshTransaction(
     // refreshed). Avoid a network POST AND avoid burning a single-use refresh
     // token. The SDK parses the synthesized response and re-persists idempotently.
     const remaining = disk?.access_token ? remainingLifetimeMs(disk) : undefined;
-    const minRemainingMs = Math.max(ACCESS_TOKEN_SKEW_MS, minRemainingScope.getStore() ?? 0);
+    // A host `refresh` op asks for more remaining life than the default skew;
+    // the same threshold judges peer rotation after an invalid_grant below.
+    const minRemainingMs = Math.max(ACCESS_TOKEN_SKEW_MS, hostRefreshMinRemainingMs() ?? 0);
     if (disk?.access_token && typeof remaining === "number" && remaining > minRemainingMs) {
       logger.info("Refresh short-circuited: on-disk access token still valid", {
         package_id: packageId,
@@ -361,7 +357,7 @@ export async function runRefreshTransaction(
         // prompt instead of silently re-failing on a now-dead grant.
         logger.error("Refresh succeeded but the token response body was unreadable", {
           package_id: packageId,
-          error: error instanceof Error ? error.message : String(error),
+          error: errorLogText(error),
         });
         await provider
           .clearTokensAndMarkNeedsReconnect({
@@ -407,7 +403,7 @@ export async function runRefreshTransaction(
       } catch (error) {
         logger.error("Refresh rotated a token but persistence failed — flagging reconnect", {
           package_id: packageId,
-          error: error instanceof Error ? error.message : String(error),
+          error: errorLogText(error),
         });
         // The on-disk token is now dead (the server consumed it) and we could not
         // store the replacement. Fail closed: mark reconnect and re-throw so the
@@ -449,13 +445,13 @@ export async function runRefreshTransaction(
     // (4) invalid_grant on the token we presented. Distinguish a lost race
     // (peer rotated, hasn't persisted yet — FM5 TOCTOU) from a genuinely dead
     // grant via bounded re-reads with jittered backoff.
+    const errorFields = oauthErrorLogFields(summary);
     logger.info("Refresh transaction: invalid_grant on presented token; checking for peer rotation", {
       package_id: packageId,
       pid: process.pid,
       presented_refresh_fp: tokenFp(refreshTokenToSend),
-      ...(summary
-        ? { server_error: summary.error, server_error_description: summary.error_description }
-        : {}),
+      ...(errorFields.error ? { server_error: errorFields.error } : {}),
+      ...(errorFields.error_description ? { server_error_description: errorFields.error_description } : {}),
     });
     for (let attempt = 0; attempt < TOCTOU_MAX_ATTEMPTS; attempt++) {
       assertLockHealthy();
@@ -472,7 +468,7 @@ export async function runRefreshTransaction(
       const recheckRemaining = recheck?.access_token ? remainingLifetimeMs(recheck) : undefined;
       const peerRotated =
         (recheckRefresh && recheckRefresh !== refreshTokenToSend) ||
-        (typeof recheckRemaining === "number" && recheckRemaining > ACCESS_TOKEN_SKEW_MS);
+        (typeof recheckRemaining === "number" && recheckRemaining > minRemainingMs);
 
       if (peerRotated && recheck?.access_token) {
         logger.info("Refresh lost a race but a peer rotated — recovering from disk", {
@@ -513,7 +509,7 @@ export async function runRefreshTransaction(
       presented_refresh_fp: presentedFp,
       disk_refresh_fp: finalDiskFp,
       disk_matches_presented: presentedFp !== "none" && presentedFp === finalDiskFp,
-      ...(summary ? summary : {}),
+      ...errorFields,
     });
     await provider.clearTokensAndMarkNeedsReconnect(summary);
     return response;

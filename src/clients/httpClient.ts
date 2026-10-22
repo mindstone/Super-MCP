@@ -263,6 +263,10 @@ export function createResponseNormalizingFetch(
     if (body instanceof URLSearchParams) {
       params = body;
     } else if (typeof body === "string") {
+      // Every MCP request now reaches this check; skip parsing JSON-RPC bodies.
+      if (!body.includes("grant_type=")) {
+        return false;
+      }
       try {
         params = new URLSearchParams(body);
       } catch {
@@ -282,7 +286,9 @@ export function createResponseNormalizingFetch(
     let response: unknown;
     try {
       response =
-        refreshProvider && isOAuthTokenEndpoint(input) && isRefreshGrantBody(init)
+        // Any refresh-grant POST, whatever the endpoint's path: the discovered
+        // token endpoint need not contain "token" (held-file spender boundary).
+        refreshProvider && isRefreshGrantBody(init)
           ? await runRefreshTransaction({ provider: refreshProvider, baseFetch }, input, init)
           : await baseFetch(input, init);
     } catch (error) {

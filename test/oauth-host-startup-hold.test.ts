@@ -67,4 +67,11 @@ describe("startup renewal hold", () => {
     await startServer({ configPaths: [path.join(tempDir, "config.json")], transport: "stdio" });
     expect(observed.heldAtDiscovery).toBe(true);
   });
+
+  it("fails startup, before discovery, when a requested hold can't be applied", async () => {
+    observed.heldAtDiscovery = undefined;
+    process.env.SUPER_MCP_HOLD_RENEWAL = "../not-a-package";
+    await expect(startServer({ configPaths: [path.join(tempDir, "config.json")], transport: "stdio" })).rejects.toThrow();
+    expect(observed.heldAtDiscovery).toBeUndefined();
+  });
 });

@@ -5,6 +5,8 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { homedir } from "os";
 import { randomBytes } from "crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { withTokenRefreshLock } from "../tokenRefreshLock.js";
 import {
   buildRedirectUriRejectedError,
   isAuthorizeProbeDisabled,
@@ -55,6 +57,35 @@ export const RENEWAL_HELD_FIELD = "__superMcpRenewalHeldByHost";
 
 export function isRenewalHeld(tokens: unknown): boolean {
   return !!tokens && typeof tokens === "object" && (tokens as any)[RENEWAL_HELD_FIELD] === true;
+}
+
+// Set while a host `refresh` op runs (auth/hostOps.ts): its minimum remaining
+// life raises the refresh short-circuit threshold, and its logs are bounded.
+const hostRefreshScope = new AsyncLocalStorage<{ minRemainingMs: number }>();
+
+export function withHostRefreshScope<T>(minRemainingMs: number, fn: () => Promise<T>): Promise<T> {
+  return hostRefreshScope.run({ minRemainingMs }, fn);
+}
+
+export function hostRefreshMinRemainingMs(): number | undefined {
+  return hostRefreshScope.getStore()?.minRemainingMs;
+}
+
+/**
+ * Plan item S3-4 (invariant 11): inside a host owner refresh, logs carry only a
+ * bounded OAuth error code, never provider descriptions; standalone keeps today's
+ * fields.
+ */
+export function oauthErrorLogFields(summary: OAuthErrorSummary | undefined): Partial<OAuthErrorSummary> {
+  if (!summary) return {};
+  if (!hostRefreshScope.getStore()) return { ...summary };
+  return { error: /^[A-Za-z0-9_.-]{1,64}$/.test(summary.error) ? summary.error : "unrecognized" };
+}
+
+/** Error text for logs; inside a host owner refresh only its name or code (parser messages echo input). */
+export function errorLogText(error: unknown): string {
+  if (!hostRefreshScope.getStore()) return error instanceof Error ? error.message : String(error);
+  return String((error as NodeJS.ErrnoException)?.code ?? (error instanceof Error ? error.name : typeof error));
 }
 
 /** Tool-facing text while a held package waits for its host to renew it. */
@@ -440,14 +471,22 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       // torn/locked read does not spuriously force re-auth.
       logger.warn("Failed to read OAuth tokens from disk; using in-memory fallback", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorLogText(error),
       });
       return this.stripInternalFields(this.savedTokens);
     }
   }
 
-  /** Strip private bookkeeping fields before handing tokens to the SDK. */
+  /**
+   * Strip private bookkeeping fields before handing tokens to the SDK. Plan item
+   * S3-1a: a held file's refresh token belongs to another machine, so the SDK
+   * never sees it and no refresh POST can carry it, whatever the endpoint URL.
+   */
   private stripInternalFields(tokens: any): any {
+    if (isRenewalHeld(tokens)) {
+      const { refresh_token: _owned, ...accessOnly } = tokens;
+      return stripObtainedAtStamp(accessOnly);
+    }
     return stripObtainedAtStamp(tokens);
   }
 
@@ -478,7 +517,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       // mirror as the merge base rather than crashing the refresh.
       logger.warn("Could not read existing tokens before save; merging against in-memory state", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorLogText(error),
       });
       onDisk = this.savedTokens;
     }
@@ -756,7 +795,11 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     // crashing on a transient write error. The fail-CLOSED guarantee for a real
     // rotation lives in persistRotatedTokensOrThrow(), called under the lock.
     try {
-      await this.mergeAndPersistTokens(tokens, false);
+      // Plan item S3-5: under the package's token lock, so a save that read the
+      // file before a host hold or export can't write over it afterwards.
+      await withTokenRefreshLock(this.packageId, this.getTokenFilePath(), () =>
+        this.mergeAndPersistTokens(tokens, false),
+      );
     } catch (error) {
       logger.error("Failed to persist OAuth tokens", {
         package_id: this.packageId,
@@ -1039,7 +1082,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
 
     logger.error("OAuth grant is dead — cleared tokens and flagged reconnect", {
       package_id: this.packageId,
-      ...(reason ? reason : {}),
+      ...oauthErrorLogFields(reason),
     });
   }
 
@@ -1077,7 +1120,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     if (!disk) {
       logger.info("Token invalidation (refresh-only): tokens already cleared", {
         package_id: this.packageId,
-        ...(oauthError ? oauthError : {}),
+        ...oauthErrorLogFields(oauthError),
       });
       this.savedTokens = undefined;
       return;
@@ -1094,7 +1137,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     if (markerExists) {
       logger.warn("Token invalidation (refresh-only): dead grant flagged, clearing residual tokens", {
         package_id: this.packageId,
-        ...(oauthError ? oauthError : {}),
+        ...oauthErrorLogFields(oauthError),
       });
       await this.invalidateCredentials("tokens");
       return;
@@ -1104,7 +1147,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       message:
         "On-disk tokens are present and not flagged dead (peer may have rotated). Preserving to avoid forcing re-auth.",
       package_id: this.packageId,
-      ...(oauthError ? oauthError : {}),
+      ...oauthErrorLogFields(oauthError),
     });
   }
 
@@ -1126,7 +1169,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     logger.info("Invalidating OAuth credentials", { 
       package_id: this.packageId,
       scope,
-      ...(oauthError ? oauthError : {}),
+      ...oauthErrorLogFields(oauthError),
     });
     
     if (scope === 'all' || scope === 'tokens') {
