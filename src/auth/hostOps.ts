@@ -177,13 +177,33 @@ async function exportUnderLock(provider: SimpleOAuthProvider, disk: any, discard
 }
 
 /**
- * Renew through the package's own fetch wrapper and refresh transaction,
- * without connecting the MCP server (never registry.getClient()).
+ * The owner's credential answer for one package: super-mcp interprets its own
+ * token file, so the host never does. Renews (through the package's own fetch
+ * wrapper and refresh transaction, without connecting the MCP server, never
+ * registry.getClient()) only when less than `min_remaining_ms` is left, or to
+ * verify a reconnect marker that sits beside a refresh token; otherwise it
+ * answers from disk. Returns access only, never the refresh token or client.
  */
 async function refreshOp(
   op: Extract<HostOp, { op: "refresh" }>,
   deps: HostOpsDeps,
 ): Promise<HostOpResult> {
+  const probe = new SimpleOAuthProvider(op.package_id);
+  const before = await readJsonFile(probe.getTokenFilePath()).catch(() => undefined);
+  const marked = (await SimpleOAuthProvider.readNeedsReconnectMarkerState(op.package_id)).state !== "absent";
+  if (!before?.access_token) {
+    // After the owner's dead-grant verdict the file is gone and the marker stays.
+    return { status: marked ? "needs_reconnect" : "missing" };
+  }
+  const hasRefreshToken = typeof before.refresh_token === "string";
+  const verifyMarker = marked && hasRefreshToken;
+  if (!verifyMarker && remainingMs(before) >= op.min_remaining_ms) {
+    return marked ? { status: "needs_reconnect" } : accessResult(before);
+  }
+  if (!hasRefreshToken) {
+    // Nothing to renew with: what is left is still usable until it expires.
+    return remainingMs(before) > 0 && !marked ? accessResult(before) : { status: "needs_reconnect" };
+  }
   const config = deps.getPackage(op.package_id);
   if (!config || config.transport !== "http" || !config.oauth || !config.base_url) {
     return { status: "setup_required" };
@@ -194,12 +214,6 @@ async function refreshOp(
     : undefined;
   const provider = new SimpleOAuthProvider(op.package_id, port, staticCredentials);
   await provider.initialize();
-
-  const before = await provider.readDiskTokens().catch(() => undefined);
-  if (typeof before?.refresh_token !== "string") {
-    // Nothing to renew with: usable access still counts, otherwise reconnect.
-    return freshResult(before, op.min_remaining_ms) ?? { status: "needs_reconnect" };
-  }
   // Without a registration the SDK would register a new client; never do that here.
   if (!(await provider.clientInformation())) {
     return { status: "needs_reconnect" };
@@ -218,14 +232,17 @@ async function refreshOp(
     }
   };
   const fetchFn = createResponseNormalizingFetch(trackedFetch, (error) => provider.setLastOAuthError(error), provider);
+  // Marker verification must reach the provider: no short-circuit on a valid
+  // access token. A successful refresh clears the marker.
+  const threshold = verifyMarker ? Number.POSITIVE_INFINITY : op.min_remaining_ms;
   try {
-    await withHostRefreshScope(op.min_remaining_ms, () =>
+    await withHostRefreshScope(threshold, () =>
       auth(new RefreshOnlyOAuthProvider(provider), { serverUrl: config.base_url!, fetchFn }),
     );
   } catch (error) {
     // The owner's dead-grant verdict removes the refresh token; anything that
     // leaves it in place (network, 5xx, a busy lock) is transient.
-    const after = await provider.readDiskTokens().catch(() => before);
+    const after = await readJsonFile(probe.getTokenFilePath()).catch(() => before);
     if (typeof after?.refresh_token !== "string") {
       return { status: "needs_reconnect" };
     }
@@ -237,16 +254,31 @@ async function refreshOp(
     });
     return { status: "unavailable", reason };
   }
-  const after = await provider.readDiskTokens().catch(() => undefined);
-  return freshResult(after, 0) ?? { status: "unavailable", reason: "provider_error" };
+  const after = await readJsonFile(probe.getTokenFilePath()).catch(() => undefined);
+  return after?.access_token ? accessResult(after) : { status: "unavailable", reason: "provider_error" };
 }
 
-/** `fresh` when the access token has more than `minMs` left (or no stated expiry). */
-function freshResult(tokens: any, minMs: number): HostOpResult | undefined {
-  if (!tokens?.access_token) return undefined;
-  const remaining = remainingLifetimeMs(tokens);
-  if (remaining === undefined) return { status: "fresh" };
-  return remaining > minMs ? { status: "fresh", remaining_ms: remaining } : undefined;
+/**
+ * Remaining access lifetime on disk. No `expires_in`: never expires. An
+ * `expires_in` without our obtained-at stamp is of unknown age, so 0 (renew).
+ */
+function remainingMs(tokens: any): number {
+  if (typeof tokens?.expires_in !== "number") return Number.POSITIVE_INFINITY;
+  return remainingLifetimeMs(tokens) ?? 0;
+}
+
+/** Access-only projection: never the refresh token, client or private fields. */
+function accessResult(tokens: any): HostOpResult {
+  const remaining = remainingMs(tokens);
+  return {
+    status: "fresh",
+    access: {
+      access_token: tokens.access_token,
+      token_type: typeof tokens.token_type === "string" ? tokens.token_type : "Bearer",
+      ...(typeof tokens.scope === "string" ? { scope: tokens.scope } : {}),
+      ...(Number.isFinite(remaining) ? { expires_in: Math.max(0, Math.floor(remaining / 1000)) } : {}),
+    },
+  };
 }
 
 /** Parse, run and map one POST /api/oauth/host body. Logs only op, package and status. */
@@ -283,9 +315,15 @@ export async function handleHostOpRequest(
  */
 export async function applyStartupRenewalHold(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const ids = (env.SUPER_MCP_HOLD_RENEWAL ?? "").split(",").map((id) => id.trim()).filter(Boolean);
-  for (const id of ids) {
-    // Plan item S3-2: a hold that can't be applied fails startup rather than
-    // letting discovery spend the token (absent files have nothing to hold).
-    await runHostOp({ op: "hold", package_id: PackageId.parse(id) }, { getPackage: () => undefined });
+  for (const [index, id] of ids.entries()) {
+    const parsed = PackageId.safeParse(id);
+    if (!parsed.success) {
+      // Hosts derive ids from token file names, so this is a host bug; hold the rest.
+      logger.warn("Startup renewal hold skipped an unusable package id", { entry_index: index });
+      continue;
+    }
+    // Plan item S3-2: a valid hold that can't be applied fails startup rather
+    // than letting discovery spend the token (absent files have nothing to hold).
+    await runHostOp({ op: "hold", package_id: parsed.data }, { getPackage: () => undefined });
   }
 }

@@ -448,8 +448,8 @@ describe("refresh (owner side, no MCP connection)", () => {
       deps({ baseFetch: sdkNetwork(endpoint) }),
     );
     expect(result.status).toBe("fresh");
-    expect(result.remaining_ms as number).toBeGreaterThan(59 * 60_000);
-    expect(result).not.toHaveProperty("access_token");
+    expect((result.access as any).expires_in).toBeGreaterThan(59 * 60);
+    expect((result.access as any).access_token).toBe(endpoint.currentValidAccessToken());
     expect(endpoint.callCount()).toBe(1);
     expect((await readJson(tokenPath())).refresh_token).toBe(endpoint.currentValidRefreshToken());
   }, 5_000);
@@ -540,14 +540,83 @@ describe("refresh (owner side, no MCP connection)", () => {
     expect(logged).toContain("invalid_grant");
   }, 20_000);
 
-  it("is setup_required without package config, and needs_reconnect without anything to renew with", async () => {
-    expect(await runHostOp({ op: "refresh", package_id: "Unconfigured", min_remaining_ms: 0 }, deps())).toEqual({
-      status: "setup_required",
+  it("answers in exactly five shapes and never returns the refresh token, client or private fields", async () => {
+    const REFRESH_SENTINEL = "opaque-refresh-sentinel";
+    const CLIENT_SENTINEL = "opaque-client-sentinel";
+    const refresh = (id = PKG, min = 10 * 60_000, extra: Partial<HostOpsDeps> = {}) =>
+      runHostOp({ op: "refresh", package_id: id, min_remaining_ms: min }, deps(extra));
+    const results: unknown[] = [];
+
+    // fresh, from disk, no provider call and no package config needed.
+    await writeJson(tokenPath("NoConfig"), { ...tokensWithRemaining(REFRESH_SENTINEL, 30 * 60_000), scope: "read" });
+    await writeJson(clientPath("NoConfig"), { client_id: CLIENT_SENTINEL });
+    const fresh = await refresh("NoConfig");
+    results.push(fresh);
+    expect(fresh).toEqual({
+      status: "fresh",
+      access: { access_token: "access-old", token_type: "Bearer", scope: "read", expires_in: expect.any(Number) },
     });
+    expect((fresh.access as any).expires_in).toBeGreaterThan(29 * 60 - 5);
+    expect((fresh.access as any).expires_in).toBeLessThanOrEqual(30 * 60);
+
+    // No expiry stated: expires_in omitted.
+    await writeJson(tokenPath("NoExpiry"), { access_token: "access-forever", token_type: "Bearer" });
+    expect(await refresh("NoExpiry")).toEqual({ status: "fresh", access: { access_token: "access-forever", token_type: "Bearer" } });
+
+    // missing, and needs_reconnect once the owner's verdict removed the file.
+    results.push(await refresh("Absent"));
+    expect(results.at(-1)).toEqual({ status: "missing" });
+    await writeJson(markerPath("Absent"), { needs_reconnect: true });
+    expect(await refresh("Absent")).toEqual({ status: "needs_reconnect" });
+
+    // needs_reconnect: expired, nothing to renew with.
     await writeJson(tokenPath(), tokensWithRemaining(undefined, -1000));
-    expect(await runHostOp({ op: "refresh", package_id: PKG, min_remaining_ms: 0 }, deps())).toEqual({
-      status: "needs_reconnect",
-    });
+    results.push(await refresh());
+    expect(results.at(-1)).toEqual({ status: "needs_reconnect" });
+
+    // setup_required: renewal needed, but no package config.
+    await writeJson(tokenPath("NoConfig"), tokensWithRemaining(REFRESH_SENTINEL, 60_000));
+    results.push(await refresh("NoConfig"));
+    expect(results.at(-1)).toEqual({ status: "setup_required" });
+
+    // unavailable.
+    await writeJson(tokenPath(), tokensWithRemaining(REFRESH_SENTINEL, -1000));
+    await writeJson(clientPath(), { client_id: CLIENT_SENTINEL });
+    const offline = (async () => {
+      throw new TypeError("fetch failed");
+    }) as typeof fetch;
+    results.push(await refresh(PKG, 0, { baseFetch: offline }));
+    expect(results.at(-1)).toEqual({ status: "unavailable", reason: "provider_unreachable" });
+
+    const wire = JSON.stringify(results);
+    for (const forbidden of [REFRESH_SENTINEL, CLIENT_SENTINEL, "refresh_token", OBTAINED_AT_FIELD, RENEWAL_HELD_FIELD]) {
+      expect(wire).not.toContain(forbidden);
+    }
+  });
+
+  it("verifies a reconnect marker beside a refresh token with a real refresh, even with life left, and clears it", async () => {
+    await seedOwner(30 * 60_000);
+    await writeJson(markerPath(), { needs_reconnect: true, error: "legacy" });
+    const endpoint = createMockTokenEndpoint({ initialRefreshToken: "refresh-r0" });
+    const result = await runHostOp(
+      { op: "refresh", package_id: PKG, min_remaining_ms: 10 * 60_000 },
+      deps({ baseFetch: sdkNetwork(endpoint) }),
+    );
+    expect(result.status).toBe("fresh");
+    expect(endpoint.callCount()).toBe(1);
+    expect(await exists(markerPath())).toBe(false);
+  });
+
+  it("renews a token whose age is unknown (expires_in without an obtained-at stamp)", async () => {
+    await writeJson(tokenPath(), { access_token: "access-old", token_type: "Bearer", expires_in: 3600, refresh_token: "refresh-r0" });
+    await writeJson(clientPath(), { client_id: "public-client" });
+    const endpoint = createMockTokenEndpoint({ initialRefreshToken: "refresh-r0" });
+    const result = await runHostOp(
+      { op: "refresh", package_id: PKG, min_remaining_ms: 60_000 },
+      deps({ baseFetch: sdkNetwork(endpoint) }),
+    );
+    expect(result.status).toBe("fresh");
+    expect(endpoint.callCount()).toBe(1);
   });
 });
 
@@ -610,12 +679,13 @@ describe("POST /api/oauth/host", () => {
 });
 
 describe("startup hold and standalone use", () => {
-  it("SUPER_MCP_HOLD_RENEWAL holds each listed package, skips absent files and rejects bad ids", async () => {
+  it("SUPER_MCP_HOLD_RENEWAL holds each valid package, skips absent files and logs a bad id without it", async () => {
     await writeJson(tokenPath(), tokensWithRemaining("refresh-r0", 600_000));
-    await applyStartupRenewalHold({ SUPER_MCP_HOLD_RENEWAL: ` ${PKG} , Absent` });
+    await applyStartupRenewalHold({ SUPER_MCP_HOLD_RENEWAL: `../bad-secretish , ${PKG} , Absent` });
     expect((await readJson(tokenPath()))[RENEWAL_HELD_FIELD]).toBe(true);
     expect(await exists(tokenPath("Absent"))).toBe(false);
-    await expect(applyStartupRenewalHold({ SUPER_MCP_HOLD_RENEWAL: "../bad" })).rejects.toThrow();
+    expect(mockLogger.warn).toHaveBeenCalledWith("Startup renewal hold skipped an unusable package id", { entry_index: 0 });
+    expect(JSON.stringify(mockLogger.warn.mock.calls)).not.toContain("bad-secretish");
   });
 
   it("without the environment nothing is held and a normal refresh rotates as before", async () => {

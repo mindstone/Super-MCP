@@ -6,7 +6,12 @@ import * as path from "path";
 import { homedir } from "os";
 import { randomBytes } from "crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { withTokenRefreshLock } from "../tokenRefreshLock.js";
+import {
+  TokenRefreshLockBusyError,
+  TokenRefreshLockError,
+  TokenRefreshShutdownError,
+  withTokenRefreshLock,
+} from "../tokenRefreshLock.js";
 import {
   buildRedirectUriRejectedError,
   isAuthorizeProbeDisabled,
@@ -110,6 +115,9 @@ export function buildRenewalPausedMessage(packageId: string): string {
  * regression observable rather than silent.
  */
 const MAX_AUTHORITATIVE_ECHOES = 8;
+
+/** Busy-lock attempts (~10–14 s each) for a new interactive grant's save; see saveUnderLock. */
+const INTERACTIVE_SAVE_LOCK_ATTEMPTS = 9;
 
 /**
  * Loopback host spellings treated as equivalent for OAuth redirect URIs
@@ -795,16 +803,46 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     // crashing on a transient write error. The fail-CLOSED guarantee for a real
     // rotation lives in persistRotatedTokensOrThrow(), called under the lock.
     try {
-      // Plan item S3-5: under the package's token lock, so a save that read the
-      // file before a host hold or export can't write over it afterwards.
-      await withTokenRefreshLock(this.packageId, this.getTokenFilePath(), () =>
-        this.mergeAndPersistTokens(tokens, false),
-      );
+      await this.saveUnderLock(tokens);
     } catch (error) {
       logger.error("Failed to persist OAuth tokens", {
         package_id: this.packageId,
         error: error instanceof Error ? error.message : String(error),
       });
+    }
+  }
+
+  /**
+   * Plan item S3-5: the public save runs under the package's token lock, so a
+   * save that read the file before a host hold or export can't write over it
+   * afterwards. A routine save may be dropped if the lock can't be had (logged
+   * by saveTokens). A new interactive grant never is: it retries a busy lock
+   * past the lock's 90 s stale window, then writes without the lock, as before
+   * the lock existed, rather than lose the person's sign-in.
+   */
+  private async saveUnderLock(tokens: any): Promise<void> {
+    const interactive = this.redirectStarted;
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await withTokenRefreshLock(this.packageId, this.getTokenFilePath(), () =>
+          this.mergeAndPersistTokens(tokens, false),
+        );
+        return;
+      } catch (error) {
+        const lockFailure =
+          error instanceof TokenRefreshLockBusyError ||
+          error instanceof TokenRefreshLockError ||
+          error instanceof TokenRefreshShutdownError;
+        if (!interactive || !lockFailure) throw error;
+        if (error instanceof TokenRefreshLockBusyError && attempt < INTERACTIVE_SAVE_LOCK_ATTEMPTS) continue;
+        logger.warn("Saving a new sign-in without the token lock", {
+          package_id: this.packageId,
+          error_name: error.name,
+          attempts: attempt,
+        });
+        await this.mergeAndPersistTokens(tokens, false);
+        return;
+      }
     }
   }
 

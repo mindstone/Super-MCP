@@ -68,9 +68,11 @@ describe("startup renewal hold", () => {
     expect(observed.heldAtDiscovery).toBe(true);
   });
 
-  it("fails startup, before discovery, when a requested hold can't be applied", async () => {
+  it("fails startup, before discovery, when a valid requested hold can't be applied", async () => {
     observed.heldAtDiscovery = undefined;
-    process.env.SUPER_MCP_HOLD_RENEWAL = "../not-a-package";
+    // An unreadable token file (a directory) makes the hold itself fail.
+    fs.mkdirSync(path.join(tempDir, "Broken_tokens.json"));
+    process.env.SUPER_MCP_HOLD_RENEWAL = "Broken";
     await expect(startServer({ configPaths: [path.join(tempDir, "config.json")], transport: "stdio" })).rejects.toThrow();
     expect(observed.heldAtDiscovery).toBeUndefined();
   });
