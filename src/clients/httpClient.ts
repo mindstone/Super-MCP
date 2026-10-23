@@ -8,8 +8,9 @@ import { getLogger } from "../logging.js";
 import { SimpleOAuthProvider, RefreshOnlyOAuthProvider } from "../auth/providers/index.js";
 import { OAUTH_REDIRECT_URI_REJECTED_CODE } from "../auth/authorizeProbe.js";
 import { isAuthLikeErrorMessageText } from "../auth/authLikeVocabulary.js";
-import type { OAuthErrorSummary, StaticOAuthCredentials } from "../auth/providers/simple.js";
+import { getStaticCredentials, type OAuthErrorSummary } from "../auth/providers/simple.js";
 import { runRefreshTransaction } from "../auth/refreshTransaction.js";
+import { hostMode, pullHostAccess, accessTokenHash } from "../auth/hostGrants.js";
 
 const logger = getLogger();
 
@@ -257,27 +258,56 @@ export function createResponseNormalizingFetch(
   // package-scoped atomic transaction (the rotation-race fix). Only the refresh
   // grant is intercepted; the authorization_code exchange and all other requests
   // flow through unchanged.
-  const isRefreshGrantBody = (init?: RequestInit): boolean => {
+  const isFormEncoded = (headers?: HeadersInit): boolean =>
+    new Headers(headers).get("content-type")?.split(";", 1)[0].trim().toLowerCase() ===
+      "application/x-www-form-urlencoded";
+
+  const isOAuthGrantBody = (init?: RequestInit, grantType?: string): boolean => {
     const body = init?.body;
     let params: URLSearchParams | undefined;
     if (body instanceof URLSearchParams) {
       params = body;
-    } else if (typeof body === "string") {
-      // Every MCP request now reaches this check; skip parsing JSON-RPC bodies.
-      if (!body.includes("grant_type=")) {
-        return false;
-      }
+    } else if (typeof body === "string" && isFormEncoded(init?.headers)) {
       try {
         params = new URLSearchParams(body);
       } catch {
         return false;
       }
     }
-    return params?.get("grant_type") === "refresh_token";
+    return grantType ? params?.get("grant_type") === grantType : !!params?.get("grant_type");
+  };
+
+  const normalizeResponse = (response: unknown): Response => {
+    if (
+      response !== null &&
+      typeof response === 'object' &&
+      'status' in response &&
+      'headers' in response &&
+      !(response instanceof Response)
+    ) {
+      // Cross-realm Response detected — re-wrap with globalThis.Response
+      const r = response as { body?: ReadableStream | null; status: number; statusText?: string; headers: HeadersInit };
+      return new Response(r.body ?? null, {
+        status: r.status,
+        statusText: r.statusText ?? '',
+        headers: new Headers(r.headers),
+      });
+    } else {
+      return response as Response;
+    }
   };
 
   return (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const discoveryClassification = classifyOAuthDiscoveryRequest(input);
+    const retryInput = hostMode() && refreshProvider && input instanceof Request ? input.clone() : input;
+    let grantInit = init;
+    if (hostMode() && refreshProvider && input instanceof Request) {
+      const headers = init?.headers ?? input.headers;
+      grantInit = { ...init, headers };
+      if (init?.body == null && (init?.method ?? input.method).toUpperCase() === "POST" && isFormEncoded(headers)) {
+        grantInit.body = await input.clone().text();
+      }
+    }
     // Token-endpoint refresh POSTs run through the transactional path: re-read
     // disk under a per-package cross-process lock, short-circuit on a still-valid
     // disk token, present the freshest refresh token, and recover/clear on
@@ -286,10 +316,10 @@ export function createResponseNormalizingFetch(
     let response: unknown;
     try {
       response =
-        // Any refresh-grant POST, whatever the endpoint's path: the discovered
-        // token endpoint need not contain "token" (held-file spender boundary).
-        refreshProvider && isRefreshGrantBody(init)
-          ? await runRefreshTransaction({ provider: refreshProvider, baseFetch }, input, init)
+        // Host mode also refuses grants at discovered endpoints such as /renew.
+        // Standalone retains its original token-endpoint routing gate.
+        refreshProvider && (hostMode() || isOAuthTokenEndpoint(input)) && isOAuthGrantBody(grantInit, "refresh_token")
+          ? await runRefreshTransaction({ provider: refreshProvider, baseFetch }, input, grantInit)
           : await baseFetch(input, init);
     } catch (error) {
       if (discoveryClassification) {
@@ -304,25 +334,28 @@ export function createResponseNormalizingFetch(
           : undefined;
       onOAuthDiscoveryRequest?.(discoveryClassification, classifyOAuthDiscoveryStatus(status));
     }
-    let normalizedResponse: Response;
-    if (
-      response !== null &&
-      typeof response === 'object' &&
-      'status' in response &&
-      'headers' in response &&
-      !(response instanceof Response)
-    ) {
-      // Cross-realm Response detected — re-wrap with globalThis.Response
-      const r = response as { body?: ReadableStream | null; status: number; statusText?: string; headers: HeadersInit };
-      normalizedResponse = new Response(r.body ?? null, {
-        status: r.status,
-        statusText: r.statusText ?? '',
-        headers: new Headers(r.headers),
-      });
-    } else {
-      normalizedResponse = response as Response;
-    }
+    const normalizedResponse = normalizeResponse(response);
 
+    if (hostMode() && refreshProvider && normalizedResponse.status === 401) {
+      const resourceUrl = refreshProvider.getHostGrantConfig()?.base_url;
+      const requestUrl = getRequestUrl(input);
+      const isResourceRequest = resourceUrl && requestUrl &&
+        new URL(requestUrl).origin === new URL(resourceUrl).origin &&
+        !discoveryClassification &&
+        (/token/i.test(new URL(resourceUrl).pathname) || !isOAuthTokenEndpoint(input)) &&
+        !isOAuthGrantBody(grantInit);
+      if (isResourceRequest) {
+        const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+        const bearer = headers.get("authorization")?.match(/^Bearer (.+)$/i)?.[1];
+        if (bearer) {
+          const disk = await pullHostAccess(refreshProvider, accessTokenHash(bearer));
+          if (typeof disk?.access_token === "string" && disk.access_token !== bearer) {
+            headers.set("Authorization", `Bearer ${disk.access_token}`);
+            return normalizeResponse(await baseFetch(retryInput, { ...init, headers }));
+          }
+        }
+      }
+    }
     if (isOAuthTokenEndpoint(input)) {
       await captureOAuthErrorIfPresent(normalizedResponse);
     }
@@ -422,16 +455,6 @@ export class HttpMcpClient implements McpClient {
     );
   }
   
-  private getStaticCredentials(): StaticOAuthCredentials | undefined {
-    if (this.config.oauthClientId) {
-      return {
-        clientId: this.config.oauthClientId,
-        clientSecret: this.config.oauthClientSecret,
-      };
-    }
-    return undefined;
-  }
-
   private getOAuthDiscoveryTrace(): OAuthDiscoveryTraceEntry[] {
     return this.oauthDiscoveryTrace.map((entry) => ({ ...entry }));
   }
@@ -573,9 +596,10 @@ export class HttpMcpClient implements McpClient {
   private async initializeOAuthIfNeeded(forceOAuth: boolean = false) {
     if (this.config.oauth && !this.oauthProvider) {
       // Use external provider if provided, otherwise create a new one
-      const staticCreds = this.getStaticCredentials();
+      const staticCreds = getStaticCredentials(this.config);
       const simpleProvider = this.externalOAuthProvider ?? new SimpleOAuthProvider(this.packageId, this.oauthPort, staticCreds);
       this.simpleOAuthProvider = simpleProvider;
+      simpleProvider.setHostGrantConfig(this.config);
       
       // Only initialize if we created it (external provider should already be initialized)
       if (!this.externalOAuthProvider) {
@@ -608,7 +632,7 @@ export class HttpMcpClient implements McpClient {
       } else {
         const tokens = await simpleProvider.tokens();
         
-        if (tokens && tokens.access_token) {
+        if (hostMode() || (tokens && tokens.access_token)) {
           this.oauthProvider = new RefreshOnlyOAuthProvider(simpleProvider);
           this.useOAuth = true;
           logger.debug("OAuth provider initialized for refresh-only mode (no browser)", { package_id: this.packageId });

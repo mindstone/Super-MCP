@@ -8,12 +8,11 @@ import {
   stripObtainedAtStamp,
   isRenewalHeld,
   buildRenewalPausedMessage,
-  hostRefreshMinRemainingMs,
-  oauthErrorLogFields,
   errorLogText,
   type OAuthErrorSummary,
 } from "./providers/simple.js";
 import { withTokenRefreshLock } from "./tokenRefreshLock.js";
+import { hostMode } from "./hostGrants.js";
 
 const logger = getLogger();
 
@@ -57,7 +56,7 @@ function tokenFp(token: unknown): string {
 }
 
 /** Compute remaining lifetime (ms) of a persisted access token, or undefined. */
-export function remainingLifetimeMs(diskTokens: any): number | undefined {
+function remainingLifetimeMs(diskTokens: any): number | undefined {
   const obtainedAt = diskTokens?.[OBTAINED_AT_FIELD];
   const expiresIn = diskTokens?.expires_in;
   if (typeof obtainedAt !== "number" || typeof expiresIn !== "number") {
@@ -271,10 +270,10 @@ export async function runRefreshTransaction(
       disk_access_remaining_ms: disk?.access_token ? remainingLifetimeMs(disk) : undefined,
     });
 
-    // Plan item S3-1a: another machine owns this refresh token. Refuse before
+    // The host owns renewal. Refuse before
     // any POST: no SDK-supplied fallback, no marker change, no synthesized
     // success (so not even the valid-access short-circuit below).
-    if (isRenewalHeld(disk)) {
+    if (hostMode() || isRenewalHeld(disk)) {
       logger.info("Refresh refused: renewal is held by the host", { package_id: packageId });
       return new Response(
         JSON.stringify({ error: "temporarily_unavailable", error_description: buildRenewalPausedMessage(packageId) }),
@@ -286,10 +285,7 @@ export async function runRefreshTransaction(
     // refreshed). Avoid a network POST AND avoid burning a single-use refresh
     // token. The SDK parses the synthesized response and re-persists idempotently.
     const remaining = disk?.access_token ? remainingLifetimeMs(disk) : undefined;
-    // A host `refresh` op asks for more remaining life than the default skew;
-    // the same threshold judges peer rotation after an invalid_grant below.
-    const minRemainingMs = Math.max(ACCESS_TOKEN_SKEW_MS, hostRefreshMinRemainingMs() ?? 0);
-    if (disk?.access_token && typeof remaining === "number" && remaining > minRemainingMs) {
+    if (disk?.access_token && typeof remaining === "number" && remaining > ACCESS_TOKEN_SKEW_MS) {
       logger.info("Refresh short-circuited: on-disk access token still valid", {
         package_id: packageId,
         remaining_ms: remaining,
@@ -358,7 +354,7 @@ export async function runRefreshTransaction(
         // prompt instead of silently re-failing on a now-dead grant.
         logger.error("Refresh succeeded but the token response body was unreadable", {
           package_id: packageId,
-          error: errorLogText(error),
+          error: error instanceof Error ? error.message : String(error),
         });
         await provider
           .clearTokensAndMarkNeedsReconnect({
@@ -404,7 +400,7 @@ export async function runRefreshTransaction(
       } catch (error) {
         logger.error("Refresh rotated a token but persistence failed — flagging reconnect", {
           package_id: packageId,
-          error: errorLogText(error),
+          error: error instanceof Error ? error.message : String(error),
         });
         // The on-disk token is now dead (the server consumed it) and we could not
         // store the replacement. Fail closed: mark reconnect and re-throw so the
@@ -446,13 +442,13 @@ export async function runRefreshTransaction(
     // (4) invalid_grant on the token we presented. Distinguish a lost race
     // (peer rotated, hasn't persisted yet — FM5 TOCTOU) from a genuinely dead
     // grant via bounded re-reads with jittered backoff.
-    const errorFields = oauthErrorLogFields(summary);
     logger.info("Refresh transaction: invalid_grant on presented token; checking for peer rotation", {
       package_id: packageId,
       pid: process.pid,
       presented_refresh_fp: tokenFp(refreshTokenToSend),
-      ...(errorFields.error ? { server_error: errorFields.error } : {}),
-      ...(errorFields.error_description ? { server_error_description: errorFields.error_description } : {}),
+      ...(summary
+        ? { server_error: summary.error, server_error_description: summary.error_description }
+        : {}),
     });
     for (let attempt = 0; attempt < TOCTOU_MAX_ATTEMPTS; attempt++) {
       assertLockHealthy();
@@ -469,7 +465,7 @@ export async function runRefreshTransaction(
       const recheckRemaining = recheck?.access_token ? remainingLifetimeMs(recheck) : undefined;
       const peerRotated =
         (recheckRefresh && recheckRefresh !== refreshTokenToSend) ||
-        (typeof recheckRemaining === "number" && recheckRemaining > minRemainingMs);
+        (typeof recheckRemaining === "number" && recheckRemaining > ACCESS_TOKEN_SKEW_MS);
 
       if (peerRotated && recheck?.access_token) {
         logger.info("Refresh lost a race but a peer rotated — recovering from disk", {
@@ -510,7 +506,7 @@ export async function runRefreshTransaction(
       presented_refresh_fp: presentedFp,
       disk_refresh_fp: finalDiskFp,
       disk_matches_presented: presentedFp !== "none" && presentedFp === finalDiskFp,
-      ...errorFields,
+      ...(summary ? summary : {}),
     });
     await provider.clearTokensAndMarkNeedsReconnect(summary);
     return response;

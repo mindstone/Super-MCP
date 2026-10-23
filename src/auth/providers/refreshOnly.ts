@@ -54,7 +54,7 @@ export class RefreshOnlyOAuthProvider implements OAuthClientProvider {
   }
   
   async redirectToAuthorization(_authUrl: URL): Promise<void> {
-    // Plan item S3-1d: a held package waits for its host to renew it, so say
+    // A held package waits for its host to renew it, so say
     // "paused", not "sign in" (the person needs no action).
     if (await this.delegate.isRenewalPaused()) {
       throw new Error(buildRenewalPausedMessage(this.delegate.getPackageId()));

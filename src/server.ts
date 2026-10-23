@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import crypto from "node:crypto";
+import { once } from "node:events";
 import express from "express";
 import { ERROR_CODES } from "./types.js";
 import { PackageRegistry } from "./registry.js";
@@ -46,7 +47,8 @@ import {
   drainInFlightTokenRefreshes,
 } from "./auth/tokenRefreshLock.js";
 import { resolveToolTarget } from "./toolTargetResolution.js";
-import { applyStartupRenewalHold, handleHostOpRequest } from "./auth/hostOps.js";
+import { handleHostOpRequest } from "./auth/hostOps.js";
+import { hostMode, prepareHostGrants, validateHostGrantsDirectory } from "./auth/hostGrants.js";
 
 // FM6 (260706_mcp-oauth-fm6-graceful-drain): give an in-flight single-use
 // refresh-token rotation time to finish its atomic persist before we exit, so a
@@ -449,7 +451,7 @@ export function registerHttpApiRoutes(
     }
   });
 
-  // Host-only OAuth file operations (auth/hostOps.ts). Loopback + JSON only: a
+  // OAuth file operations for host integration (auth/hostOps.ts). Loopback + JSON only: a
   // cross-origin form POST can't send application/json without a preflight.
   app.post("/api/oauth/host", dnsRebindingGuard, async (req, res) => {
     if (!req.is("application/json")) {
@@ -457,7 +459,6 @@ export function registerHttpApiRoutes(
       return;
     }
     const result = await handleHostOpRequest(req.body, {
-      getPackage: (packageId) => registry.getPackage(packageId),
       onCredentialsChanged: async (packageId) => {
         if (!registry.getPackage(packageId)) return;
         await registry.restartPackage(packageId);
@@ -535,14 +536,12 @@ export async function startServer(options: {
   });
 
   try {
-    // Plan item S3-2: hold host-owned refresh tokens before any discovery can
-    // spend one (a no-op unless SUPER_MCP_HOLD_RENEWAL is set).
-    await applyStartupRenewalHold();
     const registry = await PackageRegistry.fromConfigFiles(paths);
     registry.startIdleReaper();
     const catalog = new Catalog(registry);
     const catalogRefresher = new CatalogRefresher(catalog, registry);
-    catalogRefresher.start();
+    await validateHostGrantsDirectory();
+    if (!hostMode()) catalogRefresher.start();
     const validator = getValidator();
     
     const configWatcher = new ConfigWatcher(paths, () =>
@@ -1252,6 +1251,9 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           });
         }
       });
+      if (hostMode()) {
+        await once(httpServer, "listening");
+      }
     } else {
       const server = createMcpServer();
       const stdioTransport = new StdioServerTransport();
@@ -1302,7 +1304,14 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
         });
       }
     }
-    
+
+    if (hostMode()) {
+      // Listening precedes discovery and legacy offers; host mode already
+      // refuses every local renewal, even if an individual preparation fails.
+      await prepareHostGrants(id => registry.getPackage(id));
+      catalogRefresher.start();
+    }
+
   } catch (error) {
     logger.fatal("Failed to start server", {
       error: formatError(error),

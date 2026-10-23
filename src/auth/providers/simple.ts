@@ -5,7 +5,10 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { homedir } from "os";
 import { randomBytes } from "crypto";
-import { AsyncLocalStorage } from "node:async_hooks";
+import type { PackageConfig } from "../../types.js";
+import {
+  hostMode, pullHostAccess, offerHostGrant, hostAccessCache, buildRenewalSpec, markHostReconnect,
+} from "../hostGrants.js";
 import { withTokenRefreshLock } from "../tokenRefreshLock.js";
 import {
   buildRedirectUriRejectedError,
@@ -19,6 +22,15 @@ const OAUTH_TOKEN_DIR_ENV = "SUPER_MCP_OAUTH_TOKEN_DIR";
 
 function getOAuthTokenStoragePath(): string {
   return process.env[OAUTH_TOKEN_DIR_ENV] || path.join(homedir(), ".super-mcp", "oauth-tokens");
+}
+
+export async function listOAuthTokenPackages(): Promise<string[]> {
+  const files = await fs.readdir(getOAuthTokenStoragePath()).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return [];
+    throw error;
+  });
+  const suffix = "_tokens.json";
+  return files.filter(file => file.endsWith(suffix)).map(file => file.slice(0, -suffix.length));
 }
 
 /**
@@ -42,12 +54,16 @@ export function stripObtainedAtStamp(tokens: any): any {
   if (!tokens || typeof tokens !== "object") {
     return tokens;
   }
-  const { [OBTAINED_AT_FIELD]: _omit, [RENEWAL_HELD_FIELD]: _held, ...rest } = tokens;
+  const {
+    [OBTAINED_AT_FIELD]: _omit,
+    [RENEWAL_HELD_FIELD]: _held,
+    ...rest
+  } = tokens;
   return rest;
 }
 
 /**
- * Private field a host (via POST /api/oauth/host or SUPER_MCP_HOLD_RENEWAL) sets
+ * Private field the host sets
  * on a token file whose refresh token another machine owns. A held file is never
  * used to POST a refresh, never gets a refresh token back from a non-interactive
  * save, and is never cleared by a dead-grant verdict here. Standalone use never
@@ -59,33 +75,24 @@ export function isRenewalHeld(tokens: unknown): boolean {
   return !!tokens && typeof tokens === "object" && (tokens as any)[RENEWAL_HELD_FIELD] === true;
 }
 
-// Set while a host `refresh` op runs (auth/hostOps.ts): its minimum remaining
-// life raises the refresh short-circuit threshold, and its logs are bounded.
-const hostRefreshScope = new AsyncLocalStorage<{ minRemainingMs: number }>();
-
-export function withHostRefreshScope<T>(minRemainingMs: number, fn: () => Promise<T>): Promise<T> {
-  return hostRefreshScope.run({ minRemainingMs }, fn);
-}
-
-export function hostRefreshMinRemainingMs(): number | undefined {
-  return hostRefreshScope.getStore()?.minRemainingMs;
-}
-
-/**
- * Plan item S3-4 (invariant 11): inside a host owner refresh, logs carry only a
- * bounded OAuth error code, never provider descriptions; standalone keeps today's
- * fields.
- */
+/** Host-mode errors are bounded; standalone retains its existing diagnostics. */
 export function oauthErrorLogFields(summary: OAuthErrorSummary | undefined): Partial<OAuthErrorSummary> {
   if (!summary) return {};
-  if (!hostRefreshScope.getStore()) return { ...summary };
-  return { error: /^[A-Za-z0-9_.-]{1,64}$/.test(summary.error) ? summary.error : "unrecognized" };
+  if (!hostMode()) return { ...summary };
+  const knownErrors = [
+    "invalid_request", "invalid_client", "invalid_grant", "unauthorized_client",
+    "unsupported_grant_type", "invalid_scope",
+  ];
+  return { error: knownErrors.includes(summary.error) ? summary.error : "unrecognized" };
 }
 
-/** Error text for logs; inside a host owner refresh only its name or code (parser messages echo input). */
 export function errorLogText(error: unknown): string {
-  if (!hostRefreshScope.getStore()) return error instanceof Error ? error.message : String(error);
-  return String((error as NodeJS.ErrnoException)?.code ?? (error instanceof Error ? error.name : typeof error));
+  if (!hostMode()) return error instanceof Error ? error.message : String(error);
+  return error instanceof Error ? error.name : typeof error;
+}
+
+export function getStaticCredentials(config: PackageConfig): StaticOAuthCredentials | undefined {
+  return config.oauthClientId ? { clientId: config.oauthClientId, clientSecret: config.oauthClientSecret } : undefined;
 }
 
 /** Tool-facing text while a held package waits for its host to renew it. */
@@ -235,7 +242,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   constructor(packageId: string, oauthPort: number = 5173, staticCredentials?: StaticOAuthCredentials) {
     this.packageId = packageId;
     this.oauthPort = oauthPort;
-    this.tokenStoragePath = getOAuthTokenStoragePath();
+    this.tokenStoragePath = hostMode() ? path.resolve(getOAuthTokenStoragePath()) : getOAuthTokenStoragePath();
     this.staticCredentials = staticCredentials;
     
     // Pre-populate client info from static credentials (skips DCR)
@@ -247,7 +254,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       };
       logger.info("Using pre-registered OAuth client credentials (DCR skipped)", {
         package_id: packageId,
-        client_id: staticCredentials.clientId,
+        ...(!hostMode() ? { client_id: staticCredentials.clientId } : {}),
       });
     }
   }
@@ -310,6 +317,16 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     }
   }
   
+  private hostGrantConfig?: PackageConfig;
+
+  setHostGrantConfig(config: PackageConfig): void {
+    this.hostGrantConfig = config;
+  }
+
+  getHostGrantConfig(): PackageConfig | undefined {
+    return this.hostGrantConfig;
+  }
+
   async initialize() {
     await this.loadPersistedData();
   }
@@ -323,7 +340,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
         this.savedClientInfo = JSON.parse(clientData);
         logger.debug("Loaded persisted client info", { 
           package_id: this.packageId,
-          client_id: this.savedClientInfo?.client_id 
+          ...(!hostMode() ? { client_id: this.savedClientInfo?.client_id } : {}),
         });
       } catch (error) {
         // No saved client info
@@ -366,7 +383,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       };
       logger.debug("Restored static OAuth client info after invalidation", {
         package_id: this.packageId,
-        client_id: this.staticCredentials.clientId,
+        ...(!hostMode() ? { client_id: this.staticCredentials.clientId } : {}),
       });
     }
     return this.savedClientInfo;
@@ -383,7 +400,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       };
       logger.debug("Updated static OAuth client info (credentials preserved)", {
         package_id: this.packageId,
-        client_id: this.staticCredentials.clientId,
+        ...(!hostMode() ? { client_id: this.staticCredentials.clientId } : {}),
       });
       return;
     }
@@ -396,13 +413,13 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       await fs.writeFile(clientPath, JSON.stringify(info, null, 2), { mode: 0o600 });
       logger.info("OAuth client information saved to disk", { 
         package_id: this.packageId,
-        client_id: info?.client_id,
-        path: clientPath
+        ...(!hostMode() ? { client_id: info?.client_id } : {}),
+        ...(!hostMode() ? { path: clientPath } : {}),
       });
     } catch (error) {
       logger.error("Failed to persist OAuth client info", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error)
+        error: errorLogText(error)
       });
     }
   }
@@ -421,15 +438,10 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     return this.packageId;
   }
 
-  /** Absolute path of the persisted DCR client registration for this package. */
-  getClientFilePath(): string {
-    return path.join(this.tokenStoragePath, `${this.packageId}_client.json`);
-  }
-
   /** True when the token file is held by the host and no reconnect is flagged. */
   async isRenewalPaused(): Promise<boolean> {
     const disk = await this.readDiskTokens().catch(() => undefined);
-    if (!isRenewalHeld(disk)) {
+    if (!hostMode() && !isRenewalHeld(disk)) {
       return false;
     }
     const marker = await SimpleOAuthProvider.readNeedsReconnectMarkerState(this.packageId);
@@ -453,10 +465,16 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       }
       throw error;
     }
+    if (hostMode() && !raw.trim()) return undefined; // token-lock placeholder
     return JSON.parse(raw) as any;
   }
 
   async tokens() {
+    if (hostMode()) {
+      const disk = await pullHostAccess(this);
+      this.savedTokens = disk;
+      return this.stripInternalFields(disk);
+    }
     // Re-read disk every call so a process that entered after a peer rotated the
     // refresh token observes the fresh token (the SDK's retry-after-invalidate
     // then converges). Keep the in-memory mirror coherent with disk.
@@ -484,12 +502,13 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   }
 
   /**
-   * Strip private bookkeeping fields before handing tokens to the SDK. Plan item
-   * S3-1a: a held file's refresh token belongs to another machine, so the SDK
+   * Strip private bookkeeping fields before handing tokens to the SDK.
+   * a held file's refresh token belongs to another machine, so the SDK
    * never sees it and no refresh POST can carry it, whatever the endpoint URL.
    */
   private stripInternalFields(tokens: any): any {
-    if (isRenewalHeld(tokens)) {
+    if (hostMode() || isRenewalHeld(tokens)) {
+      if (!tokens) return undefined;
       const { refresh_token: _owned, ...accessOnly } = tokens;
       return stripObtainedAtStamp(accessOnly);
     }
@@ -510,7 +529,11 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
    * guard. Non-authoritative writes (the SDK's unavoidable second save, racing
    * peers) are guarded so they cannot downgrade a newer on-disk token.
    */
-  private async mergeAndPersistTokens(tokens: any, authoritative: boolean): Promise<any> {
+  private async mergeAndPersistTokens(
+    tokens: any,
+    authoritative: boolean,
+    renewal?: Awaited<ReturnType<typeof buildRenewalSpec>>,
+  ): Promise<any> {
     // Compute the refresh-token-preserve merge against the ON-DISK value read
     // immediately before write — never the (possibly stale) in-memory mirror —
     // so a concurrent peer's freshly-rotated refresh_token is not clobbered by a
@@ -528,8 +551,14 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       onDisk = this.savedTokens;
     }
 
+    // In host mode only a new interactive grant may save here. Access caches
+    // come from the host pull; a delayed SDK echo cannot replace that cache.
+    if (hostMode() && !this.redirectStarted) {
+      this.savedTokens = onDisk;
+      return onDisk;
+    }
     const mergeBase = onDisk ?? this.savedTokens ?? {};
-    const mergedTokens: any = {
+    let mergedTokens: any = {
       ...mergeBase,
       ...tokens,
     };
@@ -541,14 +570,14 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       mergedTokens.refresh_token = mergeBase.refresh_token;
     }
 
-    // Plan item S3-1b: on a held file only an interactive authorization-code
+    // On a held file only an interactive authorization-code
     // save (this provider opened the browser) may write a refresh token; every
     // other save keeps disk's refresh token, or none. The field always stays, so
-    // a new grant is held until the host exports it.
-    if (isRenewalHeld(onDisk)) {
+    // a new grant is held until the host accepts its offer.
+    if (hostMode() || isRenewalHeld(onDisk)) {
       mergedTokens[RENEWAL_HELD_FIELD] = true;
       if (!this.redirectStarted) {
-        if (typeof onDisk.refresh_token === "string") {
+        if (typeof onDisk?.refresh_token === "string") {
           mergedTokens.refresh_token = onDisk.refresh_token;
         } else {
           delete mergedTokens.refresh_token;
@@ -579,6 +608,15 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       mergedTokens[OBTAINED_AT_FIELD] = Date.now();
     }
 
+    if (hostMode()) {
+      // New authorization-code grants are offered durably before the cache write.
+      // Routine SDK echoes cannot install a grant or restore renewal credentials.
+      if (this.redirectStarted && !tokens?.refresh_token) delete mergedTokens.refresh_token;
+      if (!(await offerHostGrant(this, mergedTokens, false, renewal))) {
+        throw new Error("The host could not save this sign-in. Please try again.");
+      }
+      mergedTokens = hostAccessCache(mergedTokens);
+    }
     await this.atomicWriteTokens(mergedTokens);
     this.savedTokens = mergedTokens;
     // Record the authoritative token set we just wrote so the SDK's subsequent
@@ -595,7 +633,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     }
     logger.info("OAuth tokens saved to disk", {
       package_id: this.packageId,
-      path: this.getTokenFilePath(),
+      ...(!hostMode() ? { path: this.getTokenFilePath() } : {}),
       has_refresh_token: !!mergedTokens.refresh_token,
     });
     return mergedTokens;
@@ -730,10 +768,13 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
    * reader sees the old file or the new file in full, never a torn intermediate.
    * graceful-fs (installed at boot) retries transient EPERM/EMFILE, incl. the
    * Windows file-in-use window on rename. Throws on failure — no silent swallow.
-   * Host ops also write the client and pending-export files through it
-   * (`targetPath`), holding withTokenRefreshLock for this package.
+   * Pending grant offers use `targetPath` while holding this package's token lock.
    */
-  async atomicWriteTokens(mergedTokens: any, targetPath: string = this.getTokenFilePath()): Promise<void> {
+  async atomicWriteTokens(
+    mergedTokens: any,
+    targetPath: string = this.getTokenFilePath(),
+    strictDirectorySync = false,
+  ): Promise<void> {
     const targetDir = path.dirname(targetPath);
     await fs.mkdir(targetDir, { recursive: true, mode: 0o700 });
     const tempPath = path.join(
@@ -759,7 +800,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       // rename but before the dir metadata is flushed could otherwise revert to
       // the old, now-consumed token file). Best-effort: some platforms (Windows)
       // do not permit opening a directory for fsync — tolerate that specific case.
-      await this.fsyncDir(targetDir);
+      await this.fsyncDir(targetDir, strictDirectorySync);
     } catch (error) {
       // Best-effort cleanup of the temp file if anything failed after we created
       // it; surface the original failure (no silent swallow).
@@ -771,19 +812,23 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   }
 
   /** fsync a directory entry. Tolerates platforms that disallow O_RDONLY on dirs. */
-  private async fsyncDir(dirPath: string): Promise<void> {
+  private async fsyncDir(dirPath: string, strict = false): Promise<void> {
     let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
     try {
       handle = await fs.open(dirPath, "r");
       await handle.sync();
     } catch (error) {
+      if (strict && !(process.platform === "win32" &&
+          ["EISDIR", "EPERM", "EACCES"].includes((error as NodeJS.ErrnoException).code ?? ""))) {
+        throw error;
+      }
       // Windows (and some FS) reject opening a directory for fsync (EISDIR/EPERM/
       // EACCES). The file-content fsync above is the load-bearing durability step;
       // the dir fsync is belt-and-braces, so degrade quietly with a debug log
       // rather than failing an otherwise-successful write.
       logger.debug("Directory fsync skipped (unsupported on this platform/FS)", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorLogText(error),
       });
     } finally {
       if (handle) {
@@ -793,28 +838,35 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   }
 
   async saveTokens(tokens: any) {
-    // Public SDK hook, run under the package's token lock (Plan item S3-5), so
-    // a save that read the file before a host hold or export can't write over
-    // it afterwards. A routine save is TOLERANT: the transactional refresh has
-    // already persisted the rotation under the lock (fail-closed), so a failure
-    // here is logged, not thrown. A new interactive grant (this provider opened
-    // the browser) waits longer for the lock and FAILS the sign-in if it can't
-    // be saved, so the person retries; it is never written without the lock.
-    const interactive = this.redirectStarted;
+    // Ordinary standalone saves retain the tolerant, unlocked SDK hook. Host or
+    // held saves share the offer's lock; a new interactive grant must be durable.
+    const locked = hostMode() || isRenewalHeld(await this.readDiskTokens().catch(() => undefined));
+    const interactive = locked && this.redirectStarted;
     try {
-      await withTokenRefreshLock(
-        this.packageId,
-        this.getTokenFilePath(),
-        () => this.mergeAndPersistTokens(tokens, false),
-        interactive ? { retries: { ...INTERACTIVE_SAVE_LOCK_RETRIES } } : undefined,
-      );
+      if (locked) {
+        let renewal: Awaited<ReturnType<typeof buildRenewalSpec>>;
+        if (hostMode() && interactive && tokens?.refresh_token) {
+          renewal = await buildRenewalSpec(this);
+          if (!renewal) await markHostReconnect(this);
+        }
+        await withTokenRefreshLock(
+          this.packageId,
+          this.getTokenFilePath(),
+          () => this.mergeAndPersistTokens(tokens, false, renewal),
+          interactive ? { retries: { ...INTERACTIVE_SAVE_LOCK_RETRIES } } : undefined,
+        );
+      } else {
+        await this.mergeAndPersistTokens(tokens, false);
+      }
     } catch (error) {
       logger.error("Failed to persist OAuth tokens", {
         package_id: this.packageId,
-        interactive,
-        error: error instanceof Error ? error.message : String(error),
+        ...(locked ? { interactive } : {}),
+        error: errorLogText(error),
       });
       if (interactive) throw error;
+    } finally {
+      if (hostMode() && interactive) this.redirectStarted = false;
     }
   }
 
@@ -861,8 +913,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
         // (k3 F1), so this log is the observability channel for both the
         // accepted/rejected Location shapes and why a probe failed open
         // (runtime-safety F7).
-        location: verdict.location,
-        error: verdict.error,
+        ...(!hostMode() ? { location: verdict.location, error: verdict.error } : {}),
       });
       if (verdict.outcome === "rejected") {
         // redirectStarted is set only AFTER the probe verdict (recall#2
@@ -879,7 +930,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     this.redirectStarted = true;
     logger.info("Opening browser for OAuth", {
       package_id: this.packageId,
-      url: authUrl.toString()
+      ...(!hostMode() ? { url: authUrl.toString() } : {}),
     });
     
     const clientId = authUrl.searchParams.get('client_id');
@@ -890,7 +941,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       };
       logger.info("Extracted client_id from OAuth URL", {
         package_id: this.packageId,
-        client_id: clientId
+        ...(!hostMode() ? { client_id: clientId } : {}),
       });
     }
     
@@ -909,7 +960,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       child.on('error', (err) => {
         logger.error("Failed to open browser", {
           package_id: this.packageId,
-          error: err.message
+          error: errorLogText(err)
         });
       });
       child.unref();
@@ -917,7 +968,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     } catch (error) {
       logger.error("Failed to open browser", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error)
+        error: errorLogText(error)
       });
     }
   }
@@ -1038,7 +1089,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       // prior token exchange) — debug level is the right volume for that.
       logger.debug("hasPersistedAccessToken: token file unreadable; the probe will run", {
         package_id: packageId,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorLogText(error),
       });
       return false;
     }
@@ -1052,9 +1103,9 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
    * after bounded backoff). Idempotent.
    */
   async clearTokensAndMarkNeedsReconnect(reason: OAuthErrorSummary | undefined): Promise<void> {
-    // Plan item S3-1c: a held file is never cleared by a verdict on this machine;
+    // A held file is never cleared by a verdict on this machine;
     // only the owner of the refresh token may declare the grant dead.
-    if (isRenewalHeld(await this.readDiskTokens().catch(() => undefined))) {
+    if (hostMode() || isRenewalHeld(await this.readDiskTokens().catch(() => undefined))) {
       logger.warn("Dead-grant clear skipped: renewal is held by the host", { package_id: this.packageId });
       return;
     }
@@ -1067,7 +1118,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
         logger.warn("Failed to delete dead OAuth token file", {
           package_id: this.packageId,
-          error: error instanceof Error ? error.message : String(error),
+          error: errorLogText(error),
         });
       }
     }
@@ -1086,7 +1137,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     } catch (error) {
       logger.error("Failed to write needsReconnect marker", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error),
+        error: errorLogText(error),
       });
     }
 
@@ -1119,8 +1170,8 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       disk = undefined;
     }
 
-    if (isRenewalHeld(disk)) {
-      // Plan item S3-1c: never clear a held file (see clearTokensAndMarkNeedsReconnect).
+    if (hostMode() || isRenewalHeld(disk)) {
+      // Never clear a held file (see clearTokensAndMarkNeedsReconnect).
       logger.warn("Token invalidation (refresh-only): renewal held by the host, preserving", {
         package_id: this.packageId,
       });
@@ -1292,7 +1343,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     } catch (error) {
       logger.debug("Error invalidating stale OAuth credentials", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error)
+        error: errorLogText(error)
       });
       return false;
     }
