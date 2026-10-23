@@ -267,6 +267,7 @@ function createApiHarness(
     get(path: string, ...handlers: RequestHandler[]) {
       routes.set(path, handlers);
     },
+    post() {},
   } as unknown as Express;
   registerHttpApiRoutes(app, {
     registry,
