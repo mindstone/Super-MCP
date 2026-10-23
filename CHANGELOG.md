@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Host-managed OAuth grants.** With `SUPER_MCP_HOST_GRANTS_DIR` and `MCP_HOST_BRIDGE_STATE`, the router offers grants durably to its host and borrows access tokens without renewing them locally. The loopback JSON endpoint `/api/oauth/host` exists in both modes: `grant_changed` is host-mode only, while `release_all` releases held files in either mode and returns a `skipped` count for files it could not release. A released file that holds only a borrowed access token, with no refresh token, is deleted and leaves a reconnect marker; empty lock placeholders are removed too. Without these variables, ordinary standalone OAuth keeps its existing behavior.
 - **`ToolNotesStore.whenIdle()`** resolves once any compaction a `readSnapshot()` started in the background has finished. `readSnapshot()` still does not wait for it; call `whenIdle()` before deleting the notes directory (tests, shutdown) so the compaction's lock and temp file cannot land in a directory being removed.
 
+### Changed
+- OAuth error logs record only the error code, never the provider's description.
+
 ### Fixed
 - A request body counts as a token refresh only when it is form-encoded.
 - **Host-owned renewal stays under the token lock.** In host mode, refresh-grant requests are refused whatever the token endpoint's path. Saves in host mode or to held files take the same per-package lock. The first save after a browser redirect waits up to about 20 s for that lock (inside the 30 s token-exchange timeout); if it cannot save, sign-in fails so the person can retry. Routine saves that cannot get the lock are logged and dropped. Ordinary standalone saves retain their existing behavior.

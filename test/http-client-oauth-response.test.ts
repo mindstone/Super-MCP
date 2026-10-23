@@ -388,8 +388,9 @@ describe('HttpMcpClient cross-realm Response handling', () => {
     expect(warnWithError).toBeDefined();
     expect(warnWithError?.[1]).toMatchObject({
       error: 'invalid_grant',
-      error_description: 'Refresh token expired',
     });
+    expect(JSON.stringify(Object.values(mockLogger).flatMap((fn) => fn.mock.calls)))
+      .not.toMatch(/error_description|server_error_description|Refresh token expired/);
 
     // Tokens preserved (peer may have rotated; a dead grant is cleared by the
     // transactional fetch wrapper, not here).

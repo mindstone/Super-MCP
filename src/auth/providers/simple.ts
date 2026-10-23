@@ -10,6 +10,7 @@ import {
   hostMode, pullHostAccess, offerHostGrant, hostAccessCache, buildRenewalSpec, markHostReconnect,
 } from "../hostGrants.js";
 import { withTokenRefreshLock } from "../tokenRefreshLock.js";
+import { knownOAuthErrors as knownErrors } from "../oauthErrorLogging.js";
 import {
   buildRedirectUriRejectedError,
   isAuthorizeProbeDisabled,
@@ -75,15 +76,10 @@ export function isRenewalHeld(tokens: unknown): boolean {
   return !!tokens && typeof tokens === "object" && (tokens as any)[RENEWAL_HELD_FIELD] === true;
 }
 
-/** Host-mode errors are bounded; standalone retains its existing diagnostics. */
-export function oauthErrorLogFields(summary: OAuthErrorSummary | undefined): Partial<OAuthErrorSummary> {
+/** Log only bounded OAuth error codes, never provider descriptions. */
+export function oauthErrorLogFields(summary: OAuthErrorSummary | undefined): Partial<Pick<OAuthErrorSummary, "error">> {
   if (!summary) return {};
-  if (!hostMode()) return { ...summary };
-  const knownErrors = [
-    "invalid_request", "invalid_client", "invalid_grant", "unauthorized_client",
-    "unsupported_grant_type", "invalid_scope",
-  ];
-  return { error: knownErrors.includes(summary.error) ? summary.error : "unrecognized" };
+  return { error: knownErrors.find((code) => code === summary.error) ?? "unrecognized" };
 }
 
 export function errorLogText(error: unknown): string {
