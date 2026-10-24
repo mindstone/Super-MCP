@@ -1102,8 +1102,10 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
 
       const mcpHandler = async (req: any, res: any) => {
         try {
-          const packageId = req.params.id as string | undefined;
-          if (packageId !== undefined && (!registry.getPackage(packageId) || registry.isPackageHomed(packageId))) {
+          const requestedId = req.params.id as string | undefined;
+          // Use the configured package's own id from here on, never the request's string.
+          const packageId = requestedId === undefined ? undefined : registry.getPackage(requestedId)?.id;
+          if (requestedId !== undefined && (packageId === undefined || registry.isPackageHomed(packageId))) {
             res.status(404).json({ error: "Package not found" });
             return;
           }
