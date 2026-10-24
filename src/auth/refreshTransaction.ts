@@ -1,7 +1,7 @@
 import * as fs from "fs/promises";
-import { createHash } from "node:crypto";
 import { OAuthTokensSchema } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { getLogger } from "../logging.js";
+import { oauthErrorLogFields, oauthErrorLogText } from "./oauthErrorLogging.js";
 import {
   SimpleOAuthProvider,
   OBTAINED_AT_FIELD,
@@ -31,24 +31,6 @@ function jitteredDelay(attempt: number): number {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-/**
- * Non-reversible short identity of a token for diagnostics. NEVER logs the token
- * material itself — a truncated SHA-256 (32 bits) is enough to compare identity
- * across log lines (presented-vs-disk, before-vs-after rotation) but far too
- * little to reconstruct the secret. `"none"` for an absent token. This is the
- * load-bearing discriminator for the residual grant-death investigation
- * (260630_mcp-oauth-refresh-race): at invalid_grant, `disk_matches_presented`
- * being true is the crash-before-persist (FM6) signature — the token we
- * presented is still the one on disk and it is dead, i.e. a peer consumed the
- * rotation but never persisted the replacement.
- */
-function tokenFp(token: unknown): string {
-  if (typeof token !== "string" || token.length === 0) {
-    return "none";
-  }
-  return createHash("sha256").update(token).digest("hex").slice(0, 8);
 }
 
 /** Compute remaining lifetime (ms) of a persisted access token, or undefined. */
@@ -247,22 +229,18 @@ export async function runRefreshTransaction(
         // lock with no disk tokens and persist-or-fail-closed on success.
         logger.warn("Refresh transaction could not read disk tokens; proceeding under lock with no disk tokens", {
           package_id: packageId,
-          error: error instanceof Error ? error.message : String(error),
+          error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
         });
       }
       disk = undefined;
     }
 
-    // Diagnostics (info-level so it survives the default deployed log level):
-    // capture the identity of what we're about to work with. This is the entry
-    // point for the residual grant-death investigation — pid + fingerprints let a
-    // post-mortem reconstruct whether two processes presented the same token and
-    // whether disk moved under us.
+    // Record credential presence without logging token-derived identifiers.
     logger.info("Refresh transaction: evaluating", {
       package_id: packageId,
       pid: process.pid,
-      disk_refresh_fp: tokenFp(disk?.refresh_token),
-      supplied_refresh_fp: tokenFp(supplied.refreshToken),
+      disk_refresh: !!disk?.refresh_token,
+      supplied_refresh: !!supplied.refreshToken,
       disk_access_remaining_ms: disk?.access_token ? remainingLifetimeMs(disk) : undefined,
     });
 
@@ -290,14 +268,11 @@ export async function runRefreshTransaction(
       return baseFetch(input, init);
     }
 
-    // Diagnostics: we are about to consume a single-use refresh token on the
-    // wire. If the process dies between here and the persist below, the on-disk
-    // token becomes dead-but-unrotated (FM6). Logging the presented fingerprint
-    // lets a later invalid_grant be matched back to this exact attempt.
+    // Record the attempt before consuming a single-use refresh token.
     logger.info("Refresh transaction: presenting refresh token to server", {
       package_id: packageId,
       pid: process.pid,
-      presented_refresh_fp: tokenFp(refreshTokenToSend),
+      presented_refresh: true,
       source: diskRefreshToken ? "disk" : "sdk-supplied",
     });
 
@@ -339,7 +314,7 @@ export async function runRefreshTransaction(
         // prompt instead of silently re-failing on a now-dead grant.
         logger.error("Refresh succeeded but the token response body was unreadable", {
           package_id: packageId,
-          error: error instanceof Error ? error.message : String(error),
+          error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
         });
         await provider
           .clearTokensAndMarkNeedsReconnect({
@@ -385,7 +360,7 @@ export async function runRefreshTransaction(
       } catch (error) {
         logger.error("Refresh rotated a token but persistence failed — flagging reconnect", {
           package_id: packageId,
-          error: error instanceof Error ? error.message : String(error),
+          error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
         });
         // The on-disk token is now dead (the server consumed it) and we could not
         // store the replacement. Fail closed: mark reconnect and re-throw so the
@@ -403,8 +378,8 @@ export async function runRefreshTransaction(
       logger.info("Refresh transaction: rotated and persisted under lock", {
         package_id: packageId,
         pid: process.pid,
-        presented_refresh_fp: tokenFp(refreshTokenToSend),
-        new_refresh_fp: tokenFp(persisted?.refresh_token),
+        presented_refresh: true,
+        new_refresh: !!persisted?.refresh_token,
       });
       // N1 — Return a Response built from the MERGED PERSISTED token set (what we
       // actually wrote to disk under the lock), NOT the raw parsed `rotated` body.
@@ -430,9 +405,9 @@ export async function runRefreshTransaction(
     logger.info("Refresh transaction: invalid_grant on presented token; checking for peer rotation", {
       package_id: packageId,
       pid: process.pid,
-      presented_refresh_fp: tokenFp(refreshTokenToSend),
+      presented_refresh: true,
       ...(summary
-        ? { server_error: summary.error, server_error_description: summary.error_description }
+        ? { server_error: oauthErrorLogFields(summary).error }
         : {}),
     });
     for (let attempt = 0; attempt < TOCTOU_MAX_ATTEMPTS; attempt++) {
@@ -483,15 +458,13 @@ export async function runRefreshTransaction(
     } catch {
       finalDisk = undefined;
     }
-    const presentedFp = tokenFp(refreshTokenToSend);
-    const finalDiskFp = tokenFp(finalDisk?.refresh_token);
     logger.error("Refresh grant is genuinely dead after bounded re-read", {
       package_id: packageId,
       pid: process.pid,
-      presented_refresh_fp: presentedFp,
-      disk_refresh_fp: finalDiskFp,
-      disk_matches_presented: presentedFp !== "none" && presentedFp === finalDiskFp,
-      ...(summary ? summary : {}),
+      presented_refresh: true,
+      disk_refresh: !!finalDisk?.refresh_token,
+      disk_matches_presented: refreshTokenToSend === finalDisk?.refresh_token,
+      ...oauthErrorLogFields(summary),
     });
     await provider.clearTokensAndMarkNeedsReconnect(summary);
     return response;
