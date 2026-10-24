@@ -440,6 +440,23 @@ describe("OAuth refresh-token rotation race (red harness)", () => {
     // POST-FIX (green): tokensStillThere === false and markerExists === true.
     expect(tokensStillThere).toBe(false); // FAILS on current code (wedge: token kept)
     expect(markerExists).toBe(true); // FAILS on current code (wedge: no marker)
+    expect(mockLogger.info).toHaveBeenCalledWith(
+      "Refresh transaction: invalid_grant on presented token; checking for peer rotation",
+      expect.objectContaining({ error: "invalid_grant", presented_refresh: true }),
+    );
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      "Refresh grant is genuinely dead after bounded re-read",
+      expect.objectContaining({
+        error: "invalid_grant",
+        presented_refresh: true,
+        disk_refresh: true,
+        disk_matches_presented: true,
+      }),
+    );
+    const logs = JSON.stringify(Object.values(mockLogger).flatMap((fn) => fn.mock.calls));
+    expect(logs).not.toMatch(/error_description|server_error_description|Grant not found|refresh_fp/);
+    expect(JSON.parse(await fs.readFile(reconnectMarker, "utf8")))
+      .toMatchObject({ error: "invalid_grant", error_description: "Grant not found" });
   });
 
   // -------------------------------------------------------------------------

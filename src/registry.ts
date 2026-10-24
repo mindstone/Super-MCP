@@ -19,6 +19,7 @@ import { PackageHomeClient } from "./clients/packageHomeClient.js";
 import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { HttpMcpClient } from "./clients/httpClient.js";
 import { SimpleOAuthProvider } from "./auth/providers/simple.js";
+import { oauthErrorLogText } from "./auth/oauthErrorLogging.js";
 import { getLogger } from "./logging.js";
 import { SecurityPolicy, SecurityConfig, setSecurityPolicy } from "./security.js";
 
@@ -1806,7 +1807,7 @@ export class PackageRegistry {
         enhancedMessage += `\n  2. Check the package configuration`;
         enhancedMessage += `\n  3. Verify any required authentication`;
         
-        const enhancedError = new Error(enhancedMessage);
+        const enhancedError = new Error(enhancedMessage, { cause: error });
         (enhancedError as any).originalError = error;
         throw enhancedError;
       }
@@ -2168,7 +2169,7 @@ export class PackageRegistry {
         logger.warn("MCP client connect failed; retry suppressed during registry shutdown", {
           package_id: packageId,
           attempt: 1,
-          error: firstError instanceof Error ? firstError.message : String(firstError),
+          error: oauthErrorLogText(firstError, firstError instanceof Error ? firstError.message : String(firstError)),
         });
       }
       this.assertAdmissionOpen(packageId);
@@ -2182,7 +2183,7 @@ export class PackageRegistry {
         logger.warn("MCP client connect retry skipped for permanent failure", {
           package_id: packageId,
           attempt: 1,
-          error: firstError instanceof Error ? firstError.message : String(firstError),
+          error: oauthErrorLogText(firstError, firstError instanceof Error ? firstError.message : String(firstError)),
         });
         throw firstError;
       }
@@ -2194,7 +2195,7 @@ export class PackageRegistry {
       logger.warn("MCP client connect failed; retrying once", {
         package_id: packageId,
         attempt: 1,
-        error: firstError instanceof Error ? firstError.message : String(firstError),
+        error: oauthErrorLogText(firstError, firstError instanceof Error ? firstError.message : String(firstError)),
       });
 
       let secondClient: McpClient | undefined;
@@ -2428,7 +2429,7 @@ export class PackageRegistry {
         if (!this.terminal) {
           logger.debug("Pending connection did not survive package restart", {
             package_id: packageId,
-            error: error instanceof Error ? error.message : String(error),
+            error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
           });
         }
         // Ignore errors - connection may have failed
@@ -2596,7 +2597,7 @@ export class PackageRegistry {
     } catch (error) {
       logger.debug("Health check failed", {
         package_id: packageId,
-        error: error instanceof Error ? error.message : String(error),
+        error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
       });
       return { health: "unavailable", error };
     }

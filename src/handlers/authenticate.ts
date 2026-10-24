@@ -9,6 +9,7 @@ import { OAUTH_FINISH_AUTH_TIMEOUT_CODE, OAUTH_REDIRECT_URI_REJECTED_CODE } from
 import type { OAuthProbeVerdictTraceEntry } from "../clients/httpClient.js";
 import { isAuthorizeProbeDisabled, type AuthorizeProbeVerdict } from "../auth/authorizeProbe.js";
 import { formatError } from "../utils/formatError.js";
+import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
 import { coerceStringifiedBoolean } from "../utils/normalizeInput.js";
 import { getValidator } from "../validator.js";
 
@@ -396,14 +397,14 @@ async function handleAuthenticateCore(
       } catch (error) {
         logger.info("Tool access failed, need to authenticate", { 
           package_id,
-          error: formatError(error),
+          error: oauthErrorLogText(error, formatError(error)),
         });
       }
     }
   } catch (error) {
     logger.info("Client not available or errored", { 
       package_id,
-      error: formatError(error),
+      error: oauthErrorLogText(error, formatError(error)),
     });
   }
   } // end if (!force)
@@ -584,13 +585,13 @@ async function handleAuthenticateCore(
             if (isFatalAuthError) {
               logger.error("OAuth failed with fatal error, aborting callback wait", {
                 package_id,
-                error: errMsg,
+                error: oauthErrorLogText(err, errMsg),
               });
-              reject(new Error(`OAuth setup failed: ${errMsg}`));
+              reject(new Error(`OAuth setup failed: ${errMsg}`, { cause: err }));
             } else {
               logger.debug("OAuth redirect initiated (expected)", {
                 package_id,
-                error: errMsg,
+                error: oauthErrorLogText(err, errMsg),
               });
               // Non-fatal errors (e.g., redirect initiated) — don't abort the callback wait
             }
@@ -620,7 +621,7 @@ async function handleAuthenticateCore(
         } catch (err) {
           logger.warn("Connection verification failed - tokens saved but server rejected request. Try using a tool to confirm.", {
             package_id,
-            error: formatError(err)
+            error: oauthErrorLogText(err, formatError(err))
           });
           health = "error";
         }
@@ -738,7 +739,7 @@ async function handleAuthenticateCore(
 
         logger.error("OAuth failed", {
           package_id,
-          error: errMsg,
+          error: oauthErrorLogText(error, errMsg),
           isFatalSetupError,
           isFinishAuthTimeout,
         });
@@ -1050,7 +1051,7 @@ async function handleAuthenticateCore(
       connectPromise.catch((err: unknown) => {
         logger.debug("OAuth connection error (expected)", {
           package_id,
-          error: formatError(err)
+          error: oauthErrorLogText(err, formatError(err))
         });
       });
     }
@@ -1107,7 +1108,7 @@ async function handleAuthenticateCore(
   } catch (error) {
     logger.error("Authentication failed", {
       package_id,
-      error: formatError(error),
+      error: oauthErrorLogText(error, formatError(error)),
     });
     return {
       content: [
