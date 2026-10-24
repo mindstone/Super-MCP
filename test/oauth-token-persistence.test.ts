@@ -15,6 +15,7 @@ vi.mock("../src/logging.js", () => ({
 }));
 
 import { RefreshOnlyOAuthProvider, SimpleOAuthProvider } from "../src/auth/providers/index.js";
+import { oauthErrorLogFields } from "../src/auth/oauthErrorLogging.js";
 
 const ENV_KEY = "SUPER_MCP_OAUTH_TOKEN_DIR";
 
@@ -225,7 +226,7 @@ describe("OAuth token persistence", () => {
     });
   });
 
-  it("logs allowed OAuth error fields and clears consumed error on refresh-only token invalidation", async () => {
+  it("logs only the OAuth error code and clears consumed error on refresh-only token invalidation", async () => {
     const provider = new SimpleOAuthProvider("Notion-test", 5173);
     await provider.initialize();
     await provider.saveTokens({
@@ -242,16 +243,15 @@ describe("OAuth token persistence", () => {
 
     // Post-fix: refresh-only token invalidation is disk-compare aware. With
     // on-disk tokens present and no dead-grant marker, it preserves them and
-    // logs the (consumed) OAuth error fields. (Stage 6 expands this suite with
-    // the dead-grant clearing + peer-rotation cases; this assertion only pins
-    // that the error fields are still surfaced and the error is consumed.)
+    // logs the consumed OAuth error code without the provider's description.
     expect(mockLogger.warn).toHaveBeenCalledWith(
       "Token invalidation (refresh-only): preserving on-disk tokens",
       expect.objectContaining({
         error: "invalid_grant",
-        error_description: "Refresh token revoked",
       }),
     );
+    expect(JSON.stringify(Object.values(mockLogger).flatMap((fn) => fn.mock.calls)))
+      .not.toContain("Refresh token revoked");
 
     const tokenFile = path.join(tempDir, "Notion-test_tokens.json");
     const saved = JSON.parse(await fs.readFile(tokenFile, "utf8"));
@@ -260,6 +260,29 @@ describe("OAuth token persistence", () => {
       refresh_token: "refresh-token",
     });
 
+    expect(provider.consumeLastOAuthError()).toBeUndefined();
+  });
+
+  it("never logs OAuth descriptions during credential invalidation", async () => {
+    const provider = new SimpleOAuthProvider("Acme-log-safety", 5173);
+    await provider.initialize();
+    provider.setLastOAuthError({
+      error: "invalid_grant",
+      error_description: "oauth-description-sentinel",
+    });
+
+    await provider.invalidateCredentials("tokens");
+
+    expect(mockLogger.info).toHaveBeenCalledWith("Invalidating OAuth credentials", {
+      package_id: "Acme-log-safety",
+      scope: "tokens",
+      error: "invalid_grant",
+    });
+    expect(oauthErrorLogFields(undefined)).toEqual({});
+    expect(oauthErrorLogFields({ error: "unknown-code-sentinel", error_description: "oauth-description-sentinel" }))
+      .toEqual({ error: "unrecognized" });
+    const logs = JSON.stringify(Object.values(mockLogger).flatMap((fn) => fn.mock.calls));
+    expect(logs).not.toMatch(/error_description|server_error_description|oauth-description-sentinel/);
     expect(provider.consumeLastOAuthError()).toBeUndefined();
   });
 });

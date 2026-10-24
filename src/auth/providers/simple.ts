@@ -5,6 +5,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { homedir } from "os";
 import { randomBytes } from "crypto";
+import { oauthErrorLogFields, oauthErrorLogText } from "../oauthErrorLogging.js";
 import {
   buildRedirectUriRejectedError,
   isAuthorizeProbeDisabled,
@@ -346,7 +347,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     } catch (error) {
       logger.error("Failed to persist OAuth client info", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error)
+        error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error))
       });
     }
   }
@@ -406,7 +407,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       // torn/locked read does not spuriously force re-auth.
       logger.warn("Failed to read OAuth tokens from disk; using in-memory fallback", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error),
+        error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
       });
       return this.stripInternalFields(this.savedTokens);
     }
@@ -444,7 +445,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       // mirror as the merge base rather than crashing the refresh.
       logger.warn("Could not read existing tokens before save; merging against in-memory state", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error),
+        error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
       });
       onDisk = this.savedTokens;
     }
@@ -687,7 +688,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       // rather than failing an otherwise-successful write.
       logger.debug("Directory fsync skipped (unsupported on this platform/FS)", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error),
+        error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
       });
     } finally {
       if (handle) {
@@ -709,7 +710,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     } catch (error) {
       logger.error("Failed to persist OAuth tokens", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error),
+        error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
       });
     }
   }
@@ -813,7 +814,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     } catch (error) {
       logger.error("Failed to open browser", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error)
+        error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error))
       });
     }
   }
@@ -934,7 +935,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       // prior token exchange) — debug level is the right volume for that.
       logger.debug("hasPersistedAccessToken: token file unreadable; the probe will run", {
         package_id: packageId,
-        error: error instanceof Error ? error.message : String(error),
+        error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
       });
       return false;
     }
@@ -957,7 +958,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
         logger.warn("Failed to delete dead OAuth token file", {
           package_id: this.packageId,
-          error: error instanceof Error ? error.message : String(error),
+          error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
         });
       }
     }
@@ -976,13 +977,13 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     } catch (error) {
       logger.error("Failed to write needsReconnect marker", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error),
+        error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
       });
     }
 
     logger.error("OAuth grant is dead — cleared tokens and flagged reconnect", {
       package_id: this.packageId,
-      ...(reason ? reason : {}),
+      ...oauthErrorLogFields(reason),
     });
   }
 
@@ -1012,7 +1013,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     if (!disk) {
       logger.info("Token invalidation (refresh-only): tokens already cleared", {
         package_id: this.packageId,
-        ...(oauthError ? oauthError : {}),
+        ...oauthErrorLogFields(oauthError),
       });
       this.savedTokens = undefined;
       return;
@@ -1029,7 +1030,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     if (markerExists) {
       logger.warn("Token invalidation (refresh-only): dead grant flagged, clearing residual tokens", {
         package_id: this.packageId,
-        ...(oauthError ? oauthError : {}),
+        ...oauthErrorLogFields(oauthError),
       });
       await this.invalidateCredentials("tokens");
       return;
@@ -1039,7 +1040,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       message:
         "On-disk tokens are present and not flagged dead (peer may have rotated). Preserving to avoid forcing re-auth.",
       package_id: this.packageId,
-      ...(oauthError ? oauthError : {}),
+      ...oauthErrorLogFields(oauthError),
     });
   }
 
@@ -1061,7 +1062,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     logger.info("Invalidating OAuth credentials", { 
       package_id: this.packageId,
       scope,
-      ...(oauthError ? oauthError : {}),
+      ...oauthErrorLogFields(oauthError),
     });
     
     if (scope === 'all' || scope === 'tokens') {
@@ -1174,7 +1175,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
     } catch (error) {
       logger.debug("Error invalidating stale OAuth credentials", {
         package_id: this.packageId,
-        error: error instanceof Error ? error.message : String(error)
+        error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error))
       });
       return false;
     }

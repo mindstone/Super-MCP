@@ -2,6 +2,7 @@ import { ERROR_CODES, ReadResourceResult } from "../types.js";
 import { PackageRegistry } from "../registry.js";
 import { Catalog } from "../catalog.js";
 import { getLogger } from "../logging.js";
+import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
 
 const logger = getLogger();
 
@@ -109,7 +110,7 @@ export async function handleReadResource(
     return result;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    logger.error("Resource read failed", { uri, package_id: packageId, error: errorMessage });
+    logger.error("Resource read failed", { uri, package_id: packageId, error: oauthErrorLogText(error, errorMessage) });
     
     // Check for method not found error (server doesn't support resources)
     if (errorMessage.includes("Method not found") || errorMessage.includes("-32601")) {

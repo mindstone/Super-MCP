@@ -10,6 +10,7 @@ import { OAUTH_REDIRECT_URI_REJECTED_CODE } from "../auth/authorizeProbe.js";
 import { isAuthLikeErrorMessageText } from "../auth/authLikeVocabulary.js";
 import type { OAuthErrorSummary, StaticOAuthCredentials } from "../auth/providers/simple.js";
 import { runRefreshTransaction } from "../auth/refreshTransaction.js";
+import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
 
 const logger = getLogger();
 
@@ -665,7 +666,7 @@ export class HttpMcpClient implements McpClient {
       if (isTransportNegotiationError && currentlyUsingStreamableHttp) {
         logger.warn("Streamable HTTP transport failed, falling back to SSE transport", {
           package_id: this.packageId,
-          original_error: errorMessage,
+          original_error: oauthErrorLogText(error, errorMessage),
         });
         
         try {
@@ -709,15 +710,15 @@ export class HttpMcpClient implements McpClient {
           if (this.isAuthLikeErrorMessage(fallbackErrorMessage)) {
             logger.debug("SSE fallback reached OAuth redirect (expected)", {
               package_id: this.packageId,
-              original_error: errorMessage,
-              fallback_error: fallbackErrorMessage,
+              original_error: oauthErrorLogText(error, errorMessage),
+              fallback_error: oauthErrorLogText(fallbackError, fallbackErrorMessage),
             });
             throw fallbackError;
           }
           logger.error("SSE fallback also failed", {
             package_id: this.packageId,
-            original_error: errorMessage,
-            fallback_error: fallbackErrorMessage,
+            original_error: oauthErrorLogText(error, errorMessage),
+            fallback_error: oauthErrorLogText(fallbackError, fallbackErrorMessage),
           });
           // Continue to throw the original error with fallback context
           throw new Error(
@@ -741,7 +742,7 @@ export class HttpMcpClient implements McpClient {
       if (isTransportNegotiationError && canFallBackToStreamableHttp) {
         logger.warn("SSE transport failed, falling back to Streamable HTTP transport", {
           package_id: this.packageId,
-          original_error: errorMessage,
+          original_error: oauthErrorLogText(error, errorMessage),
         });
 
         try {
@@ -785,15 +786,15 @@ export class HttpMcpClient implements McpClient {
           if (this.isAuthLikeErrorMessage(fallbackErrorMessage)) {
             logger.debug("Streamable HTTP fallback reached OAuth redirect (expected)", {
               package_id: this.packageId,
-              original_error: errorMessage,
-              fallback_error: fallbackErrorMessage,
+              original_error: oauthErrorLogText(error, errorMessage),
+              fallback_error: oauthErrorLogText(fallbackError, fallbackErrorMessage),
             });
             throw fallbackError;
           }
           logger.error("Streamable HTTP fallback also failed", {
             package_id: this.packageId,
-            original_error: errorMessage,
-            fallback_error: fallbackErrorMessage,
+            original_error: oauthErrorLogText(error, errorMessage),
+            fallback_error: oauthErrorLogText(fallbackError, fallbackErrorMessage),
           });
           throw new Error(
             `Transport negotiation failed. Original: ${errorMessage}. ` +
@@ -837,7 +838,7 @@ export class HttpMcpClient implements McpClient {
       
       logger.error("Failed to connect to MCP server", {
         package_id: this.packageId,
-        error: errorMessage,
+        error: oauthErrorLogText(error, errorMessage),
       });
       throw error;
     }
@@ -946,7 +947,7 @@ export class HttpMcpClient implements McpClient {
       } catch (error) {
         logger.error("Failed to list tools", {
           package_id: this.packageId,
-          error: error instanceof Error ? error.message : String(error),
+          error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
         });
         throw error;
       }
@@ -988,7 +989,7 @@ export class HttpMcpClient implements McpClient {
         logger.error("Tool call failed", {
           package_id: this.packageId,
           tool_name: name,
-          error: error instanceof Error ? error.message : String(error),
+          error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
         });
         throw error;
       }
@@ -1062,7 +1063,7 @@ export class HttpMcpClient implements McpClient {
         logger.error("Failed to read resource", {
           package_id: this.packageId,
           uri,
-          error: error instanceof Error ? error.message : String(error),
+          error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
         });
         throw error;
       }
@@ -1097,7 +1098,7 @@ export class HttpMcpClient implements McpClient {
           !this.simpleOAuthProvider?.hasStartedRedirect() &&
           this.config.transportType !== "sse" &&
           !this.usedSseFallback) {
-        await this.recreateClientForSseFallback(authError.message);
+        await this.recreateClientForSseFallback(oauthErrorLogText(authError, authError.message));
         try {
           await this.connect();
           this.isConnected = true;
@@ -1130,7 +1131,7 @@ export class HttpMcpClient implements McpClient {
           this.config.transportType === "sse" &&
           !this.usedSseFallback &&
           !this.usedStreamableHttpFallback) {
-        await this.recreateClientForStreamableHttpFallback(authError.message);
+        await this.recreateClientForStreamableHttpFallback(oauthErrorLogText(authError, authError.message));
         try {
           await this.connect();
           this.isConnected = true;
@@ -1156,12 +1157,12 @@ export class HttpMcpClient implements McpClient {
       if (this.isAuthLikeErrorMessage(authError.message)) {
         logger.debug("OAuth redirect initiated or auth needed (expected)", {
           package_id: this.packageId,
-          error: authError.message
+          error: oauthErrorLogText(authError, authError.message)
         });
       } else {
         logger.error("Unexpected error during OAuth connect", {
           package_id: this.packageId,
-          error: authError.message
+          error: oauthErrorLogText(authError, authError.message)
         });
         throw this.attachOAuthDiscoveryTrace(authError);
       }
@@ -1240,7 +1241,7 @@ export class HttpMcpClient implements McpClient {
       } catch (error) {
         logger.error("Failed to connect after OAuth", {
           package_id: this.packageId,
-          error: error instanceof Error ? error.message : String(error)
+          error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error))
         });
         this.isConnected = false;
         throw error;
