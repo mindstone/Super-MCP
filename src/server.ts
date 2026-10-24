@@ -36,6 +36,7 @@ import {
   extractRawToolId,
 } from "./handlers/index.js";
 import { formatError } from "./utils/formatError.js";
+import { oauthErrorLogText } from "./auth/oauthErrorLogging.js";
 import { startWatchdog, type WatchdogHandle } from "./ownerWatchdog.js";
 import {
   startDiscoveryWatchdog,
@@ -997,7 +998,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       } catch (error) {
         logger.error("Tool execution failed", {
           tool_name: name,
-          error: formatError(error),
+          error: oauthErrorLogText(error, formatError(error)),
         });
 
         if (error && typeof error === "object" && "code" in error) {
@@ -1038,7 +1039,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       } catch (error) {
         logger.error("Resource read failed", {
           uri,
-          error: formatError(error),
+          error: oauthErrorLogText(error, formatError(error)),
         });
         throw error;
       }

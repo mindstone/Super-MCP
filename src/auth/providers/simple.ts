@@ -576,7 +576,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   /**
    * Append an authoritative token identity to the bounded echo queue, evicting the
    * oldest entry if the cap is exceeded (F1). Storing only the SDK-visible
-   * access/refresh identity — never logged, fingerprint-only comparison.
+   * access/refresh identity — never logged; compared in memory.
    */
   private recordAuthoritativeEcho(echo: { access_token?: string; refresh_token?: string }): void {
     this.authoritativeTokenEchoes.push(echo);

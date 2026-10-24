@@ -574,7 +574,7 @@ async function handleAuthenticateCore(
                 package_id,
                 error: oauthErrorLogText(err, errMsg),
               });
-              reject(new Error(`OAuth setup failed: ${errMsg}`));
+              reject(new Error(`OAuth setup failed: ${errMsg}`, { cause: err }));
             } else {
               logger.debug("OAuth redirect initiated (expected)", {
                 package_id,

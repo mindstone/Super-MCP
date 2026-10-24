@@ -4,17 +4,19 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { exchangeAuthorization, parseErrorResponse, refreshAuthorization } from "@modelcontextprotocol/sdk/client/auth.js";
+import { CustomOAuthError, OAuthError, OAUTH_ERRORS } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { HttpMcpClient } from "../src/clients/httpClient.js";
 import { handleAuthenticate } from "../src/handlers/authenticate.js";
 import { SimpleOAuthProvider } from "../src/auth/providers/simple.js";
 import { oauthErrorLogFields, oauthErrorLogText } from "../src/auth/oauthErrorLogging.js";
 import type { Catalog } from "../src/catalog.js";
-import type { PackageRegistry } from "../src/registry.js";
+import { PackageRegistry } from "../src/registry.js";
 import type { PackageConfig } from "../src/types.js";
 
 const logger = vi.hoisted(() => ({
   info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(),
 }));
+const callbackWait = vi.hoisted(() => vi.fn());
 vi.mock("../src/logging.js", () => ({ getLogger: () => logger }));
 vi.mock("../src/utils/portFinder.js", () => ({
   checkPortAvailable: vi.fn(async () => true),
@@ -26,7 +28,7 @@ vi.mock("../src/auth/callbackServer.js", () => ({
   OAuthCallbackServer: class {
     setServiceId = vi.fn();
     start = vi.fn(async () => {});
-    waitForCallback = vi.fn(async () => "authorization-code");
+    waitForCallback = callbackWait;
     stop = vi.fn(async () => {});
   },
 }));
@@ -61,6 +63,7 @@ describe("SDK OAuth error logging", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    callbackWait.mockResolvedValue("authorization-code");
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "super-mcp-oauth-log-"));
     vi.stubEnv("SUPER_MCP_OAUTH_TOKEN_DIR", tempDir);
   });
@@ -128,6 +131,23 @@ describe("SDK OAuth error logging", () => {
     expectSafeLogs();
   });
 
+  it("preserves fatal setup descriptions for the caller while redacting the wrapped authentication log", async () => {
+    const error = await parseErrorResponse(errorResponse("invalid_client_metadata"));
+    error.message = `client registration failed: ${SENTINEL}`;
+    callbackWait.mockReturnValue(new Promise(() => {}));
+    vi.spyOn(HttpMcpClient.prototype, "connectWithOAuth").mockRejectedValue(error);
+
+    const result = await handleAuthenticate(
+      { package_id: config.id, wait_for_completion: true }, registry(), {} as Catalog,
+    );
+
+    expect(JSON.parse(result.content[0].text).message).toBe(`OAuth setup failed: ${error.message}`);
+    expect(logger.error).toHaveBeenCalledWith("OAuth failed", expect.objectContaining({
+      error: "invalid_client_metadata", isFatalSetupError: true,
+    }));
+    expectSafeLogs();
+  });
+
   it.each(["http", "sse"] as const)("redacts both SDK errors in %s transport fallback logs", async (transportType) => {
     const original = await parseErrorResponse(errorResponse("invalid_request"));
     original.message = `HTTP 404 ${SENTINEL}`;
@@ -144,14 +164,69 @@ describe("SDK OAuth error logging", () => {
     expectSafeLogs();
   });
 
+  it.each([
+    ["http", "original"], ["http", "fallback"],
+    ["sse", "original"], ["sse", "fallback"],
+  ] as const)("redacts the %s negotiation %s OAuth error through registry retry and caller wrapping", async (transportType, oauthSide) => {
+    const oauthError = await parseErrorResponse(errorResponse("temporarily_unavailable"));
+    const original = oauthSide === "original" ? oauthError : new Error("HTTP 404");
+    original.message = `HTTP 404 ${original.message}`;
+    const fallback = oauthSide === "fallback" ? oauthError : new Error("fallback unavailable");
+    vi.spyOn(Client.prototype, "connect")
+      .mockRejectedValueOnce(original).mockRejectedValueOnce(fallback)
+      .mockRejectedValueOnce(original).mockRejectedValueOnce(fallback);
+    const actualRegistry = new PackageRegistry({ packages: [{ ...config, transportType, oauth: false }] });
+
+    try {
+      const error = await actualRegistry.getClient(config.id).catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain(
+        `Transport negotiation failed. Original: ${original.message}. ` +
+        `${transportType === "http" ? "SSE" : "Streamable HTTP"} fallback: ${fallback.message}`,
+      );
+      expect(oauthErrorLogText(error, (error as Error).message)).toBe("temporarily_unavailable");
+      expect(logger.warn).toHaveBeenCalledWith("MCP client connect failed; retrying once", {
+        package_id: config.id, attempt: 1, error: "temporarily_unavailable",
+      });
+      expectSafeLogs();
+    } finally {
+      await actualRegistry.closeAll();
+    }
+  });
+
+  it.each(Object.entries(OAUTH_ERRORS))("retains the SDK's bounded %s code", (code, ErrorType) => {
+    const error = new ErrorType(SENTINEL);
+    expect(error).toBeInstanceOf(OAuthError);
+    expect(oauthErrorLogText(new Error(SENTINEL, { cause: error }), SENTINEL)).toBe(code);
+    expect(oauthErrorLogFields({ error: code })).toEqual({ error: code });
+  });
+
+  it("bounds cycles, deep causes and aggregate errors without changing their messages", () => {
+    const cycle = new Error(SENTINEL);
+    cycle.cause = cycle;
+    let deep = new Error(SENTINEL);
+    for (let i = 0; i < 40; i++) deep = new Error(SENTINEL, { cause: deep });
+    for (const error of [cycle, deep, new AggregateError(Array(40).fill(new Error(SENTINEL)), SENTINEL)]) {
+      expect(oauthErrorLogText(error, error.message)).toBe("unrecognized");
+      expect(error.message).toBe(SENTINEL);
+    }
+    expect(oauthErrorLogText(new Error("ordinary wrapper", { cause: new Error("ordinary cause") }), "ordinary wrapper"))
+      .toBe("ordinary wrapper");
+  });
+
   it("bounds unknown codes and raw bodies, and preserves non-OAuth text", async () => {
-    for (const body of [errorResponse(SENTINEL), new Response(SENTINEL, { status: 500 })]) {
+    for (const [body, code] of [
+      [errorResponse(SENTINEL), "server_error"],
+      [new Response(SENTINEL, { status: 500 }), "server_error"],
+    ] as const) {
       const error = await parseErrorResponse(body);
       expect(error.message).toContain(SENTINEL);
-      expect(oauthErrorLogText(error, error.message)).toBe("unrecognized");
+      expect(oauthErrorLogText(error, error.message)).toBe(code);
       expect(error.message).toContain(SENTINEL);
     }
-    expect(oauthErrorLogFields({ error: SENTINEL, error_description: SENTINEL })).toEqual({ error: "unrecognized" });
+    expect(oauthErrorLogFields({ error: SENTINEL })).toEqual({ error: "unrecognized" });
+    expect(oauthErrorLogText(new CustomOAuthError(SENTINEL, SENTINEL), SENTINEL)).toBe("unrecognized");
+    expect(oauthErrorLogFields(undefined)).toEqual({});
     expect(oauthErrorLogText(new Error("ordinary error"), "ordinary error")).toBe("ordinary error");
     expect(oauthErrorLogText({ message: "structured error" }, "structured error")).toBe("structured error");
   });

@@ -442,7 +442,7 @@ describe("OAuth refresh-token rotation race (red harness)", () => {
     expect(markerExists).toBe(true); // FAILS on current code (wedge: no marker)
     expect(mockLogger.info).toHaveBeenCalledWith(
       "Refresh transaction: invalid_grant on presented token; checking for peer rotation",
-      expect.objectContaining({ server_error: "invalid_grant", presented_refresh: true }),
+      expect.objectContaining({ error: "invalid_grant", presented_refresh: true }),
     );
     expect(mockLogger.error).toHaveBeenCalledWith(
       "Refresh grant is genuinely dead after bounded re-read",

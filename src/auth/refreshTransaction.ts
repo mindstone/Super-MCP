@@ -406,9 +406,7 @@ export async function runRefreshTransaction(
       package_id: packageId,
       pid: process.pid,
       presented_refresh: true,
-      ...(summary
-        ? { server_error: oauthErrorLogFields(summary).error }
-        : {}),
+      ...oauthErrorLogFields(summary),
     });
     for (let attempt = 0; attempt < TOCTOU_MAX_ATTEMPTS; attempt++) {
       assertLockHealthy();

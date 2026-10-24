@@ -279,7 +279,8 @@ describe("OAuth token persistence", () => {
       error: "invalid_grant",
     });
     expect(oauthErrorLogFields(undefined)).toEqual({});
-    expect(oauthErrorLogFields({ error: "unknown-code-sentinel", error_description: "oauth-description-sentinel" }))
+    const unknownSummary = { error: "unknown-code-sentinel", error_description: "oauth-description-sentinel" };
+    expect(oauthErrorLogFields(unknownSummary))
       .toEqual({ error: "unrecognized" });
     const logs = JSON.stringify(Object.values(mockLogger).flatMap((fn) => fn.mock.calls));
     expect(logs).not.toMatch(/error_description|server_error_description|oauth-description-sentinel/);

@@ -723,7 +723,8 @@ export class HttpMcpClient implements McpClient {
           // Continue to throw the original error with fallback context
           throw new Error(
             `Transport negotiation failed. Original: ${errorMessage}. ` +
-            `SSE fallback: ${fallbackErrorMessage}`
+            `SSE fallback: ${fallbackErrorMessage}`,
+            { cause: new AggregateError([error, fallbackError]) },
           );
         }
       }
@@ -798,7 +799,8 @@ export class HttpMcpClient implements McpClient {
           });
           throw new Error(
             `Transport negotiation failed. Original: ${errorMessage}. ` +
-            `Streamable HTTP fallback: ${fallbackErrorMessage}`
+            `Streamable HTTP fallback: ${fallbackErrorMessage}`,
+            { cause: new AggregateError([error, fallbackError]) },
           );
         }
       }

@@ -120,9 +120,9 @@ export async function handleReadResource(
       };
     }
     
-    throw {
+    throw Object.defineProperty({
       code: ERROR_CODES.DOWNSTREAM_ERROR,
       message: `Failed to read resource from ${packageId}: ${errorMessage}`,
-    };
+    }, "cause", { value: error });
   }
 }

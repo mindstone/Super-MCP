@@ -2365,7 +2365,7 @@ export async function handleUseTool(
       diagnosticMessage += `\n  Arguments provided: ${Object.keys(args).join(", ")}`;
     }
     
-    throw {
+    throw Object.defineProperty({
       code: ERROR_CODES.DOWNSTREAM_ERROR,
       message: diagnosticMessage,
       data: {
@@ -2376,6 +2376,6 @@ export async function handleUseTool(
         args_provided: args ? Object.keys(args) : [],
         ...connectDiagnostics,
       },
-    };
+    }, "cause", { value: error });
   }
 }

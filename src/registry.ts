@@ -1787,7 +1787,7 @@ export class PackageRegistry {
         enhancedMessage += `\n  2. Check the package configuration`;
         enhancedMessage += `\n  3. Verify any required authentication`;
         
-        const enhancedError = new Error(enhancedMessage);
+        const enhancedError = new Error(enhancedMessage, { cause: error });
         (enhancedError as any).originalError = error;
         throw enhancedError;
       }
