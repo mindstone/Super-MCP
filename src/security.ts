@@ -157,7 +157,7 @@ export class SecurityPolicy {
    * @param packageId The package ID to check
    * @returns BlockCheckResult with blocked status and reason
    */
-  isPackageBlocked(packageId: string): BlockCheckResult {
+  isPackageBlocked(packageId: string, logAttempt = true): BlockCheckResult {
     // Gate 1: Allowlist check (if configured, must be on it)
     if (this.allowedPackagePatterns.length > 0) {
       const match = this.matchesAnyPattern(packageId, this.allowedPackagePatterns);
@@ -166,7 +166,7 @@ export class SecurityPolicy {
           blocked: true,
           reason: `Package '${packageId}' is not in the allowed packages list`,
         };
-        this.logBlockedAttempt("package", packageId, result.reason!, "allowlist");
+        if (logAttempt) this.logBlockedAttempt("package", packageId, result.reason!, "allowlist");
         return result;
       }
     }
@@ -181,7 +181,7 @@ export class SecurityPolicy {
             ? `Package '${packageId}' blocked by pattern: ${match.original}`
             : `Package '${packageId}' is explicitly blocked`,
         };
-        this.logBlockedAttempt("package", packageId, result.reason!, "blocklist");
+        if (logAttempt) this.logBlockedAttempt("package", packageId, result.reason!, "blocklist");
         return result;
       }
     }
@@ -196,9 +196,9 @@ export class SecurityPolicy {
    * @param toolId The tool ID (without namespace prefix)
    * @returns BlockCheckResult with blocked status and reason
    */
-  isToolBlocked(packageId: string, toolId: string): BlockCheckResult {
+  isToolBlocked(packageId: string, toolId: string, logAttempt = true): BlockCheckResult {
     // First check if the entire package is blocked
-    const packageCheck = this.isPackageBlocked(packageId);
+    const packageCheck = this.isPackageBlocked(packageId, logAttempt);
     if (packageCheck.blocked) {
       return packageCheck;
     }
@@ -217,7 +217,7 @@ export class SecurityPolicy {
           blocked: true,
           reason: `Tool '${fullToolName}' is not in the allowed tools list`,
         };
-        this.logBlockedAttempt("tool", fullToolName, result.reason!, "allowlist");
+        if (logAttempt) this.logBlockedAttempt("tool", fullToolName, result.reason!, "allowlist");
         return result;
       }
     }
@@ -236,7 +236,7 @@ export class SecurityPolicy {
             ? `Tool '${fullToolName}' blocked by pattern: ${match.original}`
             : `Tool '${fullToolName}' is explicitly blocked`,
         };
-        this.logBlockedAttempt("tool", fullToolName, result.reason!, "blocklist");
+        if (logAttempt) this.logBlockedAttempt("tool", fullToolName, result.reason!, "blocklist");
         return result;
       }
     }

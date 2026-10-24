@@ -1,3 +1,5 @@
+import { StdioMcpClient } from "../clients/stdioClient.js";
+import type { McpClient } from "../types.js";
 import { PackageRegistry } from "../registry.js";
 import { Catalog, type CatalogRefreshController } from "../catalog.js";
 import { getLogger } from "../logging.js";
@@ -160,9 +162,17 @@ async function handleAuthenticateCore(
     });
   }
   
+  const homed = registry.isPackageHomed?.(package_id) === true;
+  if (homed && pkg.transport === "http" && pkg.oauth) force = true;
+
   if (pkg.transport === "stdio") {
+    let localClient: McpClient | undefined;
     try {
-      const client = await registry.getClient(package_id);
+      if (homed) {
+        localClient = new StdioMcpClient(package_id, pkg);
+        await localClient.connect();
+      }
+      const client = localClient ?? await registry.getClient(package_id);
       const tools = await client.listTools();
       const authTools = tools.filter(
         (t: AuthDelegationToolCandidate): t is NamedAuthDelegationToolCandidate =>
@@ -263,6 +273,8 @@ async function handleAuthenticateCore(
         package_id,
         error: formatError(err),
       });
+    } finally {
+      await localClient?.close();
     }
 
     return {
@@ -307,11 +319,11 @@ async function handleAuthenticateCore(
     }
   }
   
+  const clients = homed ? new Map<string, any>() : (registry as any).clients as Map<string, any>;
   if (force) {
     logger.info("Force re-auth requested, skipping health check", { package_id });
     
     // Close and remove existing client to release resources
-    const clients = (registry as any).clients as Map<string, any>;
     const existingClient = clients.get(package_id);
     if (existingClient) {
       try {
@@ -331,8 +343,10 @@ async function handleAuthenticateCore(
       const tempProvider = new SimpleOAuthProvider(package_id, 5173);
       await tempProvider.initialize();
       await tempProvider.invalidateCredentials('all');
+      if (homed && await tempProvider.tokens()) throw new Error("Could not clear the previous sign-in. Please try connecting again.");
       logger.info("Invalidated stored OAuth credentials", { package_id });
     } catch (err) {
+      if (homed) throw err;
       logger.debug("No stored credentials to invalidate", {
         package_id,
         error: formatError(err),
@@ -403,8 +417,6 @@ async function handleAuthenticateCore(
       ? { clientId: pkg.oauthClientId, clientSecret: pkg.oauthClientSecret }
       : undefined;
 
-    const clients = (registry as any).clients as Map<string, any>;
-
     // Kill-switch (confirm#F5): with the probe disabled the retry loop
     // collapses to a single attempt, no classified rejection is acted on, and
     // per-attempt invalidation/re-DCR provably does not fire — the disabled
@@ -468,6 +480,7 @@ async function handleAuthenticateCore(
       // (h) fresh provider per attempt
       const oauthProvider = new SimpleOAuthProvider(package_id, attemptPort, staticCreds);
       await oauthProvider.initialize();
+      if (homed) await oauthProvider.invalidateCredentials("tokens");
       oauthProvider.setSkipAuthorizeProbe(opts.skipProbe);
 
       // Stage 2a staleness gate (explicit authenticate path only): invalidate
@@ -1110,6 +1123,8 @@ async function handleAuthenticateCore(
       ],
       isError: false,
     };
+  } finally {
+    if (homed) await Promise.all([...clients.values()].map(client => client.close()));
   }
 }
 

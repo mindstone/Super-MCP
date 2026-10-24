@@ -45,6 +45,7 @@ import {
   beginTokenRefreshShutdown,
   drainInFlightTokenRefreshes,
 } from "./auth/tokenRefreshLock.js";
+import { createPackageServer } from "./packageEndpoint.js";
 import { resolveToolTarget } from "./toolTargetResolution.js";
 
 // FM6 (260706_mcp-oauth-fm6-graceful-drain): give an in-flight single-use
@@ -1081,6 +1082,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
         server: Server;
         transport: StreamableHTTPServerTransport;
         lastActive: number;
+        packageId?: string;
       }
       const sessions = new Map<string, SessionEntry>();
 
@@ -1100,6 +1102,18 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
 
       const mcpHandler = async (req: any, res: any) => {
         try {
+          const requestedId = req.params.id as string | undefined;
+          // Use the configured package's own id from here on, never the request's string.
+          const packageId = requestedId === undefined ? undefined : registry.getPackage(requestedId)?.id;
+          if (requestedId !== undefined && (packageId === undefined || registry.isPackageHomed(packageId))) {
+            res.status(404).json({ error: "Package not found" });
+            return;
+          }
+          const suppliedSession = sessions.get(req.headers["mcp-session-id"]);
+          if (suppliedSession && suppliedSession.packageId !== packageId) {
+            res.status(404).json({ error: "Session not found" });
+            return;
+          }
           const body = req.body;
           const isInitializeRequest =
             (typeof body === "object" && body !== null && !Array.isArray(body) && body.method === "initialize") ||
@@ -1110,7 +1124,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
               ));
 
           if (isInitializeRequest) {
-            const sessionServer = createMcpServer();
+            const sessionServer = packageId === undefined ? createMcpServer() : createPackageServer(registry, packageId);
             const sessionTransport = new StreamableHTTPServerTransport({
               sessionIdGenerator: () => crypto.randomUUID(),
               onsessioninitialized: (sessionId: string) => {
@@ -1118,6 +1132,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
                   server: sessionServer,
                   transport: sessionTransport,
                   lastActive: Date.now(),
+                  packageId,
                 });
                 logger.debug("MCP session initialized", { sessionId, activeSessions: sessions.size });
               },
@@ -1141,7 +1156,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           }
 
           const session = sessions.get(sessionId);
-          if (!session) {
+          if (!session || session.packageId !== packageId) {
             res.status(404).json({ error: "Session not found" });
             return;
           }
@@ -1158,6 +1173,9 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
         }
       };
 
+      app.post("/mcp/packages/:id", mcpHandler);
+      app.get("/mcp/packages/:id", mcpHandler);
+      app.delete("/mcp/packages/:id", mcpHandler);
       app.post("/mcp", mcpHandler);
       app.get("/mcp", mcpHandler);
       app.delete("/mcp", mcpHandler);

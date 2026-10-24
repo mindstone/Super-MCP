@@ -318,6 +318,27 @@ You can still use custom locations:
 npx super-mcp-router --config /custom/path/config.json
 ```
 
+## Package homes
+
+A `packageHomes` entry routes a configured package to another router over streamable HTTP:
+
+```json
+{
+  "packageHomes": {
+    "notebook": {
+      "url": "https://cloud.example.test/mcp/packages/notebook",
+      "headers": { "Authorization": "Bearer example-token" }
+    }
+  }
+}
+```
+
+Keep the package's original `mcpServers` entry. Any config file can supply homes; later files override earlier entries by package ID. Reloading a home or its headers reconnects only that package. Removing its home resumes local operation on the next use.
+
+Tool discovery, calls and resources use the home. An unreachable home pauses the package until the next successful request. `authenticate` uses the original package entry; HTTP OAuth always starts a fresh authorization. No local fallback runs while a home is configured.
+
+In HTTP mode, `/mcp/packages/:id` exposes one local package with its original tool names, schemas, annotations, metadata and resources. Calls share the router's security, administrator and user restrictions. Sessions belong to one endpoint, and unknown or homed IDs return 404. These routes use the same loopback listener and request guards as `/mcp`.
+
 ## Using Multiple Configuration Files
 
 > **See also**: [Multi-Config Best Practices](docs/MULTI_CONFIG_BEST_PRACTICES.md) for organization strategies.

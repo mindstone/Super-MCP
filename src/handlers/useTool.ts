@@ -7,14 +7,13 @@ import {
   ERROR_CODES,
   USE_TOOL_META_PARAMS,
   USE_TOOL_SOFT_META_PARAMS,
-  type ToolBlockedReason,
 } from "../types.js";
 import { PackageRegistry } from "../registry.js";
 import { Catalog } from "../catalog.js";
 import type { ValidationResult } from "../validator.js";
 import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { getLogger } from "../logging.js";
-import { getSecurityPolicy } from "../security.js";
+import { assertToolAccess } from "../toolAccess.js";
 import { findBestMatch } from "../utils/fuzzyMatch.js";
 import {
   coerceStringifiedBoolean,
@@ -1485,52 +1484,7 @@ export async function handleUseTool(
     };
   }
 
-  // Check if tool is blocked by security policy
-  const securityPolicy = getSecurityPolicy();
-  const blockCheck = securityPolicy.isToolBlocked(package_id, tool_id);
-  if (blockCheck.blocked) {
-    throw {
-      code: ERROR_CODES.TOOL_BLOCKED,
-      message: blockCheck.reason || `Tool '${package_id}__${tool_id}' is blocked by security policy`,
-      data: { package_id, tool_id, blocked_reason: blockCheck.reason, reason: "security-policy" satisfies ToolBlockedReason },
-    };
-  }
-
-  // Check if tool is disabled by admin (takes precedence over user preference)
-  const packageConfig = registry.getPackage(package_id);
-  const catalogId = packageConfig?.catalogId;
-  if (securityPolicy.isAdminDisabled(catalogId, tool_id)) {
-    logger.warn("Blocked attempt to use admin-disabled tool", {
-      package_id,
-      tool_id,
-      catalog_id: catalogId,
-    });
-    throw {
-      code: ERROR_CODES.TOOL_BLOCKED,
-      message: `Tool '${package_id}__${tool_id}' is disabled by your organization's administrator`,
-      data: { package_id, tool_id, blocked_reason: "Disabled by administrator", admin_disabled: true, reason: "admin-disabled" satisfies ToolBlockedReason },
-    };
-  }
-
-  // Check if tool is disabled by user preference (separate from security policy)
-  if (securityPolicy.isUserDisabled(package_id, tool_id)) {
-    logger.warn("Blocked attempt to use user-disabled tool", {
-      package_id,
-      tool_id,
-    });
-    throw {
-      code: ERROR_CODES.TOOL_BLOCKED,
-      message: `Tool '${package_id}__${tool_id}' is disabled by user preference. Re-enable it in Settings to use.`,
-      data: { package_id, tool_id, blocked_reason: "Disabled by user", user_disabled: true, reason: "user-disabled" satisfies ToolBlockedReason },
-    };
-  }
-  if (!packageConfig) {
-    throw {
-      code: ERROR_CODES.PACKAGE_NOT_FOUND,
-      message: `Package not found: ${package_id}`,
-      data: { package_id },
-    };
-  }
+  assertToolAccess(registry, package_id, tool_id);
 
   await catalog.ensurePackageLoaded(package_id, {
     forceReconnect: catalog.getPackageStatus(package_id) !== "ready",
@@ -1556,7 +1510,7 @@ export async function handleUseTool(
     const reason = catalog.getPackageError(package_id) || "See logs for details";
     throw {
       code: ERROR_CODES.PACKAGE_UNAVAILABLE,
-      message: `Package '${package_id}' is unavailable: ${reason}`,
+      message: registry.isPackageHomed?.(package_id) ? reason : `Package '${package_id}' is unavailable: ${reason}`,
       data: { package_id, status: packageStatus },
     };
   }
@@ -2326,6 +2280,7 @@ export async function handleUseTool(
 
     resetValidationAttempt(downstreamValidationAttemptKey);
     
+    if (registry.isPackageHomed?.(package_id)) throw error;
     let diagnosticMessage = `Tool execution failed in package '${package_id}', tool '${tool_id}'.\n`;
     
     if (errorMessage.includes("not found") || errorMessage.includes("undefined")) {
