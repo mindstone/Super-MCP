@@ -8,6 +8,7 @@ import {
 import { PackageRegistry } from "./registry.js";
 import { argsSkeleton, createSchemaHash } from "./summarize.js";
 import { getLogger } from "./logging.js";
+import { oauthErrorLogText } from "./auth/oauthErrorLogging.js";
 
 const logger = getLogger();
 const LEGACY_ERROR_RETRY_INTERVAL_MS = 60_000;
@@ -108,6 +109,8 @@ export type CatalogFailureClass =
 export interface CatalogFailureState {
   status: "auth_required" | "setup_incomplete" | "error";
   lastError?: string;
+  /** Sanitized text for logging only; not persisted in the catalog cache. */
+  logError?: string;
   failureClass?: CatalogFailureClass;
   nextRetryAt: number | null;
   nextAuthProbeAt: number | null;
@@ -391,7 +394,7 @@ export class Catalog implements CatalogView {
     logger.error("Failed to refresh package catalog", {
       package_id: packageId,
       status: failure.status,
-      error: failure.lastError,
+      error: failure.logError ?? failure.lastError,
       retained_tool_count: retainedTools.length,
       generation,
       next_retry_at: failure.nextRetryAt,
@@ -848,6 +851,7 @@ export class Catalog implements CatalogView {
   categorizeError(packageId: string, error: unknown): {
     status: "auth_required" | "error";
     lastError?: string;
+    logError?: string;
   } {
     const message = error instanceof Error ? error.message : String(error);
     if (this.isAuthError(error)) {
@@ -868,12 +872,14 @@ export class Catalog implements CatalogView {
       return {
         status: "error",
         lastError: friendlyMessage,
+        logError: oauthErrorLogText(error, friendlyMessage),
       };
     }
 
     return {
       status: "error",
       lastError: message,
+      logError: oauthErrorLogText(error, message),
     };
   }
 

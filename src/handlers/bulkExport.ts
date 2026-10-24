@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { finished } from "node:stream/promises";
 import { Catalog } from "../catalog.js";
+import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
 import { getLogger } from "../logging.js";
 import { PackageRegistry } from "../registry.js";
 import { getSecurityPolicy } from "../security.js";
@@ -926,7 +927,7 @@ export async function handleBulkExport(
           logger.warn("bulk_export tool call failed", {
             package_id: parsedInput.packageId,
             tool_id: toolName,
-            error: toErrorMessage(error),
+            error: oauthErrorLogText(error, toErrorMessage(error)),
           });
           return {
             output: toErrorMessage(error),
@@ -941,7 +942,7 @@ export async function handleBulkExport(
     logger.warn("bulk_export failed", {
       package_id: parsedInput.packageId,
       tool_id: parsedInput.toolId,
-      error: toErrorMessage(error),
+      error: oauthErrorLogText(error, toErrorMessage(error)),
     });
     return errorResponse(toErrorMessage(error));
   } finally {

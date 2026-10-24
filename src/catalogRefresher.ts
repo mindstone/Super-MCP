@@ -457,8 +457,7 @@ export class CatalogRefresher {
     if (outcome.kind === "permanent_failure") {
       const categorized = this.catalog.categorizeError(packageId, outcome.error);
       this.catalog.commitFailure(packageId, generation, {
-        status: categorized.status,
-        lastError: categorized.lastError,
+        ...categorized,
         failureClass: outcome.failureClass,
         nextRetryAt: null,
         nextAuthProbeAt: null,
@@ -519,8 +518,7 @@ export class CatalogRefresher {
     const categorized = this.catalog.categorizeError(packageId, error);
     if (categorized.status === "auth_required") {
       this.catalog.commitFailure(packageId, generation, {
-        status: "auth_required",
-        lastError: categorized.lastError,
+        ...categorized,
         failureClass: "auth_required",
         nextRetryAt: null,
         nextAuthProbeAt: this.authProbeIntervalMs === 0
@@ -536,8 +534,7 @@ export class CatalogRefresher {
       random: this.random,
     });
     const failure: CatalogFailureState = {
-      status: "error",
-      lastError: categorized.lastError,
+      ...categorized,
       failureClass,
       nextRetryAt: this.now() + delay,
       nextAuthProbeAt: null,
