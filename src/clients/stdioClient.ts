@@ -1,3 +1,4 @@
+import type { ListResourcesResult } from "@modelcontextprotocol/sdk/types.js";
 import { exec } from "child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -1024,6 +1025,10 @@ export class StdioMcpClient implements McpClient {
     return true;
   }
 
+  async listResources(): Promise<ListResourcesResult> {
+    return this.requestQueue.add(() => this.client.listResources()) as Promise<ListResourcesResult>;
+  }
+
   async readResource(uri: string): Promise<ReadResourceResult> {
     logger.info("Reading resource from stdio MCP", {
       package_id: this.packageId,
@@ -1035,7 +1040,7 @@ export class StdioMcpClient implements McpClient {
     return this.requestQueue.add(async () => {
       try {
         const response = await this.client.readResource({ uri });
-        return { contents: response.contents || [] };
+        return response;
       } catch (error) {
         logger.error("Failed to read resource from stdio MCP", {
           package_id: this.packageId,

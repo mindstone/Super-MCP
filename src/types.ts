@@ -1,3 +1,5 @@
+import type { ListResourcesResult } from "@modelcontextprotocol/sdk/types.js";
+
 // Standard MCP config format
 export interface StandardMcpConfig {
   mcpServers: Record<string, StandardServerConfig>;
@@ -35,8 +37,14 @@ export interface StandardServerConfig {
   setupStatus?: PackageSetupStatus;
 }
 
+export interface PackageHome {
+  url: string;
+  headers?: Record<string, string>;
+}
+
 // Extended super-mcp config format (backward compatibility)
 export interface SuperMcpConfig {
+  packageHomes?: Record<string, PackageHome>;
   mcpServers?: Record<string, StandardServerConfig | ExtendedServerConfig>;
   packages?: PackageConfig[]; // Legacy format support
   configPaths?: string[]; // Reference other config files to merge
@@ -379,6 +387,7 @@ export interface McpClient {
   requiresAuth?(): Promise<boolean>;
   isAuthenticated?(): Promise<boolean>;
   readResource?(uri: string): Promise<ReadResourceResult>;
+  listResources?(): Promise<ListResourcesResult>;
   supportsResources?(): boolean;
   hasPendingRequests?(): boolean;
 }

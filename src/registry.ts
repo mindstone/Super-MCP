@@ -15,6 +15,7 @@ import {
   type CatalogStatus,
 } from "./types.js";
 import { StdioMcpClient } from "./clients/stdioClient.js";
+import { PackageHomeClient } from "./clients/packageHomeClient.js";
 import { HttpMcpClient } from "./clients/httpClient.js";
 import { SimpleOAuthProvider } from "./auth/providers/simple.js";
 import { getLogger } from "./logging.js";
@@ -997,6 +998,21 @@ export class PackageRegistry {
     const freshById = new Map(fresh.map((pkg) => [pkg.id, pkg]));
     const updated: PackageEnvRefreshResult & { status: "ok" } = { status: "ok", updated: [], notApplied: [] };
 
+    for (const pkg of this.packages) {
+      if (isDeepStrictEqual(this.config.packageHomes?.[pkg.id], mergedConfig.packageHomes?.[pkg.id])) continue;
+      this.config.packageHomes ??= {};
+      if (Object.hasOwn(mergedConfig.packageHomes ?? {}, pkg.id)) {
+        this.config.packageHomes[pkg.id] = mergedConfig.packageHomes![pkg.id];
+      } else {
+        delete this.config.packageHomes[pkg.id];
+      }
+      for (const [client, id] of this.constructedClients) {
+        if (id === pkg.id) await this.closeClientExactlyOnce(id, client, "home_changed");
+      }
+      if (this.clients.has(pkg.id)) await this.restartPackage(pkg.id);
+      updated.updated.push({ packageId: pkg.id, changedKeys: [] });
+    }
+
     for (let i = 0; i < this.packages.length; i++) {
       const current = this.packages[i];
       const next = freshById.get(current.id);
@@ -1122,6 +1138,8 @@ export class PackageRegistry {
         depth,
         referenced_from: referencedFrom || '(root)'
       });
+
+      Object.assign(mergedConfig.packageHomes ??= {}, config.packageHomes);
 
       // Merge mcpServers
       if (config.mcpServers) {
@@ -1500,6 +1518,10 @@ export class PackageRegistry {
     return packages;
   }
 
+  isPackageHomed(packageId: string): boolean {
+    return Object.hasOwn(this.config.packageHomes ?? {}, packageId);
+  }
+
   getPackage(packageId: string): PackageConfig | undefined {
     return this.packages.find(pkg => pkg.id === packageId);
   }
@@ -1592,7 +1614,7 @@ export class PackageRegistry {
         error: new Error(`Package '${packageId}' not found in configuration`),
       };
     }
-    if (config.setupStatus?.state === "blocked") {
+    if (config.setupStatus?.state === "blocked" && !this.isPackageHomed(packageId)) {
       return { kind: "setup_incomplete", reason: config.setupStatus.reason };
     }
     if (options.forceReconnect) {
@@ -1646,7 +1668,7 @@ export class PackageRegistry {
   async getClient(packageId: string): Promise<McpClient> {
     this.assertAdmissionOpen(packageId);
     const configuredPackage = this.getPackage(packageId);
-    if (configuredPackage?.setupStatus?.state === "blocked") {
+    if (configuredPackage?.setupStatus?.state === "blocked" && !this.isPackageHomed(packageId)) {
       throw new Error(
         `Package '${packageId}' setup is incomplete: ${configuredPackage.setupStatus.reason}`,
       );
@@ -2037,7 +2059,7 @@ export class PackageRegistry {
 
       // Only reap stdio clients (HTTP clients are stateless, no child process)
       const config = this.getPackage(packageId);
-      if (!config || config.transport !== "stdio") {
+      if (!config || config.transport !== "stdio" || this.isPackageHomed(packageId)) {
         continue;
       }
 
@@ -2146,6 +2168,7 @@ export class PackageRegistry {
       }
       this.assertAdmissionOpen(packageId);
 
+      if (this.isPackageHomed(packageId)) throw firstError;
       if (isPermanentConnectFailure(firstError)) {
         this.connectRetrySkippedPermanentCounts.set(
           packageId,
@@ -2217,13 +2240,16 @@ export class PackageRegistry {
     onClientCreated?: (client: McpClient) => void,
   ): Promise<ConnectOutcome> {
     this.assertAdmissionOpen(packageId);
-    if (config.setupStatus?.state === "blocked") {
+    if (config.setupStatus?.state === "blocked" && !this.isPackageHomed(packageId)) {
       return { kind: "setup_incomplete", reason: config.setupStatus.reason };
     }
 
+    const home = this.config.packageHomes?.[packageId];
     let client: McpClient;
     
-    if (config.transport === "stdio") {
+    if (this.isPackageHomed(packageId)) {
+      client = new PackageHomeClient(config, home!);
+    } else if (config.transport === "stdio") {
       client = new StdioMcpClient(packageId, config);
     } else {
       // Ambient-port coherence (REBEL-7F9 Stage 2c, recall#1 F9): pass the
@@ -2262,7 +2288,8 @@ export class PackageRegistry {
       const timeoutPromise = new Promise<never>((_, reject) => {
         timeoutHandle = setTimeout(() => {
           timedOut = true;
-          reject(connectTimeoutError(packageId, timeoutMs));
+          const error = connectTimeoutError(packageId, timeoutMs);
+          reject(client instanceof PackageHomeClient ? client.unreachableError(error) : error);
         }, timeoutMs);
       });
       try {
@@ -2321,6 +2348,10 @@ export class PackageRegistry {
         "Failed to close MCP client during registry shutdown",
       );
       throw new RegistryClosedError(packageId);
+    }
+    if (!isDeepStrictEqual(home, this.config.packageHomes?.[packageId])) {
+      await this.closeClientExactlyOnce(packageId, client, "home_changed");
+      return { kind: "transient_failure", failureClass: "transport_error", error: new Error("Package home changed during connection") };
     }
     return { kind: "connected", client };
   }

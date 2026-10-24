@@ -1,3 +1,4 @@
+import type { ListResourcesResult } from "@modelcontextprotocol/sdk/types.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -1042,6 +1043,10 @@ export class HttpMcpClient implements McpClient {
     return this.isConnected;
   }
 
+  async listResources(): Promise<ListResourcesResult> {
+    return this.requestQueue.add(() => this.client.listResources()) as Promise<ListResourcesResult>;
+  }
+
   async readResource(uri: string): Promise<ReadResourceResult> {
     if (!this.isConnected) {
       throw new Error(`Package '${this.packageId}' is not connected`);
@@ -1057,7 +1062,7 @@ export class HttpMcpClient implements McpClient {
     return this.requestQueue.add(async () => {
       try {
         const response = await this.client.readResource({ uri });
-        return { contents: response.contents || [] };
+        return response;
       } catch (error) {
         logger.error("Failed to read resource", {
           package_id: this.packageId,
