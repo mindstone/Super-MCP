@@ -159,7 +159,8 @@ describe('package homes and raw package endpoint', () => {
     policy.setAdminDisabledTools(restrictions.adminDisabledToolsByCatalogId ?? {});
     setSecurityPolicy(policy);
     await expect(handleUseTool({ package_id: 'notebook', tool_id: 'write_note', args: { text: 'blocked' } }, registry, new Catalog(registry), getValidator())).rejects.toMatchObject({ code: -33008 });
-    expect((await client.listTools()).tools).toEqual([]);
+    if ('blockedPackages' in (restrictions.security ?? {})) await expect(client.listTools()).rejects.toThrow();
+    else expect((await client.listTools()).tools).toEqual([]);
   }, 25_000);
 
   it('returns the paused message for a refused connection and 502/503/504', async () => {

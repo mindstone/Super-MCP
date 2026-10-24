@@ -13,7 +13,7 @@ import { Catalog } from "../catalog.js";
 import type { ValidationResult } from "../validator.js";
 import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { getLogger } from "../logging.js";
-import { assertToolAccess, callAllowedTool } from "../toolAccess.js";
+import { assertToolAccess } from "../toolAccess.js";
 import { findBestMatch } from "../utils/fuzzyMatch.js";
 import {
   coerceStringifiedBoolean,
@@ -1510,7 +1510,7 @@ export async function handleUseTool(
     const reason = catalog.getPackageError(package_id) || "See logs for details";
     throw {
       code: ERROR_CODES.PACKAGE_UNAVAILABLE,
-      message: `Package '${package_id}' is unavailable: ${reason}`,
+      message: registry.isPackageHomed?.(package_id) ? reason : `Package '${package_id}' is unavailable: ${reason}`,
       data: { package_id, status: packageStatus },
     };
   }
@@ -1920,7 +1920,7 @@ export async function handleUseTool(
       typeof _rebel_meeting_dispatch_capability === 'string' && _rebel_meeting_dispatch_capability.length > 0
       ? { ...args, _rebelMeetingDispatchCapability: _rebel_meeting_dispatch_capability }
       : args;
-    let toolResult = await callAllowedTool(registry, package_id, tool_id, connectorArgs);
+    let toolResult = await registry.callTool(package_id, tool_id, connectorArgs);
     const downstreamIsError = isRecord(toolResult) && toolResult.isError === true;
     const recoveryEvidenceV1 = extractRecoveryEvidenceV1(toolResult);
     toolResult = stripConnectorRecoveryEvidence(toolResult);
@@ -2280,6 +2280,7 @@ export async function handleUseTool(
 
     resetValidationAttempt(downstreamValidationAttemptKey);
     
+    if (registry.isPackageHomed?.(package_id)) throw error;
     let diagnosticMessage = `Tool execution failed in package '${package_id}', tool '${tool_id}'.\n`;
     
     if (errorMessage.includes("not found") || errorMessage.includes("undefined")) {

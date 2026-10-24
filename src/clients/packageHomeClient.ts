@@ -1,5 +1,6 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import type { McpClient, PackageConfig, PackageHome } from "../types.js";
 
 export class PackageHomeClient implements McpClient {
@@ -18,13 +19,21 @@ export class PackageHomeClient implements McpClient {
     try {
       return await run();
     } catch (error) {
+      if (error instanceof StreamableHTTPError && (error.code === 401 || error.code === 404)) {
+        this.connected = false;
+        if (error.code === 401) throw new Error("Rebel couldn't reach your cloud with its current sign-in. It'll retry automatically.", { cause: error });
+        throw error;
+      }
       const failures = new Set<unknown>();
       let cause: unknown = error;
       while (cause && typeof cause === "object" && !failures.has(cause)) {
         failures.add(cause);
-        const detail = cause as { code?: unknown; message?: string; cause?: unknown };
-        if ([502, 503, 504, -32001].includes(Number(detail.code)) ||
-            /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|UND_ERR|timeout|timed out|fetch failed/i.test(`${detail.code} ${detail.message}`)) {
+        const detail = cause as { code?: unknown; cause?: unknown };
+        if ((cause instanceof StreamableHTTPError && cause.code !== undefined && [502, 503, 504].includes(cause.code)) ||
+            (cause instanceof McpError && cause.code === ErrorCode.RequestTimeout &&
+              cause.data !== null && typeof cause.data === "object" &&
+              "timeout" in cause.data && typeof cause.data.timeout === "number") ||
+            (typeof detail.code === "string" && /^(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNRESET|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|EPIPE|UND_ERR_.*)$/.test(detail.code))) {
           this.connected = false;
           throw this.unreachableError(error);
         }
@@ -35,8 +44,7 @@ export class PackageHomeClient implements McpClient {
   }
 
   unreachableError(cause: unknown): Error {
-    const name = this.config.name || process.env.SUPER_MCP_APP_NAME || "Rebel";
-    return new Error(`Your cloud isn't reachable, so ${name} is paused for now. It'll pick up again when the cloud's back.`, { cause });
+    return new Error(`Your cloud isn't reachable, so ${this.config.name} is paused for now. It'll pick up again when the cloud's back.`, { cause });
   }
 
   async connect(): Promise<void> {

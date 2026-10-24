@@ -55,8 +55,3 @@ export function assertToolAccess(registry: PackageRegistry, package_id: string, 
     };
   }
 }
-
-export async function callAllowedTool(registry: PackageRegistry, packageId: string, toolId: string, args: unknown) {
-  assertToolAccess(registry, packageId, toolId);
-  return registry.callTool(packageId, toolId, args);
-}

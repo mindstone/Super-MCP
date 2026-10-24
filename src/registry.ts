@@ -16,6 +16,7 @@ import {
 } from "./types.js";
 import { StdioMcpClient } from "./clients/stdioClient.js";
 import { PackageHomeClient } from "./clients/packageHomeClient.js";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { HttpMcpClient } from "./clients/httpClient.js";
 import { SimpleOAuthProvider } from "./auth/providers/simple.js";
 import { getLogger } from "./logging.js";
@@ -998,19 +999,15 @@ export class PackageRegistry {
     const freshById = new Map(fresh.map((pkg) => [pkg.id, pkg]));
     const updated: PackageEnvRefreshResult & { status: "ok" } = { status: "ok", updated: [], notApplied: [] };
 
+    const previousHomes = this.config.packageHomes;
+    this.config.packageHomes = mergedConfig.packageHomes;
     for (const pkg of this.packages) {
-      if (isDeepStrictEqual(this.config.packageHomes?.[pkg.id], mergedConfig.packageHomes?.[pkg.id])) continue;
-      this.config.packageHomes ??= {};
-      if (Object.hasOwn(mergedConfig.packageHomes ?? {}, pkg.id)) {
-        this.config.packageHomes[pkg.id] = mergedConfig.packageHomes![pkg.id];
-      } else {
-        delete this.config.packageHomes[pkg.id];
-      }
+      if (isDeepStrictEqual(previousHomes?.[pkg.id], this.config.packageHomes?.[pkg.id])) continue;
       for (const [client, id] of this.constructedClients) {
-        if (id === pkg.id) await this.closeClientExactlyOnce(id, client, "home_changed");
+        if (id === pkg.id) await this.closeAfterFailure(id, client, "home_changed", "Failed to close MCP client after package home change");
       }
       if (this.clients.has(pkg.id)) await this.restartPackage(pkg.id);
-      updated.updated.push({ packageId: pkg.id, changedKeys: [] });
+      logger.info("Package home changed", { package_id: pkg.id });
     }
 
     for (let i = 0; i < this.packages.length; i++) {
@@ -1293,7 +1290,7 @@ export class PackageRegistry {
 
       // Handle root-level server entries (for configs like Klavis that don't use mcpServers wrapper)
       // A server config is identified by having 'url' (HTTP) or 'command' (stdio)
-      const knownMetadataKeys = new Set(['mcpServers', 'packages', 'configPaths', 'security', 'userDisabledToolsByServer', 'disabledServers']);
+      const knownMetadataKeys = new Set(['mcpServers', 'packages', 'packageHomes', 'configPaths', 'security', 'userDisabledToolsByServer', 'disabledServers']);
       for (const [key, value] of Object.entries(config)) {
         if (knownMetadataKeys.has(key)) continue;
         if (value && typeof value === 'object' && !Array.isArray(value)) {
@@ -1614,7 +1611,7 @@ export class PackageRegistry {
         error: new Error(`Package '${packageId}' not found in configuration`),
       };
     }
-    if (config.setupStatus?.state === "blocked" && !this.isPackageHomed(packageId)) {
+    if (config.setupStatus?.state === "blocked") {
       return { kind: "setup_incomplete", reason: config.setupStatus.reason };
     }
     if (options.forceReconnect) {
@@ -1643,7 +1640,7 @@ export class PackageRegistry {
       if (error instanceof RegistryClosedError || this.terminal) {
         return this.terminalConnectOutcome(packageId);
       }
-      if (isAuthConnectFailure(config, error)) {
+      if (!this.isPackageHomed(packageId) && isAuthConnectFailure(config, error)) {
         const client = this.clients.get(packageId);
         if (client) {
           this.notifyAuthOutcome(packageId, "auth_required");
@@ -1668,7 +1665,7 @@ export class PackageRegistry {
   async getClient(packageId: string): Promise<McpClient> {
     this.assertAdmissionOpen(packageId);
     const configuredPackage = this.getPackage(packageId);
-    if (configuredPackage?.setupStatus?.state === "blocked" && !this.isPackageHomed(packageId)) {
+    if (configuredPackage?.setupStatus?.state === "blocked") {
       throw new Error(
         `Package '${packageId}' setup is incomplete: ${configuredPackage.setupStatus.reason}`,
       );
@@ -1789,6 +1786,7 @@ export class PackageRegistry {
           ? error
           : new RegistryClosedError(packageId);
       }
+      if (this.isPackageHomed(packageId)) throw error;
       // Add helpful context to connection errors
       const errorMessage = error instanceof Error ? error.message : String(error);
       if (!errorMessage.includes("MCP") && !errorMessage.includes("diagnostic")) {
@@ -1953,8 +1951,8 @@ export class PackageRegistry {
    * CRITICAL safety invariant: a transport that closes MID-call (bytes already
    * sent, side effect possibly applied) is NEVER auto-retried. The re-establish
    * happens ONLY when `isTransportClosed()` is true before `client.callTool` is
-   * invoked; the actual `client.callTool` call has no retry around it, so an
-   * in-flight close propagates -32000 to the caller unchanged.
+   * invoked. An in-flight close propagates unchanged; only a home's session
+   * 404 is retried once, because the home refused it before dispatch.
   */
   async callTool(packageId: string, toolId: string, args: any): Promise<any> {
     let leaseClient = await this.acquireLease(packageId);
@@ -1975,8 +1973,15 @@ export class PackageRegistry {
         client = await this.getClient(packageId);
         leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
       }
-      // No retry wraps this call: a mid-call close propagates -32000 as-is.
-      return await client.callTool(toolId, args);
+      try {
+        return await client.callTool(toolId, args);
+      } catch (error) {
+        // A home session 404 is returned before dispatch, so one replay is safe.
+        if (!(client instanceof PackageHomeClient && error instanceof StreamableHTTPError && error.code === 404)) throw error;
+        client = await this.getClient(packageId);
+        leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
+        return await client.callTool(toolId, args);
+      }
     } finally {
       if (leaseClient) {
         this.unbindLeaseFromClient(packageId, leaseClient);
@@ -2240,7 +2245,7 @@ export class PackageRegistry {
     onClientCreated?: (client: McpClient) => void,
   ): Promise<ConnectOutcome> {
     this.assertAdmissionOpen(packageId);
-    if (config.setupStatus?.state === "blocked" && !this.isPackageHomed(packageId)) {
+    if (config.setupStatus?.state === "blocked") {
       return { kind: "setup_incomplete", reason: config.setupStatus.reason };
     }
 
@@ -2309,7 +2314,7 @@ export class PackageRegistry {
       }
       // Preserve the current caller-visible auth behavior while returning a
       // typed outcome for the Stage 4 catalog writer.
-      if (isAuthConnectFailure(config, error)) {
+      if (!this.isPackageHomed(packageId) && isAuthConnectFailure(config, error)) {
         logger.info("Package requires authentication", {
           package_id: packageId,
           message: `Use 'authenticate(package_id: "${packageId}")' to sign in`,
@@ -2350,7 +2355,7 @@ export class PackageRegistry {
       throw new RegistryClosedError(packageId);
     }
     if (!isDeepStrictEqual(home, this.config.packageHomes?.[packageId])) {
-      await this.closeClientExactlyOnce(packageId, client, "home_changed");
+      await this.closeAfterFailure(packageId, client, "home_changed", "Failed to close MCP client after package home change");
       return { kind: "transient_failure", failureClass: "transport_error", error: new Error("Package home changed during connection") };
     }
     return { kind: "connected", client };
