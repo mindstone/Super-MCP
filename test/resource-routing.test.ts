@@ -50,6 +50,7 @@ function client(options: {
 
 function registryStub(getClient: () => Promise<McpClient>): PackageRegistry {
   return {
+    isSetupBlocked: vi.fn().mockReturnValue(false),
     getPackages: vi.fn().mockReturnValue([PACKAGE]),
     getPackage: vi.fn().mockReturnValue(PACKAGE),
     getClient: vi.fn(getClient),

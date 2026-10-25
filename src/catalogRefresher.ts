@@ -479,8 +479,8 @@ export class CatalogRefresher {
     }
 
     const setupStatus = this.registry.getPackage(packageId)?.setupStatus;
-    if (setupStatus?.state === "blocked") {
-      return { kind: "setup_incomplete", reason: setupStatus.reason };
+    if (this.registry.isSetupBlocked(packageId)) {
+      return { kind: "setup_incomplete", reason: setupStatus!.reason };
     }
     try {
       const client = await this.registry.getClient(packageId);

@@ -45,6 +45,7 @@ function client(listTools: () => Promise<unknown[]>): McpClient {
 
 function createRegistry(getClient: () => Promise<McpClient>): PackageRegistry {
   return {
+    isSetupBlocked: vi.fn().mockReturnValue(false),
     getPackages: vi.fn().mockReturnValue([PACKAGE]),
     getPackage: vi.fn().mockReturnValue(PACKAGE),
     getClient: vi.fn(getClient),
@@ -102,6 +103,7 @@ describe("Catalog last-known-good retention", () => {
     let packages = [PACKAGE];
     let currentClient = client(async () => [TOOL]);
     const registry = {
+      isSetupBlocked: vi.fn().mockReturnValue(false),
       getPackages: vi.fn(() => packages),
       getPackage: vi.fn((packageId: string) =>
         packages.find((pkg) => pkg.id === packageId)),
@@ -136,6 +138,7 @@ describe("Catalog last-known-good retention", () => {
   it("keeps last-known-good data inactive when setup becomes incomplete", async () => {
     let blocked = false;
     const registry = {
+      isSetupBlocked: vi.fn(() => blocked),
       getPackages: vi.fn(() => [PACKAGE]),
       getPackage: vi.fn(() => blocked
         ? {

@@ -33,6 +33,7 @@ function createMockRegistry(pkg: PackageConfig | undefined, clientError: Error):
   return {
     getClient: vi.fn().mockRejectedValue(clientError),
     getPackage: vi.fn().mockReturnValue(pkg),
+    isSetupBlocked: vi.fn().mockReturnValue(false),
     getPackages: vi.fn().mockReturnValue(pkg ? [pkg] : []),
     healthCheck: vi.fn().mockResolvedValue('error'),
     restartPackage: vi.fn().mockResolvedValue({ success: false, message: 'not running' }),

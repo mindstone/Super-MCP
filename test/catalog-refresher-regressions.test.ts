@@ -86,6 +86,7 @@ function registryStub(
 } {
   const connectForCatalog = vi.fn(connect);
   const registry = {
+    isSetupBlocked: vi.fn().mockReturnValue(false),
     getPackages: vi.fn().mockReturnValue(packages),
     getPackage: vi.fn((packageId: string) =>
       packages.find((pkg) => pkg.id === packageId)),

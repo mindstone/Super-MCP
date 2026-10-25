@@ -46,6 +46,7 @@ function harness() {
   const catalogClient = client();
   const callTool = vi.fn().mockResolvedValue({ content: [{ type: "text", text: "done" }] });
   const registry = {
+    isSetupBlocked: vi.fn().mockReturnValue(false),
     getPackages: vi.fn().mockReturnValue([PACKAGE]),
     getPackage: vi.fn().mockReturnValue(PACKAGE),
     findPackagesByAlias: vi.fn().mockReturnValue([]),

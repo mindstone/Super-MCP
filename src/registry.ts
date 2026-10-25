@@ -1520,6 +1520,11 @@ export class PackageRegistry {
     return Object.hasOwn(this.config.packageHomes ?? {}, packageId);
   }
 
+  isSetupBlocked(packageId: string): boolean {
+    return this.getPackage(packageId)?.setupStatus?.state === "blocked" &&
+      !this.isPackageHomed(packageId);
+  }
+
   getPackage(packageId: string): PackageConfig | undefined {
     return this.packages.find(pkg => pkg.id === packageId);
   }
@@ -1612,8 +1617,8 @@ export class PackageRegistry {
         error: new Error(`Package '${packageId}' not found in configuration`),
       };
     }
-    if (config.setupStatus?.state === "blocked") {
-      return { kind: "setup_incomplete", reason: config.setupStatus.reason };
+    if (this.isSetupBlocked(packageId)) {
+      return { kind: "setup_incomplete", reason: config.setupStatus!.reason };
     }
     if (options.forceReconnect) {
       await this.evictClient(packageId, "explicit");
@@ -1666,9 +1671,9 @@ export class PackageRegistry {
   async getClient(packageId: string): Promise<McpClient> {
     this.assertAdmissionOpen(packageId);
     const configuredPackage = this.getPackage(packageId);
-    if (configuredPackage?.setupStatus?.state === "blocked") {
+    if (this.isSetupBlocked(packageId)) {
       throw new Error(
-        `Package '${packageId}' setup is incomplete: ${configuredPackage.setupStatus.reason}`,
+        `Package '${packageId}' setup is incomplete: ${configuredPackage!.setupStatus!.reason}`,
       );
     }
 
@@ -2246,8 +2251,8 @@ export class PackageRegistry {
     onClientCreated?: (client: McpClient) => void,
   ): Promise<ConnectOutcome> {
     this.assertAdmissionOpen(packageId);
-    if (config.setupStatus?.state === "blocked") {
-      return { kind: "setup_incomplete", reason: config.setupStatus.reason };
+    if (this.isSetupBlocked(packageId)) {
+      return { kind: "setup_incomplete", reason: config.setupStatus!.reason };
     }
 
     const home = this.config.packageHomes?.[packageId];
