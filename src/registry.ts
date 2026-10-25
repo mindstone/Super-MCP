@@ -13,6 +13,7 @@ import {
   type PermanentConnectFailureClass,
   type TransientConnectFailureClass,
   type CatalogStatus,
+  type SetupIncompleteReason,
 } from "./types.js";
 import { StdioMcpClient } from "./clients/stdioClient.js";
 import { PackageHomeClient } from "./clients/packageHomeClient.js";
@@ -1520,9 +1521,11 @@ export class PackageRegistry {
     return Object.hasOwn(this.config.packageHomes ?? {}, packageId);
   }
 
-  isSetupBlocked(packageId: string): boolean {
-    return this.getPackage(packageId)?.setupStatus?.state === "blocked" &&
-      !this.isPackageHomed(packageId);
+  setupBlockReason(packageId: string): SetupIncompleteReason | undefined {
+    const setupStatus = this.getPackage(packageId)?.setupStatus;
+    return setupStatus?.state === "blocked" && !this.isPackageHomed(packageId)
+      ? setupStatus.reason
+      : undefined;
   }
 
   getPackage(packageId: string): PackageConfig | undefined {
@@ -1617,8 +1620,9 @@ export class PackageRegistry {
         error: new Error(`Package '${packageId}' not found in configuration`),
       };
     }
-    if (this.isSetupBlocked(packageId)) {
-      return { kind: "setup_incomplete", reason: config.setupStatus!.reason };
+    const setupReason = this.setupBlockReason(packageId);
+    if (setupReason) {
+      return { kind: "setup_incomplete", reason: setupReason };
     }
     if (options.forceReconnect) {
       await this.evictClient(packageId, "explicit");
@@ -1670,10 +1674,10 @@ export class PackageRegistry {
 
   async getClient(packageId: string): Promise<McpClient> {
     this.assertAdmissionOpen(packageId);
-    const configuredPackage = this.getPackage(packageId);
-    if (this.isSetupBlocked(packageId)) {
+    const setupReason = this.setupBlockReason(packageId);
+    if (setupReason) {
       throw new Error(
-        `Package '${packageId}' setup is incomplete: ${configuredPackage!.setupStatus!.reason}`,
+        `Package '${packageId}' setup is incomplete: ${setupReason}`,
       );
     }
 
@@ -2251,8 +2255,9 @@ export class PackageRegistry {
     onClientCreated?: (client: McpClient) => void,
   ): Promise<ConnectOutcome> {
     this.assertAdmissionOpen(packageId);
-    if (this.isSetupBlocked(packageId)) {
-      return { kind: "setup_incomplete", reason: config.setupStatus!.reason };
+    const setupReason = this.setupBlockReason(packageId);
+    if (setupReason) {
+      return { kind: "setup_incomplete", reason: setupReason };
     }
 
     const home = this.config.packageHomes?.[packageId];

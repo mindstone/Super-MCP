@@ -10,8 +10,10 @@ import { StdioMcpClient } from '../src/clients/stdioClient.js';
 import { createPackageServer } from '../src/packageEndpoint.js';
 import { Catalog } from '../src/catalog.js';
 import { CatalogRefresher } from '../src/catalogRefresher.js';
+import { getDiscoveryPackageState } from '../src/catalogFormatters.js';
 import { getValidator } from '../src/validator.js';
 import { handleUseTool } from '../src/handlers/useTool.js';
+import { handleListTools } from '../src/handlers/listTools.js';
 import { handleReadResource } from '../src/handlers/readResource.js';
 import { SecurityPolicy, setSecurityPolicy } from '../src/security.js';
 
@@ -309,9 +311,11 @@ describe('package homes over in-memory streamable HTTP', () => {
     if (refresher) cleanup.push(() => refresher.dispose());
 
     expect(catalog.getPackageStatus('notebook')).toBe('unknown');
-    expect(registry.isSetupBlocked('notebook')).toBe(false);
+    expect(registry.setupBlockReason('notebook')).toBeUndefined();
     expect(registry.getPackage('notebook')?.setupStatus).toEqual(setupStatus);
     expect(catalog.getPackageDiagnostics('notebook')).toMatchObject({ status: 'unknown', lastError: setupStatus.reason, lastErrorClass: null });
+    expect(catalog.getPackageError('notebook')).toBeUndefined();
+    expect(getDiscoveryPackageState(catalog, 'notebook')).toMatchObject({ catalogStatus: 'connecting', reason: 'Initial catalog observation is still in progress.' });
     expect(catalog.getRetryHint('notebook', 123)).toEqual({ retryAt: 123, retryInMs: 0, schedule: 'transient_backoff' });
     expect(await registry.connectForCatalog('notebook')).toMatchObject({ kind: 'connected' });
     const client = await registry.getClient('notebook');
@@ -322,13 +326,13 @@ describe('package homes over in-memory streamable HTTP', () => {
     await catalog.ensurePackageLoaded('notebook');
     expect(catalog.getPackageStatus('notebook')).toBe('ready');
     expect(catalog.getPackageDiagnostics('notebook')).toMatchObject({ status: 'ready', lastError: setupStatus.reason, lastErrorClass: null });
-    expect(catalog.getPackageError('notebook')).toBe(setupStatus.reason);
+    expect(catalog.getPackageError('notebook')).toBeUndefined();
     expect(catalog.listDegraded()).toEqual([]);
     const methods = await Promise.all(requests.filter(req => req.method === 'POST').map(async req => (await req.json()).method));
     expect(methods).toEqual(expect.arrayContaining(['tools/list', 'tools/call', 'resources/read']));
 
     await registry.refreshPackageEnvFromConfigFiles([file]);
-    expect(registry.isSetupBlocked('notebook')).toBe(true);
+    expect(registry.setupBlockReason('notebook')).toBe(setupStatus.reason);
     expect(registry.getPackage('notebook')?.setupStatus).toEqual(setupStatus);
     expect(await registry.connectForCatalog('notebook')).toEqual({ kind: 'setup_incomplete', reason: setupStatus.reason });
     await expect(registry.getClient('notebook')).rejects.toThrow('setup is incomplete');
@@ -340,11 +344,49 @@ describe('package homes over in-memory streamable HTTP', () => {
     expect(localSpawn).not.toHaveBeenCalled();
   });
 
+  it.each([undefined, 'Home connection failed'])('shows the home error independently of the local setup reason (%s)', lastError => {
+    const registry = keep(new PackageRegistry({
+      mcpServers: { notebook: { command: '/must-never-run', setupStatus: { state: 'blocked', reason: 'missing_managed_credentials' } } },
+      packageHomes: { notebook: { url: 'https://cloud.example.test/mcp/packages/notebook' } },
+    }));
+    const catalog = new Catalog(registry);
+    const generation = catalog.beginRefresh('notebook');
+    catalog.commitFailure('notebook', generation, { status: 'error', lastError, failureClass: 'transport_error', nextRetryAt: null, nextAuthProbeAt: null });
+    expect(catalog.getPackageError('notebook')).toBe(lastError);
+    expect(getDiscoveryPackageState(catalog, 'notebook')).toMatchObject({ catalogStatus: 'error', reason: lastError ?? 'Package is unavailable.' });
+    expect(catalog.getPackageDiagnostics('notebook').lastError).toBe(lastError ?? 'missing_managed_credentials');
+  });
+
+  it('routes tool and resource handlers to the home despite a local setup block', async () => {
+    const cloud = keep(new PackageRegistry({ mcpServers: { notebook: entry } }));
+    const { requests } = harness(cloud);
+    await cloud.getClient('notebook');
+    const localSpawn = vi.spyOn(StdioMcpClient.prototype, 'connect');
+    localSpawn.mockClear();
+    const registry = keep(new PackageRegistry({
+      mcpServers: { notebook: { command: '/must-never-run', setupStatus: { state: 'blocked', reason: 'missing_managed_credentials' } } },
+      packageHomes: { notebook: { url: 'https://cloud.example.test/mcp/packages/notebook' } },
+    }));
+    const catalog = new Catalog(registry);
+    const result = await handleUseTool({ package_id: 'notebook', tool_id: 'write_note', args: { text: 'via handler' } }, registry, catalog, getValidator());
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.content[0].text).result).toMatchObject({ content: [{ text: 'via handler' }] });
+    const listed = await handleListTools({ package_id: 'notebook' }, catalog, getValidator(), registry);
+    expect(listed.isError).toBe(false);
+    expect(JSON.parse(listed.content[0].text).tools).toEqual(expect.arrayContaining([expect.objectContaining({ tool_id: 'notebook__write_note' })]));
+    expect(await handleReadResource({ uri: 'ui://notebook/view' }, registry, catalog)).toMatchObject({ contents: [{ text: '<p>Fictional notebook</p>' }] });
+    const methods = await Promise.all(requests.filter(req => req.method === 'POST').map(async req => (await req.json()).method));
+    expect(methods).toEqual(expect.arrayContaining(['tools/list', 'tools/call', 'resources/read']));
+    expect(requests.every(req => req.url === 'https://cloud.example.test/mcp/packages/notebook')).toBe(true);
+    expect(localSpawn).not.toHaveBeenCalled();
+  });
+
   it('keeps unhomed local setup blocks and diagnostics unchanged', async () => {
     const setupStatus = { state: 'blocked' as const, reason: 'missing_managed_credentials' as const };
     const registry = keep(new PackageRegistry({ mcpServers: { notebook: { command: '/must-never-run', setupStatus } } }));
     const catalog = new Catalog(registry);
     expect(catalog.getPackageStatus('notebook')).toBe('setup_incomplete');
+    expect(catalog.getPackageError('notebook')).toBe(setupStatus.reason);
     expect(catalog.getPackageDiagnostics('notebook')).toMatchObject({ status: 'setup_incomplete', lastError: setupStatus.reason, lastErrorClass: 'setup_incomplete' });
     expect(catalog.getRetryHint('notebook')).toEqual({ retryAt: null, retryInMs: null, schedule: 'none' });
     expect(await registry.connectForCatalog('notebook')).toEqual({ kind: 'setup_incomplete', reason: setupStatus.reason });

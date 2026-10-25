@@ -62,8 +62,8 @@ function registryStub(
   getClient: (packageId: string) => Promise<McpClient>,
 ): PackageRegistry {
   return {
-    isSetupBlocked: vi.fn((packageId: string) =>
-      packages.find((pkg) => pkg.id === packageId)?.setupStatus?.state === "blocked"),
+    setupBlockReason: vi.fn((packageId: string) =>
+      packages.find((pkg) => pkg.id === packageId)?.setupStatus?.reason),
     getPackages: vi.fn().mockReturnValue(packages),
     getPackage: vi.fn((packageId: string) =>
       packages.find((pkg) => pkg.id === packageId)),
@@ -101,7 +101,7 @@ describe("CatalogRefresher lifecycle", () => {
       setupStatus: { state: "blocked" as const, reason: "missing_managed_credentials" as const },
     };
     const registry = registryStub([pkg], async () => clientWithTools("find_records"));
-    vi.mocked(registry.isSetupBlocked).mockReturnValue(!homed);
+    vi.mocked(registry.setupBlockReason).mockReturnValue(homed ? undefined : pkg.setupStatus.reason);
     const catalog = new Catalog(registry);
     const refresher = new CatalogRefresher(catalog, registry);
     try {

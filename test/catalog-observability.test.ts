@@ -17,7 +17,7 @@ vi.mock("../src/logging.js", () => ({ getLogger: () => mockLogger }));
 function createCatalog(): Catalog {
   return new Catalog({
     getPackage: vi.fn((packageId: string) => ({ id: packageId, name: packageId })),
-    isSetupBlocked: vi.fn().mockReturnValue(false),
+    setupBlockReason: vi.fn().mockReturnValue(undefined),
     getPackages: vi.fn(() => [{ id: "alpha", name: "Alpha" }]),
   } as unknown as PackageRegistry);
 }

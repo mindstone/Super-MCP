@@ -478,9 +478,9 @@ export class CatalogRefresher {
       return seam.connectForCatalog(packageId, { forceReconnect });
     }
 
-    const setupStatus = this.registry.getPackage(packageId)?.setupStatus;
-    if (this.registry.isSetupBlocked(packageId)) {
-      return { kind: "setup_incomplete", reason: setupStatus!.reason };
+    const setupReason = this.registry.setupBlockReason(packageId);
+    if (setupReason) {
+      return { kind: "setup_incomplete", reason: setupReason };
     }
     try {
       const client = await this.registry.getClient(packageId);
