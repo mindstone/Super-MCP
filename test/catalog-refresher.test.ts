@@ -62,6 +62,8 @@ function registryStub(
   getClient: (packageId: string) => Promise<McpClient>,
 ): PackageRegistry {
   return {
+    setupBlockReason: vi.fn((packageId: string) =>
+      packages.find((pkg) => pkg.id === packageId)?.setupStatus?.reason),
     getPackages: vi.fn().mockReturnValue(packages),
     getPackage: vi.fn((packageId: string) =>
       packages.find((pkg) => pkg.id === packageId)),
@@ -90,6 +92,26 @@ describe("CatalogRefresher lifecycle", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+  });
+
+  it.each([false, true])("uses the registry setup decision without the connection seam (homed: %s)", async homed => {
+    const CatalogRefresher = await loadCatalogRefresher();
+    const pkg = {
+      ...packageConfig("records"),
+      setupStatus: { state: "blocked" as const, reason: "missing_managed_credentials" as const },
+    };
+    const registry = registryStub([pkg], async () => clientWithTools("find_records"));
+    vi.mocked(registry.setupBlockReason).mockReturnValue(homed ? undefined : pkg.setupStatus.reason);
+    const catalog = new Catalog(registry);
+    const refresher = new CatalogRefresher(catalog, registry);
+    try {
+      refresher.start();
+      await vi.waitFor(() => expect(catalog.getPackageStatus(pkg.id)).toBe(homed ? "ready" : "setup_incomplete"));
+      expect(registry.getClient).toHaveBeenCalledTimes(homed ? 1 : 0);
+      expect(catalog.getPackageDiagnostics(pkg.id).lastError).toBe(pkg.setupStatus.reason);
+    } finally {
+      await refresher.dispose();
+    }
   });
 
   it("R8b: executes retry timers, single-flights concurrent refreshes, and disposes safely in flight", async () => {

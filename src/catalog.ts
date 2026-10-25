@@ -430,11 +430,11 @@ export class Catalog implements CatalogView {
     }
 
     const generation = this.beginRefresh(packageId);
-    const setupStatus = this.registry.getPackage(packageId)?.setupStatus;
-    if (setupStatus?.state === "blocked") {
+    const setupReason = this.registry.setupBlockReason(packageId);
+    if (setupReason) {
       this.commitFailure(packageId, generation, {
         status: "setup_incomplete",
-        lastError: setupStatus.reason,
+        lastError: setupReason,
         failureClass: "setup_incomplete",
         nextRetryAt: null,
         nextAuthProbeAt: null,
@@ -751,20 +751,20 @@ export class Catalog implements CatalogView {
   getPackageStatus(packageId: string): CatalogStatus | "unknown" {
     const cached = this.cache.get(packageId);
     if (cached) return cached.status;
-    return this.registry.getPackage(packageId)?.setupStatus?.state === "blocked"
+    return this.registry.setupBlockReason(packageId)
       ? "setup_incomplete"
       : "unknown";
   }
 
   getPackageError(packageId: string): string | undefined {
     return this.cache.get(packageId)?.lastError ??
-      this.registry.getPackage(packageId)?.setupStatus?.reason;
+      this.registry.setupBlockReason(packageId);
   }
 
   getRetryHint(packageId: string, now: number = Date.now()): CatalogRetryHint {
     const cached = this.cache.get(packageId);
     if (!cached) {
-      if (this.registry.getPackage(packageId)?.setupStatus?.state === "blocked") {
+      if (this.registry.setupBlockReason(packageId)) {
         return { retryAt: null, retryInMs: null, schedule: "none" };
       }
       return { retryAt: now, retryInMs: 0, schedule: "transient_backoff" };
@@ -798,12 +798,13 @@ export class Catalog implements CatalogView {
   getPackageDiagnostics(packageId: string): CatalogPackageDiagnostics {
     const cached = this.cache.get(packageId);
     const setupReason = this.registry.getPackage(packageId)?.setupStatus?.reason;
+    const setupBlocked = this.registry.setupBlockReason(packageId);
     return {
-      status: cached?.status ?? (setupReason ? "setup_incomplete" : "unknown"),
+      status: cached?.status ?? (setupBlocked ? "setup_incomplete" : "unknown"),
       lastError: cached?.lastError ?? setupReason,
       consecutiveFailures: cached?.consecutiveFailures ?? 0,
       nextRetryAt: cached?.nextRetryAt ?? cached?.nextAuthProbeAt ?? null,
-      lastErrorClass: cached?.failureClass ?? (setupReason ? "setup_incomplete" : null),
+      lastErrorClass: cached?.failureClass ?? (setupBlocked ? "setup_incomplete" : null),
       retainedToolCount: cached?.tools.length ?? 0,
       generation: cached?.generation ?? this.configurationGeneration,
     };

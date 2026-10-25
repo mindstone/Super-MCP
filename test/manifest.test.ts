@@ -33,6 +33,7 @@ vi.mock("../src/security.js", () => ({
 
 function createMockRegistry(packages: PackageConfig[]): PackageRegistry {
   return {
+    setupBlockReason: vi.fn().mockReturnValue(undefined),
     getPackages: vi.fn().mockReturnValue(packages),
     getPackage: vi.fn().mockImplementation((packageId: string) => packages.find((pkg) => pkg.id === packageId)),
     getSkippedPackages: vi.fn().mockReturnValue([]),

@@ -25,6 +25,7 @@ function createMockRegistry(): PackageRegistry {
   return {
     getClient: vi.fn(),
     getPackage: vi.fn().mockReturnValue(defaultPkg),
+    setupBlockReason: vi.fn().mockReturnValue(undefined),
     getPackages: vi.fn().mockReturnValue([defaultPkg]),
     healthCheck: vi.fn(),
     restartPackage: vi.fn(),

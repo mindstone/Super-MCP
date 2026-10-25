@@ -77,6 +77,7 @@ function createMockRegistry(overrides: {
     visibility: 'default',
   };
   return {
+    setupBlockReason: vi.fn().mockReturnValue(undefined),
     healthCheck: overrides.healthCheck ?? vi.fn().mockResolvedValue('ok'),
     getClient: overrides.getClient ?? vi.fn().mockResolvedValue(createMockClient()),
     getPackage: overrides.getPackage ?? vi.fn().mockReturnValue(defaultPkg),
@@ -387,6 +388,7 @@ describe('Catalog-Registry sync: list_tool_packages handler', () => {
     const registry = {
       getPackage: vi.fn().mockReturnValue(pkg),
       getPackages: vi.fn().mockReturnValue([pkg]),
+      setupBlockReason: vi.fn().mockReturnValue(undefined),
       subscribeLifecycle: vi.fn((listener: (event: RegistryLifecycleEvent) => void) => {
         lifecycleListener = listener;
         return vi.fn();

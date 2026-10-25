@@ -89,7 +89,7 @@ describe('package homes and raw package endpoint', () => {
     const base = await router();
     const localSpawn = vi.spyOn(StdioMcpClient.prototype, 'connect').mockRejectedValue(new Error('Local spawn is forbidden'));
     const registry = keep(new PackageRegistry({
-      mcpServers: { notebook: { name: 'Fictional Notes', command: '/must-never-run' } },
+      mcpServers: { notebook: { name: 'Fictional Notes', command: '/must-never-run', setupStatus: { state: 'blocked', reason: 'missing_managed_credentials' } } },
       packageHomes: { notebook: { url: `${base}/mcp/packages/notebook` } },
     }));
     const client = await registry.getClient('notebook');
@@ -101,6 +101,10 @@ describe('package homes and raw package endpoint', () => {
     expect(await registry.callTool('notebook', 'write_note', { text: 'hello' })).toMatchObject({ content: [{ text: 'hello' }], _meta: { fictional: 'call-meta' } });
     expect(await client.listResources!()).toMatchObject({ resources: [{ uri: 'ui://notebook/view' }] });
     expect(await client.readResource!('ui://notebook/view')).toMatchObject({ contents: [{ text: '<p>Fictional notebook</p>', _meta: { ui: { prefersBorder: true } } }], _meta: { fictional: 'resource-meta' } });
+    const catalog = new Catalog(registry);
+    await catalog.ensurePackageLoaded('notebook');
+    expect(catalog.getPackageStatus('notebook')).toBe('ready');
+    expect(catalog.getPackageDiagnostics('notebook').lastError).toBe('missing_managed_credentials');
     expect(localSpawn).not.toHaveBeenCalled();
     expect(registry.getPackage('notebook')?.transport).toBe('stdio');
   }, 25_000);

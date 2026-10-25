@@ -49,6 +49,7 @@ function makeRegistry(packageIds: readonly string[]): PackageRegistry {
   return {
     getPackage: vi.fn((packageId: string) => packages.get(packageId)),
     getPackages: vi.fn(() => [...packages.values()]),
+    setupBlockReason: vi.fn(() => undefined),
   } as unknown as PackageRegistry;
 }
 

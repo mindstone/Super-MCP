@@ -23,6 +23,7 @@ describe("catalog formatter wire contract", () => {
     };
     const registry = {
       getPackage: vi.fn(() => pkg),
+      setupBlockReason: vi.fn().mockReturnValue(undefined),
       getPackages: vi.fn(() => [pkg]),
     } as unknown as PackageRegistry;
     const catalog = new Catalog(registry);

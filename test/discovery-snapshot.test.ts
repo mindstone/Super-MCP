@@ -45,6 +45,7 @@ function registryStub(
   getClient: (packageId: string) => Promise<McpClient>,
 ): PackageRegistry {
   const registry = {
+    setupBlockReason: vi.fn().mockReturnValue(undefined),
     getPackages: vi.fn().mockReturnValue(packages),
     getPackage: vi.fn((packageId: string) =>
       packages.find((pkg) => pkg.id === packageId)),
