@@ -44,6 +44,13 @@ function remainingLifetimeMs(diskTokens: any): number | undefined {
   return expiresAtMs - Date.now();
 }
 
+/** True when the token is in date beyond the skew and is not the one the server just refused (FOX-5952: reusing a refused in-date token caused a request storm). */
+function hasUsableAccessToken(tokens: { access_token?: string } | undefined, rejectedAccessToken?: string): boolean {
+  if (!tokens?.access_token || tokens.access_token === rejectedAccessToken) return false;
+  const remaining = remainingLifetimeMs(tokens);
+  return remaining !== undefined && remaining > ACCESS_TOKEN_SKEW_MS;
+}
+
 /**
  * Build a synthesized HTTP 200 token-endpoint Response from on-disk tokens. The
  * SDK's executeTokenRequest does `OAuthTokensSchema.parse(await res.json())`,
@@ -177,6 +184,7 @@ async function isInvalidGrant(response: Response): Promise<{ invalidGrant: boole
 export interface RefreshTransactionDeps {
   provider: SimpleOAuthProvider;
   baseFetch: typeof fetch;
+  rejectedAccessToken?: string;
 }
 
 /**
@@ -191,7 +199,7 @@ export async function runRefreshTransaction(
   input: RequestInfo | URL,
   init: RequestInit | undefined,
 ): Promise<Response> {
-  const { provider, baseFetch } = deps;
+  const { provider, baseFetch, rejectedAccessToken } = deps;
   const packageId = provider.getPackageId();
   const tokenFilePath = provider.getTokenFilePath();
   const supplied = parseRefreshBody(init);
@@ -247,14 +255,18 @@ export async function runRefreshTransaction(
     // (2) Short-circuit: disk already has a still-valid access token (a peer
     // refreshed). Avoid a network POST AND avoid burning a single-use refresh
     // token. The SDK parses the synthesized response and re-persists idempotently.
-    const remaining = disk?.access_token ? remainingLifetimeMs(disk) : undefined;
-    if (disk?.access_token && typeof remaining === "number" && remaining > ACCESS_TOKEN_SKEW_MS) {
+    if (hasUsableAccessToken(disk, rejectedAccessToken)) {
       logger.info("Refresh short-circuited: on-disk access token still valid", {
         package_id: packageId,
-        remaining_ms: remaining,
+        remaining_ms: remainingLifetimeMs(disk),
       });
       await provider.clearNeedsReconnectMarker();
       return synthesizeTokenResponse(disk);
+    }
+    if (hasUsableAccessToken(disk)) {
+      logger.info("Refresh required: on-disk access token was refused by the server", {
+        package_id: packageId,
+      });
     }
 
     // (3) Refresh genuinely needed. Present the FRESHEST on-disk refresh token
@@ -420,10 +432,9 @@ export async function runRefreshTransaction(
       // A peer rotated and persisted: disk refresh token changed since we read,
       // and/or there is now a still-valid access token → synthesize success.
       const recheckRefresh = typeof recheck?.refresh_token === "string" ? recheck.refresh_token : undefined;
-      const recheckRemaining = recheck?.access_token ? remainingLifetimeMs(recheck) : undefined;
       const peerRotated =
         (recheckRefresh && recheckRefresh !== refreshTokenToSend) ||
-        (typeof recheckRemaining === "number" && recheckRemaining > ACCESS_TOKEN_SKEW_MS);
+        hasUsableAccessToken(recheck, rejectedAccessToken);
 
       if (peerRotated && recheck?.access_token) {
         logger.info("Refresh lost a race but a peer rotated — recovering from disk", {
