@@ -204,6 +204,9 @@ function createResponseNormalizingFetch(
     statusClass: OAuthDiscoveryStatusClass,
   ) => void,
 ): typeof fetch {
+  // FOX-5952: expiry alone cannot make a token usable after the server refused it.
+  let rejectedAccessToken: string | undefined;
+
   // OAuth refresh / code-exchange failures (invalid_grant, invalid_client, …) hit the
   // authorization server's token endpoint. Scope error capture to that endpoint so a
   // normal non-OK MCP/JSON-RPC API response that happens to carry a string `error`
@@ -285,7 +288,7 @@ function createResponseNormalizingFetch(
     try {
       response =
         refreshProvider && isOAuthTokenEndpoint(input) && isRefreshGrantBody(init)
-          ? await runRefreshTransaction({ provider: refreshProvider, baseFetch }, input, init)
+          ? await runRefreshTransaction({ provider: refreshProvider, baseFetch, rejectedAccessToken }, input, init)
           : await baseFetch(input, init);
     } catch (error) {
       if (discoveryClassification) {
@@ -317,6 +320,14 @@ function createResponseNormalizingFetch(
       });
     } else {
       normalizedResponse = response as Response;
+    }
+
+    if (normalizedResponse.status === 401) {
+      const authorization = new Headers(init?.headers).get("authorization");
+      const bearer = authorization?.match(/^Bearer\s+(.+)$/i);
+      if (bearer) {
+        rejectedAccessToken = bearer[1];
+      }
     }
 
     if (isOAuthTokenEndpoint(input)) {
