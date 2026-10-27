@@ -1037,7 +1037,7 @@ describe("FOX-2753: ticket scenario verification", () => {
     };
     const error = await runValidationFailure({
       schema,
-      args: { to: ["harry@mindstone.com"], subject: "test", body: "test", priority: "high" },
+      args: { to: ["jane@example.com"], subject: "test", body: "test", priority: "high" },
     });
     const ticket = error.data.repair_ticket;
     expect(ticket.unknown_fields).toContain("priority");
