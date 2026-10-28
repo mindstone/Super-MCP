@@ -1089,13 +1089,18 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       const sessions = new Map<string, SessionEntry>();
 
       const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+      // A session with an open tool call is kept until no client can still be
+      // waiting on it: the 4h tool-call sentinel (SUPER_MCP_TOOL_TIMEOUT, Rebel
+      // Core's TOOL_CALL_TIMEOUT) plus the idle limit. A cancelled call leaves
+      // its POST open with no response, so the open count alone would never drop.
+      const BUSY_SESSION_IDLE_TIMEOUT_MS = 4 * 60 * 60 * 1000 + SESSION_IDLE_TIMEOUT_MS;
       const GC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
       const gcInterval = setInterval(() => {
         const now = Date.now();
         for (const [id, entry] of sessions) {
-          if (entry.openPosts > 0) continue;
-          if (now - entry.lastActive > SESSION_IDLE_TIMEOUT_MS) {
+          const idleLimit = entry.openPosts > 0 ? BUSY_SESSION_IDLE_TIMEOUT_MS : SESSION_IDLE_TIMEOUT_MS;
+          if (now - entry.lastActive > idleLimit) {
             logger.debug("Reaping idle MCP session", { sessionId: id });
             entry.server.close().catch(() => {});
             sessions.delete(id);

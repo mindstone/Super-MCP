@@ -145,13 +145,13 @@ describe("HTTP session idle reaper", () => {
     vi.restoreAllMocks();
   });
 
-  function callTool() {
+  function callTool(signal?: AbortSignal) {
     // Observe rejection immediately so a red assertion can still clean up safely.
-    return client.callTool({ name: "use_tool", arguments: {} }, undefined, { timeout: 3_000 })
+    return client.callTool({ name: "use_tool", arguments: {} }, undefined, { timeout: 3_000, signal })
       .then((result) => ({ result }), (error: unknown) => ({ error }));
   }
 
-  it("keeps an open tool POST through a sweep 31 minutes later and delivers its result", async () => {
+  it("keeps a session with an open tool POST, delivers the result, then idles from when it closed", async () => {
     const call = callTool();
     await started.promise;
     expect(toolResponse().closed).toBe(false);
@@ -160,19 +160,11 @@ describe("HTTP session idle reaper", () => {
     sweep();
     expect(wasReaped()).toBe(false);
 
+    const completedAt = now;
     release.resolve();
     expect(await call).toEqual({
       result: { content: [{ type: "text", text: "Tool completed" }] },
     });
-  });
-
-  it("starts the 30-minute idle period when the tool POST closes", async () => {
-    const call = callTool();
-    await started.promise;
-    now += 31 * MINUTE;
-    const completedAt = now;
-    release.resolve();
-    await call;
     await vi.waitFor(() => expect(toolResponse().closed).toBe(true));
 
     now = completedAt + IDLE_LIMIT;
@@ -182,6 +174,23 @@ describe("HTTP session idle reaper", () => {
     sweep();
     expect(wasReaped()).toBe(true);
     await expect(client.ping()).rejects.toThrow(/Session not found/);
+  });
+
+  it("reaps a session whose cancelled call left its POST open, once no client can still be waiting", async () => {
+    const abort = new AbortController();
+    const call = callTool(abort.signal);
+    await started.promise;
+    abort.abort(); // Sends notifications/cancelled; the POST stream stays open.
+    await call;
+    release.resolve();
+    expect(toolResponse().closed).toBe(false);
+
+    now += 4 * 60 * MINUTE + IDLE_LIMIT;
+    sweep();
+    expect(wasReaped()).toBe(false);
+    now += 1;
+    sweep();
+    expect(wasReaped()).toBe(true);
   });
 
   it("still reaps a session with only a GET listening stream open", async () => {
