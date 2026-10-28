@@ -102,6 +102,39 @@ describe("materializeOutput", () => {
     JSON.parse(content); // Should not throw
   });
 
+  it("saves a large structured-only result as its structuredContent JSON", async () => {
+    const structuredContent = { attendees: Array(1000).fill({ id: 1, detail: "A".repeat(100) }) };
+    const result = await materializeOutput("pkg1", "tool1", {}, {
+      content: [], structuredContent,
+    }, 100, tempWorkspace, 20_000);
+
+    expect(result).not.toBeNull();
+    expect(result?.result.status).toBe("materialized");
+    expect(result?.result.file_path).toMatch(/\.json$/);
+    const content = await fs.readFile(path.join(tempWorkspace, result!.result.file_path as string), "utf8");
+    expect(content).toBe(JSON.stringify(structuredContent, null, 2));
+  });
+
+  it("does not save structuredContent from an error with empty content", async () => {
+    const result = await materializeOutput("pkg1", "tool1", {}, {
+      content: [], isError: true, structuredContent: { detail: "A".repeat(100_000) },
+    }, 100, tempWorkspace, 20_000);
+
+    expect(result).toBeNull();
+  });
+
+  it("keeps prose in the saved file when structuredContent is also present", async () => {
+    const text = "Attendee summary. ".repeat(2000);
+    const result = await materializeOutput("pkg1", "tool1", {}, {
+      content: [{ type: "text", text }], structuredContent: { attendees: [{ id: 1 }] },
+    }, 100, tempWorkspace, 20_000);
+
+    expect(result).not.toBeNull();
+    expect(result?.result.file_path).toMatch(/\.txt$/);
+    const content = await fs.readFile(path.join(tempWorkspace, result!.result.file_path as string), "utf8");
+    expect(content).toBe('---\npackage_id: "pkg1"\ntool_id: "tool1"\n---\n' + text);
+  });
+
   it("T4: Non-JSON output -> YAML frontmatter + .txt file", async () => {
     const text = "Hello world ".repeat(10_000);
     const result = await materializeOutput("pkg1", "tool1", {}, createToolResult(text), 100, tempWorkspace, 100);

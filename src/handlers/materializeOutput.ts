@@ -3,6 +3,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { UseToolOutput } from "../types.js";
 import { getLogger } from "../logging.js";
+import { resolveToolResultPayload } from "../utils/toolResultPayload.js";
 
 // super-mcp is a separately built package and cannot import @rebel/shared.
 // Parent-repo conformance tests keep this exact set aligned with IMAGE_MIME_TYPES.
@@ -235,8 +236,9 @@ function extractDataForMaterialization(toolResult: unknown): DecomposedContent {
         }
       }
 
+      const payload = textParts.length === 0 && !isError ? resolveToolResultPayload(toolResult, "") : null;
       return {
-        data: toolResult.content,
+        data: payload ? payload.data : toolResult.content,
         fullContent: toolResult.content,
         textParts,
         imageBlocks: extractImageContentBlocks(toolResult),

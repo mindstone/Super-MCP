@@ -9,6 +9,7 @@ import { getLogger } from "../logging.js";
 import { PackageRegistry } from "../registry.js";
 import { getSecurityPolicy } from "../security.js";
 import { BulkExportInput, BulkExportOutput } from "../types.js";
+import { resolveToolResultPayload, type ToolResultPayload } from "../utils/toolResultPayload.js";
 import {
   coerceStringifiedJson,
   coerceStringifiedNumber,
@@ -122,10 +123,9 @@ interface ParsedBulkExportInput {
   pagination?: { tokenField: string; inputParam: string };
 }
 
-interface ToolExecutionResult {
-  output: string;
-  isError: boolean;
-}
+type ToolExecutionResult =
+  | { output: string; isError: true }
+  | { output: string; isError: false; payload: ToolResultPayload | null };
 
 interface ToolAnnotations {
   readOnlyHint?: boolean;
@@ -472,13 +472,13 @@ async function resolveOutputPath(outputFile: string): Promise<{ absolutePath: st
   return { absolutePath, absoluteTempFile, relativePath };
 }
 
-function extractMcpTextResult(toolResult: unknown): ToolExecutionResult {
+function extractMcpResult(toolResult: unknown): ToolExecutionResult {
   const isError = isRecord(toolResult) && toolResult.isError === true;
 
   if (!isRecord(toolResult) || !Array.isArray(toolResult.content)) {
     return {
       output: typeof toolResult === "string" ? toolResult : JSON.stringify(toolResult) ?? "",
-      isError: isError || true,
+      isError: true,
     };
   }
 
@@ -487,13 +487,17 @@ function extractMcpTextResult(toolResult: unknown): ToolExecutionResult {
     .map((block) => block.text)
     .join("");
 
-  if (text.length > 0) {
-    return { output: text, isError };
+  if (isError) {
+    return { output: text.length > 0 ? text : JSON.stringify(toolResult.content), isError: true };
   }
 
+  const payload = resolveToolResultPayload(toolResult, text);
   return {
-    output: JSON.stringify(toolResult.content),
-    isError: true,
+    output: payload?.serialized ?? (text.length > 0
+      ? "Tool output is not JSON and has no object structuredContent. Try adding returnJson: true to args."
+      : "Tool result has no text or object structuredContent."),
+    isError: false,
+    payload,
   };
 }
 
@@ -645,19 +649,18 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
         break;
       }
 
+      if (!result.payload) {
+        pushError(errors, `Page ${page + 1}: ${result.output}`);
+        break;
+      }
+
       const rawPageBytes = Buffer.byteLength(result.output);
       if (rawPageBytes > BULK_EXPORT_MAX_PAGE_BYTES) {
         pushError(errors, `Page ${page + 1} raw output exceeded 10MB; lower the tool's page size.`);
         break;
       }
 
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(result.output);
-      } catch {
-        pushError(errors, "Tool output is not JSON. Try adding returnJson: true to args.");
-        break;
-      }
+      const parsed = result.payload.data;
 
       let items: unknown[];
       if (params.itemsPath) {
@@ -922,7 +925,7 @@ export async function handleBulkExport(
             }),
           ]);
           registry.notifyActivity(parsedInput.packageId);
-          return extractMcpTextResult(toolResult);
+          return extractMcpResult(toolResult);
         } catch (error) {
           logger.warn("bulk_export tool call failed", {
             package_id: parsedInput.packageId,

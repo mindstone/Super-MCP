@@ -733,7 +733,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
                 },
                 items_path: {
                   type: "string",
-                  description: "Optional dot-path to the array or object to emit as NDJSON lines from each JSON response.",
+                  description: "Optional dot-path to the array or object to emit as NDJSON lines, inside the tool's JSON text or its structuredContent when it returns no JSON text.",
                   examples: ["emails", "data.items"],
                 },
                 max_pages: {
@@ -747,7 +747,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
                   properties: {
                     token_field: {
                       type: "string",
-                      description: "Dot-path to the next-page token in the tool's JSON response.",
+                      description: "Dot-path to the next-page token inside the tool's JSON text or its structuredContent when it returns no JSON text.",
                       examples: ["nextPageToken", "meta.next_cursor"],
                     },
                     input_param: {
