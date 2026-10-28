@@ -221,6 +221,6 @@ These can be removed but have no runtime cost (just interface definitions).
 
 ---
 
-*Document created: 2025-12-08 by Joshua Wöhle*
+*Document created: 2025-12-08*
 *Last updated: 2025-12-12*
 *Progress: Phases 1, 2, and dead code removal complete. Phase 3 deferred.*
