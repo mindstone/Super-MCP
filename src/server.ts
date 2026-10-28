@@ -1083,6 +1083,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
         server: Server;
         transport: StreamableHTTPServerTransport;
         lastActive: number;
+        openPosts: number;
         packageId?: string;
       }
       const sessions = new Map<string, SessionEntry>();
@@ -1093,6 +1094,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       const gcInterval = setInterval(() => {
         const now = Date.now();
         for (const [id, entry] of sessions) {
+          if (entry.openPosts > 0) continue;
           if (now - entry.lastActive > SESSION_IDLE_TIMEOUT_MS) {
             logger.debug("Reaping idle MCP session", { sessionId: id });
             entry.server.close().catch(() => {});
@@ -1133,6 +1135,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
                   server: sessionServer,
                   transport: sessionTransport,
                   lastActive: Date.now(),
+                  openPosts: 0,
                   packageId,
                 });
                 logger.debug("MCP session initialized", { sessionId, activeSessions: sessions.size });
@@ -1163,6 +1166,13 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           }
 
           session.lastActive = Date.now();
+          if (req.method === "POST") {
+            session.openPosts++;
+            res.once("close", () => {
+              session.openPosts--;
+              session.lastActive = Date.now();
+            });
+          }
           await session.transport.handleRequest(req, res, req.body);
         } catch (error) {
           logger.error("Failed to handle MCP request", {
