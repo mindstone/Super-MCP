@@ -181,7 +181,10 @@ describe("HTTP session idle reaper", () => {
     const call = callTool(abort.signal);
     await started.promise;
     abort.abort(); // Sends notifications/cancelled; the POST stream stays open.
-    await call;
+    expect(await call).toEqual({ error: expect.any(Error) });
+    // Client rejection precedes delivery of its cancellation notification.
+    await vi.waitFor(() => expect(requests.find((request) =>
+      request.body?.method === "notifications/cancelled")?.response.closed).toBe(true));
     release.resolve();
     expect(toolResponse().closed).toBe(false);
 
@@ -191,6 +194,8 @@ describe("HTTP session idle reaper", () => {
     now += 1;
     sweep();
     expect(wasReaped()).toBe(true);
+    await vi.waitFor(() => expect(toolResponse().closed).toBe(true));
+    await expect(client.ping()).rejects.toThrow(/Session not found/);
   });
 
   it("still reaps a session with only a GET listening stream open", async () => {
