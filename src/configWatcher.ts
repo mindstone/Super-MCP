@@ -4,6 +4,7 @@ import chokidar, { FSWatcher } from "chokidar";
 import { SuperMcpConfig } from "./types.js";
 import { SecurityConfig, SecurityPolicy, setSecurityPolicy } from "./security.js";
 import { getLogger } from "./logging.js";
+import type { ConfigApplyResult } from "./registry.js";
 
 const logger = getLogger();
 
@@ -100,7 +101,7 @@ export class ConfigWatcher {
     
     this.debounceTimer = setTimeout(async () => {
       this.debounceTimer = null;
-      await this.reloadSecurityConfig();
+      await reloadSecurityPolicyFromConfigFiles(this.configPaths);
       try {
         await this.onConfigurationChange?.();
       } catch (error) {
@@ -109,38 +110,6 @@ export class ConfigWatcher {
         });
       }
     }, DEBOUNCE_MS);
-  }
-
-  private async reloadSecurityConfig(): Promise<void> {
-    logger.info("Reloading security configuration...");
-    
-    try {
-      const { securityConfig, userDisabledToolsByServer, adminDisabledToolsByCatalogId } = await this.loadMergedConfig();
-      const newPolicy = new SecurityPolicy(securityConfig);
-      
-      // Set user-disabled tools on the new policy
-      newPolicy.setUserDisabledTools(userDisabledToolsByServer);
-      
-      // Set admin-disabled tools on the new policy
-      newPolicy.setAdminDisabledTools(adminDisabledToolsByCatalogId);
-      
-      setSecurityPolicy(newPolicy);
-      
-      const summary = newPolicy.getSummary();
-      const userDisabledSummary = newPolicy.getUserDisabledSummary();
-      const adminDisabledSummary = newPolicy.getAdminDisabledSummary();
-      logger.info("Security policy reloaded successfully", {
-        ...summary,
-        user_disabled_servers: userDisabledSummary.serverCount,
-        user_disabled_tools: userDisabledSummary.totalDisabled,
-        admin_disabled_catalogs: adminDisabledSummary.catalogCount,
-        admin_disabled_tools: adminDisabledSummary.totalDisabled,
-      });
-    } catch (error) {
-      logger.error("Failed to reload security config, keeping existing policy", {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
   }
 
   private async discoverAllConfigPaths(): Promise<void> {
@@ -185,11 +154,62 @@ export class ConfigWatcher {
       await discover(configPath, 0);
     }
   }
+}
+
+/** Reload policy before admitting additions, then publish the catalog generation. */
+export async function applyConfigurationChange(
+  registry: { applyConfigFromFiles(configPaths: string[]): Promise<ConfigApplyResult> },
+  catalogRefresher: { configurationChanged(): void },
+  configPaths: string[],
+): Promise<ConfigApplyResult> {
+  if (!await reloadSecurityPolicyFromConfigFiles(configPaths)) return { status: "failed" };
+  let result: ConfigApplyResult;
+  try {
+    result = await registry.applyConfigFromFiles(configPaths);
+  } catch {
+    logger.error("Failed to apply package configs after a config change");
+    result = { status: "failed" };
+  }
+  catalogRefresher.configurationChanged();
+  return result;
+}
+
+export async function reloadSecurityPolicyFromConfigFiles(configPaths: string[]): Promise<boolean> {
+  logger.info("Reloading security configuration...");
+
+  try {
+    const { securityConfig, userDisabledToolsByServer, adminDisabledToolsByCatalogId } = await loadMergedSecurityConfig(configPaths);
+    const newPolicy = new SecurityPolicy(securityConfig);
+
+    // Set user-disabled tools on the new policy
+    newPolicy.setUserDisabledTools(userDisabledToolsByServer);
+
+    // Set admin-disabled tools on the new policy
+    newPolicy.setAdminDisabledTools(adminDisabledToolsByCatalogId);
+
+    setSecurityPolicy(newPolicy);
+
+    const summary = newPolicy.getSummary();
+    const userDisabledSummary = newPolicy.getUserDisabledSummary();
+    const adminDisabledSummary = newPolicy.getAdminDisabledSummary();
+    logger.info("Security policy reloaded successfully", {
+      ...summary,
+      user_disabled_servers: userDisabledSummary.serverCount,
+      user_disabled_tools: userDisabledSummary.totalDisabled,
+      admin_disabled_catalogs: adminDisabledSummary.catalogCount,
+      admin_disabled_tools: adminDisabledSummary.totalDisabled,
+    });
+    return true;
+  } catch {
+    logger.error("Failed to reload security config, keeping existing policy");
+    return false;
+  }
+}
 
   /**
    * Load merged security config, user-disabled tools, and admin-disabled tools from all config files.
    */
-  private async loadMergedConfig(): Promise<{
+async function loadMergedSecurityConfig(configPaths: string[]): Promise<{
     securityConfig: SecurityConfig;
     userDisabledToolsByServer: Record<string, string[]>;
     adminDisabledToolsByCatalogId: Record<string, string[]>;
@@ -307,7 +327,7 @@ export class ConfigWatcher {
       }
     };
 
-    for (const configPath of this.configPaths) {
+  for (const configPath of configPaths) {
       await loadConfig(configPath, 0);
     }
 
@@ -317,4 +337,3 @@ export class ConfigWatcher {
       adminDisabledToolsByCatalogId: mergedAdminDisabled,
     };
   }
-}

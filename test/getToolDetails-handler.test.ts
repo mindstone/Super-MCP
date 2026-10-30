@@ -264,6 +264,7 @@ function createApiHarness(
 ) {
   const routes = new Map<string, RequestHandler[]>();
   const app = {
+    post: vi.fn(),
     get(path: string, ...handlers: RequestHandler[]) {
       routes.set(path, handlers);
     },

@@ -269,6 +269,17 @@ export type PackageEnvRefreshResult =
       }>;
     };
 
+export type ConfigApplyResult =
+  | { status: "failed" }
+  | {
+      status: "ok";
+      added: string[];
+      needsReload: Array<
+        | { packageId: string; reason: "removed" | "changed" | "env_changed" | "invalid" }
+        | { reason: "config_files_changed" }
+      >;
+    };
+
 /** Names of env keys added, removed or changed between two env maps (sorted). */
 function changedEnvKeys(
   before: Record<string, string> | undefined,
@@ -441,6 +452,7 @@ interface ClientCleanupFailure {
 export class PackageRegistry {
   private config: SuperMcpConfig;
   private configPaths?: string[];
+  private loadedConfigFiles: string[] = [];
   private envRefreshQueue: Promise<unknown> = Promise.resolve();
   private packages: PackageConfig[];
   private clients: Map<string, McpClient> = new Map();
@@ -864,6 +876,7 @@ export class PackageRegistry {
 
     const registry = new PackageRegistry(mergedConfig);
     registry.configPaths = configPaths.map((configPath) => path.resolve(configPath));
+    registry.loadedConfigFiles = [...loadOrder].sort();
 
     // Initialize security policy
     const securityConfig: SecurityConfig = mergedConfig.security || {};
@@ -958,48 +971,89 @@ export class PackageRegistry {
   }
 
   /**
-   * Re-read the config files after a change and refresh the cached env of
-   * existing stdio packages whose env changed and nothing else about them did,
-   * so their NEXT spawn uses it (e.g. a rotated OAuth refresh token the host
-   * persisted). Live clients and in-flight calls are left alone.
-   *
-   * Deliberately narrow: packages added, removed, or changed in any other
-   * field (command, args, cwd, transport, ...) are logged and left to the
-   * host's whole-router reload. On a read or parse failure the cached configs
-   * are kept. Env values are credentials: only package ids and key names are
-   * logged. Never throws.
+   * Refresh only the cached env of existing stdio packages with unchanged
+   * identity, for their next spawn. Watcher and pre-spawn refreshes never
+   * admit packages; only applyConfigFromFiles does, after a security reload.
+   * Admitting an addition leaves existing clients and in-flight calls
+   * untouched. The existing package-home transition behaviour is unchanged.
+   * Other edits await a whole-router reload. Read/parse failures keep cached
+   * configs; diagnostics never include env values or parser text.
    */
   async refreshPackageEnvFromConfigFiles(configPaths: string[]): Promise<PackageEnvRefreshResult> {
-    const refresh = this.envRefreshQueue.then(() => this.refreshPackageEnvFromConfigFilesNow(configPaths));
+    const refresh = this.envRefreshQueue.then(() => this.reconcileFromConfigFilesNow(configPaths, "refresh"));
     // The caller receives the rejection; subsequent refreshes must still run.
     this.envRefreshQueue = refresh.then(() => undefined, () => undefined);
     return refresh;
   }
 
-  private async refreshPackageEnvFromConfigFilesNow(configPaths: string[]): Promise<PackageEnvRefreshResult> {
+  /** The caller must reload security policy before admitting new packages. */
+  async applyConfigFromFiles(configPaths: string[]): Promise<ConfigApplyResult> {
+    const apply = this.envRefreshQueue.then(() => this.reconcileFromConfigFilesNow(configPaths, "apply"));
+    this.envRefreshQueue = apply.then(() => undefined, () => undefined);
+    return apply;
+  }
+
+  private reconcileFromConfigFilesNow(configPaths: string[], mode: "refresh"): Promise<PackageEnvRefreshResult>;
+  private reconcileFromConfigFilesNow(configPaths: string[], mode: "apply"): Promise<ConfigApplyResult>;
+  private async reconcileFromConfigFilesNow(
+    configPaths: string[], mode: "refresh" | "apply",
+  ): Promise<PackageEnvRefreshResult | ConfigApplyResult> {
     if (this.terminal) {
-      return { status: "ok", updated: [], notApplied: [] };
+      return mode === "apply" ? { status: "failed" } : { status: "ok", updated: [], notApplied: [] };
     }
 
     let mergedConfig: SuperMcpConfig;
     let fresh: PackageConfig[];
+    let skipped: SkippedPackage[];
+    let loadOrder: string[];
     try {
-      ({ mergedConfig } = await PackageRegistry.loadMergedConfigFiles(configPaths));
-      fresh = PackageRegistry.validateAndFilterPackages(
+      ({ mergedConfig, loadOrder } = await PackageRegistry.loadMergedConfigFiles(configPaths));
+      ({ packages: fresh, skipped } = PackageRegistry.validateAndFilterPackages(
         mergedConfig,
         this.normalizeConfig(mergedConfig, true),
         true,
-      ).packages;
+      ));
     } catch {
       // Parser and I/O errors can quote credentials from config content.
       logger.error("Failed to re-read package configs after a config change, keeping cached configs");
       return { status: "failed" };
     }
 
-    if (this.terminal) return { status: "ok", updated: [], notApplied: [] };
+    if (this.terminal) {
+      return mode === "apply" ? { status: "failed" } : { status: "ok", updated: [], notApplied: [] };
+    }
 
     const freshById = new Map(fresh.map((pkg) => [pkg.id, pkg]));
     const updated: PackageEnvRefreshResult & { status: "ok" } = { status: "ok", updated: [], notApplied: [] };
+    const applied: ConfigApplyResult & { status: "ok" } = { status: "ok", added: [], needsReload: [] };
+    const additions: PackageConfig[] = [];
+
+    // Capture every difference before the env refresh changes cached configs.
+    if (mode === "apply") {
+      const currentIds = new Set(this.packages.map((pkg) => pkg.id));
+      for (const pkg of fresh) {
+        if (!currentIds.has(pkg.id)) additions.push(pkg);
+      }
+      applied.added = additions.map((pkg) => pkg.id);
+      for (const current of this.packages) {
+        const next = freshById.get(current.id);
+        if (!next) {
+          applied.needsReload.push({ packageId: current.id, reason: "removed" });
+        } else if (!isDeepStrictEqual({ ...current, env: undefined }, { ...next, env: undefined })) {
+          applied.needsReload.push({ packageId: current.id, reason: "changed" });
+        } else if (!isDeepStrictEqual(current.env, next.env)) {
+          applied.needsReload.push({ packageId: current.id, reason: "env_changed" });
+        }
+      }
+      for (const invalid of skipped) {
+        if (!currentIds.has(invalid.id) && !this.skippedPackages.some((pkg) => pkg.id === invalid.id)) {
+          applied.needsReload.push({ packageId: invalid.id, reason: "invalid" });
+        }
+      }
+      if (!isDeepStrictEqual([...loadOrder].sort(), this.loadedConfigFiles)) {
+        applied.needsReload.push({ reason: "config_files_changed" });
+      }
+    }
 
     const previousHomes = this.config.packageHomes;
     this.config.packageHomes = mergedConfig.packageHomes;
@@ -1038,6 +1092,20 @@ export class PackageRegistry {
         this.config.mcpServers[current.id] = rawEntry;
       }
       updated.updated.push({ packageId: current.id, changedKeys });
+    }
+    if (mode === "apply") {
+      if (this.terminal) return { status: "failed" };
+      for (const pkg of additions) {
+        this.packages.push(pkg);
+        this.skippedPackages = this.skippedPackages.filter((skipped) => skipped.id !== pkg.id);
+        this.config.mcpServers ??= {};
+        this.config.mcpServers[pkg.id] = mergedConfig.mcpServers![pkg.id];
+      }
+      logger.info("Applied configuration additions; remaining changes need a router reload", {
+        added: applied.added,
+        needs_reload: applied.needsReload,
+      });
+      return applied;
     }
     for (const addedId of freshById.keys()) {
       updated.notApplied.push({ packageId: addedId, reason: "added" });

@@ -88,6 +88,12 @@ Explicit execution paths remain allowed to connect within their own bounds. For 
 
 ---
 
+## Applying Configuration Changes
+
+`POST /api/config/apply` admits valid new packages after reloading security policy, then asks `CatalogRefresher` to reconcile. Admission creates no client and leaves existing clients and in-flight calls untouched. The existing package-home transition behaviour is unchanged. The endpoint is protected by the DNS rebinding guard and rejects any `Origin` header.
+
+The registry serializes explicit applies with watcher and pre-spawn env refreshes. Those refreshes stay narrow: they update env for the next spawn of an existing stdio package with unchanged identity and never admit additions. Apply computes its delta before refreshing env, copies only newly admitted raw entries, and leaves removals and other edits for a router reload. Its result lists `added` ids and `needs_reload` reasons (`removed`, `changed`, `env_changed`, `invalid`, or `config_files_changed`); package-scoped reasons include `package_id`. Read or parse failures retain cached configs and report `failed`, without logging config values or parser text.
+
 ## Concurrency Model
 
 Super-MCP uses request queues to manage concurrent tool calls and prevent race conditions:
