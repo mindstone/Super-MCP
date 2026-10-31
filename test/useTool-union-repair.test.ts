@@ -49,6 +49,18 @@ const panda = (value: any) => ({ template_uuid: "template", recipients: [{ email
   pricing_tables: [{ name: "Pricing", sections: [{ title: "Items", rows: [{ data: { Discount: { type: "percent", value } } }] }] }] });
 
 describe("union rejection repair tickets", () => {
+  it("keeps the missing field from the real Office conditional schema visible", async () => {
+    const { ticket, message } = await failure(schemas.rebel_office_word_apply_style, { style: "Quote", target: { type: "searchText" } });
+    expect(ticket.missing_required).toEqual(["target.searchText"]);
+    expect(message).toContain("Missing required: target.searchText.");
+  });
+  it("keeps a schema-required final segment visible beneath a real map", async () => {
+    const schema = { type: "object", properties: { x: { type: "object", additionalProperties: { type: "object", required: ["name"] } } } };
+    const { ticket, message } = await failure(schema, { x: { "entry_private": {} } });
+    expect(ticket.missing_required).toEqual(["x.*.name"]);
+    expect(message).toContain("Missing required: x.*.name.");
+    expect(message).not.toContain("entry_private");
+  });
   it.each([undefined, "https://json-schema.org/draft/2020-12/schema"])(
     "masks nested resource scopes with dialect %s", async ($schema) => {
       const entry = { type: "object", properties: { value: { type: "string" } }, additionalProperties: false };
@@ -487,7 +499,8 @@ describe("union rejection repair tickets", () => {
   it("projects a bulk canvas form without exhausting the budget on sibling errors", async () => {
     const warn = vi.spyOn(getLogger(), "warn");
     try {
-      const fields = Array.from({ length: 20 }, (_, i) => ({ id: `note-${i}`, type: "longtext", default: 42 }));
+      expect(schemas.rebel_canvas_form.properties.fields.maxItems).toBe(30);
+      const fields = Array.from({ length: 30 }, (_, i) => ({ id: `note-${i}`, type: "longtext", default: 42 }));
       const { ticket } = await call(schemas.rebel_canvas_form, { title: "Demo", actionId: "demo", fields }).then(() => { throw Error("Expected rejection"); }, error => ({ ticket: error.data.repair_ticket }));
       expect(ticket.missing_required).toEqual(fields.map((_, i) => `fields.${i}.label`));
       expect(ticket.type_errors).toHaveLength(fields.length);

@@ -6,8 +6,8 @@ const escapePointer = (key: string) => key.replace(/~/g, "~0").replace(/\//g, "~
 
 /** Presentation only: use AJV's decisive failures, never revalidate or rank by error count. */
 export function projectUnionErrors(rootSchema: unknown, raw: ProjectedError[]): ProjectedError[] {
-  // Backstop for hostile schemas; ordinary sibling unions share one indexing pass.
-  let remaining = 20_000;
+  // Backstop for hostile schemas; covers the canvas schema's maximum of 30 fields.
+  let remaining = 24_000;
   const spend = () => {
     if (--remaining < 0) throw new Error("Union projection budget exhausted");
   };

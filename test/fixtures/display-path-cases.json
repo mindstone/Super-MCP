@@ -265,5 +265,41 @@
     "suggestions": {
       "data.*.vaule": "value"
     }
+  },
+  {
+    "name": "fixed object union with a typed map masks unknown keys",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "metadata": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "args": {
+      "metadata": {
+        "entry_private": 1
+      }
+    },
+    "hidden": "entry_private",
+    "list": "unknown_fields",
+    "field": "metadata.*",
+    "suggestions": {}
   }
 ]

@@ -1221,7 +1221,10 @@ export function diagnosticDisplayPath(schema: unknown, args: unknown) {
             // Never execute schema regexes, including branches skipped by AJV.
             for (const child of children.get(node.patternProperties as object) ?? []) { spend(); next.push(child); }
           }
-          if (!property && Object.hasOwn(node, "additionalProperties")) next.push(node.additionalProperties);
+          if (Object.hasOwn(node, "additionalProperties")) {
+            mapShaped ||= node.additionalProperties !== false;
+            if (!property) next.push(node.additionalProperties);
+          }
         }
         const finalUnknown = unknownField && position === segments.length - 1;
         const fixedUnknown = finalUnknown && !mapShaped && (applicable.some(fixedParent) || fixedParent(parentSchema));
@@ -1290,7 +1293,10 @@ function buildRepairTicket(
     const rawField = validationError.keyword === "required"
       ? getRequiredFieldFromValidationError(validationError) : getFieldFromValidationError(validationError);
     if (validationError.keyword === "required") {
-      const field = displayPath(validationError.instancePath, validationError.params?.missingProperty);
+      // AJV's missing name is schema-authored; only its instance path needs masking.
+      const field = validationError.instancePath
+        ? `${displayPath(validationError.instancePath)}.${validationError.params.missingProperty}`
+        : validationError.params.missingProperty;
       missingRequired.push(field);
       failingFields.add(rawField);
       continue;

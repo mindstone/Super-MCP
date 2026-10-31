@@ -1934,5 +1934,92 @@
     },
     "additionalProperties": true,
     "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "rebel_office_word_apply_style": {
+    "type": "object",
+    "properties": {
+      "style": {
+        "type": "string",
+        "minLength": 1,
+        "description": "Style name, e.g. \"Heading 1\", \"Title\", \"Subtitle\", \"Quote\", \"Intense Quote\", \"No Spacing\", or a custom style defined in the document."
+      },
+      "target": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "selection",
+              "paragraphRange",
+              "searchText"
+            ],
+            "description": "Which paragraphs to style: the current selection, a range of paragraphs, or paragraphs containing a search text."
+          },
+          "startParagraph": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Start paragraph index, 0-based (for paragraphRange)."
+          },
+          "endParagraph": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "End paragraph index, 0-based, inclusive (for paragraphRange; defaults to startParagraph)."
+          },
+          "searchText": {
+            "type": "string",
+            "description": "Style every paragraph containing this text (for searchText)."
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "searchText"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "searchText"
+              ],
+              "properties": {
+                "searchText": {
+                  "minLength": 1
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "type": {
+                  "const": "paragraphRange"
+                }
+              },
+              "required": [
+                "type"
+              ]
+            },
+            "then": {
+              "required": [
+                "startParagraph"
+              ]
+            }
+          }
+        ],
+        "description": "Which paragraphs to style."
+      }
+    },
+    "required": [
+      "style",
+      "target"
+    ]
   }
 }
