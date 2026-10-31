@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ToolNotesStore.whenIdle()`** resolves once any compaction a `readSnapshot()` started in the background has finished. `readSnapshot()` still does not wait for it; call `whenIdle()` before deleting the notes directory (tests, shutdown) so the compaction's lock and temp file cannot land in a directory being removed.
 
 ### Changed
+- **A host app can name itself to outside services.** `SUPER_MCP_APP_NAME` (already used for the callback page) now also sets the OAuth client name a provider shows on its consent screen and in its connected-apps list, and the MCP `clientInfo` name sent to servers. Optional `SUPER_MCP_APP_URL` and `SUPER_MCP_APP_LOGO_URL` (public https URLs) are sent as `client_uri` and `logo_uri`. Unset, the router still identifies as `super-mcp-router`. A client already registered with a provider keeps its old name until it is registered again.
 - OAuth error logs record only the error code, never the provider's description. Token fingerprints have been removed from refresh logs, and the refresh log field `server_error` is now `error`.
 
 ### Fixed

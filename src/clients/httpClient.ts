@@ -6,6 +6,7 @@ import { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import PQueue from "p-queue";
 import { McpClient, PackageConfig, ReadResourceResult } from "../types.js";
 import { getLogger } from "../logging.js";
+import { getMcpClientInfo } from "../clientIdentity.js";
 import { SimpleOAuthProvider, RefreshOnlyOAuthProvider } from "../auth/providers/index.js";
 import { OAUTH_REDIRECT_URI_REJECTED_CODE } from "../auth/authorizeProbe.js";
 import { isAuthLikeErrorMessageText } from "../auth/authLikeVocabulary.js";
@@ -424,7 +425,7 @@ export class HttpMcpClient implements McpClient {
     });
     
     this.client = new Client(
-      { name: "super-mcp-router", version: "0.1.0" },
+      getMcpClientInfo(),
       { capabilities: {} }
     );
   }
@@ -545,7 +546,7 @@ export class HttpMcpClient implements McpClient {
     }
 
     this.client = new Client(
-      { name: "super-mcp-router", version: "0.1.0" },
+      getMcpClientInfo(),
       { capabilities: {} }
     );
     this.transport = undefined;
@@ -569,7 +570,7 @@ export class HttpMcpClient implements McpClient {
     }
 
     this.client = new Client(
-      { name: "super-mcp-router", version: "0.1.0" },
+      getMcpClientInfo(),
       { capabilities: {} }
     );
     this.transport = undefined;
@@ -694,7 +695,7 @@ export class HttpMcpClient implements McpClient {
           
           // Create a fresh client for the SSE transport
           this.client = new Client(
-            { name: "super-mcp-router", version: "0.1.0" },
+            getMcpClientInfo(),
             { capabilities: {} }
           );
           
@@ -769,7 +770,7 @@ export class HttpMcpClient implements McpClient {
           }
 
           this.client = new Client(
-            { name: "super-mcp-router", version: "0.1.0" },
+            getMcpClientInfo(),
             { capabilities: {} }
           );
 
@@ -1247,7 +1248,7 @@ export class HttpMcpClient implements McpClient {
         }
         
         this.client = new Client(
-          { name: "super-mcp-router", version: "0.1.0" },
+          getMcpClientInfo(),
           { capabilities: {} }
         );
         
