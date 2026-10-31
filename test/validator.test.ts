@@ -520,6 +520,74 @@ describe("use_tool repair tickets", () => {
     expect(repairTicket.did_you_mean).toEqual({});
   });
 
+  it.each([
+    ["thread_ts", "ts"],
+    ["fromDate", "fromDateTime"],
+    ["max_results", "max_messages"],
+    ["task_gid", "task_id"],
+    ["user_id", "user"],
+  ])("suggests %s as %s without renaming or dispatching", async (unknown, valid) => {
+    const schema = {
+      type: "object",
+      properties: { [valid]: { type: "string" } },
+      required: [valid],
+      additionalProperties: false,
+    };
+    const callTool = vi.fn();
+    const { registry, catalog, validator } = createUseToolDeps(schema, { callTool });
+    const args = { [unknown]: "example-value" };
+    const error = await handleUseTool(
+      { package_id: nextId("pkg"), tool_id: nextId("tool"), args },
+      registry as any,
+      catalog as any,
+      validator,
+    ).catch((error) => error);
+
+    const ticket = expectRepairTicket(error);
+    expect(ticket.did_you_mean).toEqual({ [unknown]: valid });
+    expect(ticket.unknown_fields).toEqual([unknown]);
+    expect(ticket.missing_required).toEqual([valid]);
+    expect(callTool).not.toHaveBeenCalled();
+    // Validation strips unknown top-level fields in place; it must not rename them.
+    expect(args).toEqual({});
+  });
+
+  it.each([
+    ["delete_slack_message", ["channel", "ts"], "thread_ts"],
+    ["move_drive_file", ["file_id", "new_parent_id", "remove_from_parents"], "old_parent_id"],
+    ["send_email", ["to"], "reply_to"],
+  ] as const)("does not suggest supplied fields for %s", async (toolId, validFields, unknown) => {
+    const suppliedFields = validFields.filter(field => field !== "remove_from_parents");
+    const error = await runValidationFailure({
+      toolId,
+      schema: {
+        type: "object",
+        properties: Object.fromEntries(validFields.map(field => [field, { type: "string" }])),
+        additionalProperties: false,
+      },
+      args: Object.fromEntries([...suppliedFields, unknown].map(field => [field, "example-value"])),
+    });
+    const ticket = expectRepairTicket(error);
+    expect(ticket.did_you_mean).toEqual({});
+    expect(ticket.valid_fields).toEqual(validFields);
+    expect(ticket.unknown_fields).toEqual([unknown]);
+    expect(error.message).not.toContain("did you mean");
+  });
+
+  it("can still suggest an unsupplied field", async () => {
+    const error = await runValidationFailure({
+      schema: {
+        type: "object",
+        properties: { max_results: { type: "string" }, max_messages: { type: "string" } },
+        additionalProperties: false,
+      },
+      args: { max_result: "example-value", max_messages: "example-value" },
+    });
+    const ticket = expectRepairTicket(error);
+    expect(ticket.did_you_mean).toEqual({ max_result: "max_results" });
+    expect(ticket.valid_fields).toEqual(["max_results", "max_messages"]);
+  });
+
   it("aggregates multiple error categories in one repair ticket", async () => {
     const schema = {
       type: "object",
