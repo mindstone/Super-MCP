@@ -169,7 +169,7 @@ describe('PackageRegistry.applyConfigFromFiles', () => {
     registry = await PackageRegistry.fromConfigFiles([configPath]);
     expect(await registry.applyConfigFromFiles([configPath])).toEqual({ status: 'ok', added: [], needsReload: [] });
     await write({ ...initialServers(), Invalid: { command: 'node' } });
-    await registry.applyConfigFromFiles([configPath]);
+    expect(await registry.applyConfigFromFiles([configPath])).toEqual({ status: 'ok', added: ['Invalid'], needsReload: [] });
     expect(registry.getSkippedPackages()).toEqual([]);
   });
 
