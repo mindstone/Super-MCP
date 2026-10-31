@@ -1,5 +1,6 @@
 import { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import { getLogger } from "../../logging.js";
+import { getOAuthClientIdentity } from "../../clientIdentity.js";
 import { spawn } from "child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -293,9 +294,10 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   }
   
   get clientMetadata() {
+    const identity = getOAuthClientIdentity();
     return {
-      client_name: "super-mcp-router",  // RFC 7591 standard
-      name: "super-mcp-router",         // Fallback for non-compliant servers
+      ...identity,                      // client_name (RFC 7591 standard), client_uri, logo_uri
+      name: identity.client_name,       // Fallback for non-compliant servers
       description: "MCP Router for aggregating multiple MCP servers",
       redirect_uris: [`http://localhost:${this.oauthPort}/oauth/callback`]
     };

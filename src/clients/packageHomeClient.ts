@@ -2,9 +2,10 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import type { McpClient, PackageConfig, PackageHome } from "../types.js";
+import { getMcpClientInfo } from "../clientIdentity.js";
 
 export class PackageHomeClient implements McpClient {
-  private client = new Client({ name: "super-mcp-router", version: "1.0.0" });
+  private client = new Client(getMcpClientInfo());
   private transport: StreamableHTTPClientTransport;
   private connected = false;
 

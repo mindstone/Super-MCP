@@ -7,6 +7,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import PQueue from "p-queue";
 import { McpClient, PackageConfig, ReadResourceResult } from "../types.js";
 import { getLogger } from "../logging.js";
+import { getMcpClientInfo } from "../clientIdentity.js";
 
 const logger = getLogger();
 
@@ -468,7 +469,7 @@ export class StdioMcpClient implements McpClient {
     
     // We'll initialize the client and transport in connect()
     this.client = new Client(
-      { name: "super-mcp-router", version: "0.1.0" },
+      getMcpClientInfo(),
       { capabilities: {} }
     );
     
