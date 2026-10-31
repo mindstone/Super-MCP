@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Added
+- **Apply new packages without restarting the router.** `POST /api/config/apply` reloads security policy, admits valid additions and refreshes the catalog. It reports additions and every remaining difference that needs a router reload; adding a package leaves existing clients and their calls running.
 - **`ToolNotesStore.whenIdle()`** resolves once any compaction a `readSnapshot()` started in the background has finished. `readSnapshot()` still does not wait for it; call `whenIdle()` before deleting the notes directory (tests, shutdown) so the compaction's lock and temp file cannot land in a directory being removed.
 
 ### Changed

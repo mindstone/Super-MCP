@@ -16,7 +16,7 @@ import {
 import { getValidator } from "./validator.js";
 import { getLogger } from "./logging.js";
 import { registerSuperMcpHealthRoute } from "./health.js";
-import { ConfigWatcher, handleConfigurationChange } from "./configWatcher.js";
+import { ConfigWatcher, handleConfigurationChange, applyConfigurationChange } from "./configWatcher.js";
 import { getSecurityPolicy } from "./security.js";
 import {
   handleListToolPackages,
@@ -225,15 +225,48 @@ export function registerHttpApiRoutes(
     catalog: Catalog;
     catalogRefresher?: Pick<
       CatalogRefresher,
-      "scheduleRefresh" | "whenCurrentGenerationReady"
+      "scheduleRefresh" | "whenCurrentGenerationReady" | "configurationChanged"
     >;
     dnsRebindingGuard: express.RequestHandler;
     healthOwnerId?: string;
+    configPaths?: string[];
   }
 ): void {
-  const { registry, catalog, catalogRefresher, dnsRebindingGuard, healthOwnerId } = options;
+  const { registry, catalog, catalogRefresher, dnsRebindingGuard, healthOwnerId, configPaths } = options;
 
   registerSuperMcpHealthRoute(app, healthOwnerId);
+
+  app.post("/api/config/apply", dnsRebindingGuard, async (req, res) => {
+    if (req.headers.origin !== undefined) {
+      res.status(403).json({ status: "failed" });
+      return;
+    }
+    if (!configPaths || !catalogRefresher) {
+      res.status(404).json({ status: "failed" });
+      return;
+    }
+    try {
+      const result = await applyConfigurationChange(registry, catalogRefresher, configPaths);
+      if (result.status === "failed") {
+        res.json(result);
+        return;
+      }
+      res.json({
+        status: "ok",
+        added: result.added,
+        needs_reload: result.needsReload.map((entry) => (
+          "packageId" in entry
+            ? { package_id: entry.packageId, reason: entry.reason }
+            : { reason: entry.reason }
+        )),
+      });
+    } catch (error) {
+      logger.error("Failed to apply configuration change", {
+        error_class: error instanceof Error ? error.constructor.name : typeof error,
+      });
+      res.status(500).json({ status: "failed" });
+    }
+  });
 
   // Lightweight config-hash endpoint: returns a hash of the package registry config
   // without spinning up any MCP servers. Used by Rebel as a cheap first-tier check
@@ -1077,6 +1110,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
         catalogRefresher,
         dnsRebindingGuard,
         healthOwnerId,
+        configPaths: paths,
       });
 
       interface SessionEntry {

@@ -81,6 +81,7 @@ function registerResolveRoute(options: {
 }) {
   let handlers: express.RequestHandler[] | undefined;
   const app = {
+    post: vi.fn(),
     get: vi.fn((path: string, ...routeHandlers: express.RequestHandler[]) => {
       if (path === "/api/tools/resolve") handlers = routeHandlers;
     }),
