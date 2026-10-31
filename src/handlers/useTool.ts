@@ -15,6 +15,7 @@ import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/t
 import { getLogger } from "../logging.js";
 import { assertToolAccess } from "../toolAccess.js";
 import { findBestMatch } from "../utils/fuzzyMatch.js";
+import { projectUnionErrors } from "./unionErrorProjection.js";
 import {
   coerceStringifiedBoolean,
   coerceStringifiedNumber,
@@ -236,7 +237,11 @@ interface RepairTicket {
   valid_fields: string[];
   attempt: number;
   downstream_error?: string;
+  other_errors?: Array<{ field: string; constraint: string; expected: string }>;
 }
+
+// Prose omits submitted const/discriminator values; the serialized ticket retains got.
+const schemaOnlyEnumProse = new WeakSet<object>();
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -732,7 +737,7 @@ function parseInstancePath(instancePath: string | undefined): string[] {
 
   return instancePath
     .split("/")
-    .filter(Boolean)
+    .slice(1)
     .map(decodeJsonPointerSegment);
 }
 
@@ -1037,7 +1042,7 @@ function summarizeRepairTicket(
 
   if (ticket.enum_violations.length > 0) {
     const details = ticket.enum_violations
-      .map((entry) => `${entry.field} (allowed ${entry.allowed.map(String).join(", ")}, got ${String(entry.got)})`)
+      .map((entry) => `${entry.field} (allowed ${entry.allowed.map(String).join(", ")}${schemaOnlyEnumProse.has(entry) ? "" : `, got ${String(entry.got)}`})`)
       .join("; ");
     sections.push(`Enum violations: ${details}.`);
   }
@@ -1082,11 +1087,15 @@ function summarizeRepairTicket(
       .join(", ");
     sections.push(`Unknown fields: ${details}.`);
 
-    if (ticket.valid_fields.length > 0) {
+    if (ticket.unknown_fields.some(field => !field.includes(".")) && ticket.valid_fields.length > 0) {
       sections.push(`Valid arguments: ${ticket.valid_fields.join(", ")}.`);
-    } else {
+    } else if (ticket.unknown_fields.some(field => !field.includes("."))) {
       sections.push(`This tool takes no arguments. Call it with an empty object: {}.`);
     }
+  }
+
+  if (ticket.other_errors?.length) {
+    sections.push(`Other errors: ${ticket.other_errors.map(e => `${e.field} (${e.constraint}: ${e.expected})`).join("; ")}.`);
   }
 
   let message = `Argument validation failed for tool '${toolId}' in package '${packageId}'.`;
@@ -1107,10 +1116,134 @@ function summarizeRepairTicket(
   return message;
 }
 
+// Only followed applicators and plain validation/annotation keywords are understood.
+const DISPLAY_SCHEMA_KEYWORDS = new Set([
+  "$ref", "$defs", "definitions", "properties", "patternProperties", "additionalProperties", "items", "anyOf", "oneOf", "allOf",
+  "$schema", "$id", "$comment", "title", "description", "default", "examples", "readOnly", "writeOnly", "deprecated",
+  "type", "enum", "const", "required", "multipleOf", "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum",
+  "minLength", "maxLength", "pattern", "format", "minItems", "maxItems", "uniqueItems", "minProperties", "maxProperties",
+  "contentEncoding", "contentMediaType", "propertyNames",
+]);
+
+/** @internal Presentation only: property spellings are public only at their schema location. */
+export function diagnosticDisplayPath(schema: unknown, args: unknown) {
+  // The budget bounds the scan's own steps. The native key list for-in builds grows with the widest
+  // node, once per rejection: the same work AJV's compile does on this schema.
+  let remaining = 20_000;
+  const spend = () => { if (--remaining < 0) throw new Error("Display path budget exhausted"); };
+  const children = new Map<object, unknown[]>();
+  const seen = new Set<object>();
+  const scan = (node: unknown, map = false): boolean => {
+    if ((!isRecord(node) && !Array.isArray(node)) || seen.has(node)) return true;
+    seen.add(node);
+    const values: unknown[] = [];
+    if (map) children.set(node, values);
+    for (const keyword in node) {
+      spend();
+      if (!Object.hasOwn(node, keyword)) continue;
+      const child = (node as Record<string, unknown>)[keyword];
+      if (!map && (!DISPLAY_SCHEMA_KEYWORDS.has(keyword) || (keyword === "$id" && node !== schema))) return false;
+      if (map) values.push(child);
+      if (!scan(child, Array.isArray(child) || (!map && ["properties", "patternProperties", "$defs", "definitions"].includes(keyword)))) return false;
+    }
+    return true;
+  };
+  let nestedReadable = false;
+  try {
+    nestedReadable = scan(schema);
+    if (!nestedReadable) logger.warn("Nested diagnostic paths masked", { reason: "unsupported_schema_keyword" });
+  } catch {
+    logger.warn("Nested diagnostic paths masked", { reason: "scan_incomplete" });
+  }
+  const fixedParent = (node: unknown) => isRecord(node)
+    && !Object.hasOwn(node, "patternProperties")
+    && ((Object.hasOwn(node, "properties") && isRecord(node.properties)) || node.additionalProperties === false);
+  const expand = (schemas: unknown[]): Record<string, unknown>[] => {
+    const pending = [...schemas];
+    const seen = new Set<object>();
+    const expanded: Record<string, unknown>[] = [];
+    while (pending.length) {
+      spend();
+      const node = pending.pop();
+      if (!isRecord(node) || seen.has(node)) continue;
+      if (children.has(node)) throw new Error("Display ref targets a schema container");
+      seen.add(node);
+      expanded.push(node);
+      let refNode: unknown = node;
+      const refs = new Set<object>();
+      while (isRecord(refNode) && Object.hasOwn(refNode, "$ref")) {
+        spend();
+        if (refs.has(refNode) || refs.size >= 8) throw new Error("Unresolved display ref");
+        refs.add(refNode);
+        const ref = refNode.$ref;
+        if (typeof ref !== "string" || (ref !== "#" && !ref.startsWith("#/"))) throw new Error("Unresolved display ref");
+        let target = schema;
+        for (const token of ref === "#" ? [] : decodeURIComponent(ref.slice(2)).split("/")) {
+          spend();
+          const key = decodeJsonPointerSegment(token);
+          if ((!isRecord(target) && !Array.isArray(target)) || !Object.hasOwn(target, key)) throw new Error("Unresolved display ref");
+          target = (target as Record<string, unknown>)[key];
+        }
+        pending.push(target);
+        refNode = target;
+      }
+      for (const keyword of ["anyOf", "oneOf", "allOf"]) {
+        if (!Object.hasOwn(node, keyword) || !Array.isArray(node[keyword])) continue;
+        for (const branch of node[keyword]) { spend(); pending.push(branch); }
+      }
+    }
+    return expanded;
+  };
+  return (instancePath: string | undefined, finalField?: string, unknownField = false, parentSchema?: unknown): string => {
+    const segments = parseInstancePath(instancePath);
+    if (finalField !== undefined) segments.push(finalField);
+    remaining = 2_000;
+    try {
+      let schemas: unknown[] = [schema];
+      let parent = args;
+      const display: string[] = [];
+      for (const [position, segment] of segments.entries()) {
+        if (position > 0 && !nestedReadable) return formatFieldPath([...display, ...segments.slice(position).map(() => "*")]);
+        const applicable = expand(schemas);
+        const next: unknown[] = [];
+        let declared = false;
+        let mapShaped = false;
+        for (const node of applicable) {
+          spend();
+          const properties = isRecord(node.properties) ? node.properties : {};
+          const property = Object.hasOwn(node, "properties") && Object.hasOwn(properties, segment);
+          const index = Array.isArray(parent) && /^(0|[1-9]\d*)$/.test(segment) && Object.hasOwn(node, "items");
+          declared ||= property || index;
+          if (property) next.push(properties[segment]);
+          if (index) next.push(Array.isArray(node.items) ? node.items[Number(segment)] : node.items);
+          if (Object.hasOwn(node, "patternProperties")) {
+            mapShaped = true;
+            // Never execute schema regexes, including branches skipped by AJV.
+            for (const child of children.get(node.patternProperties as object) ?? []) { spend(); next.push(child); }
+          }
+          if (!property && Object.hasOwn(node, "additionalProperties")) next.push(node.additionalProperties);
+        }
+        const finalUnknown = unknownField && position === segments.length - 1;
+        const fixedUnknown = finalUnknown && !mapShaped && (applicable.some(fixedParent) || fixedParent(parentSchema));
+        display.push(declared || fixedUnknown ? segment : "*");
+        schemas = next;
+        parent = parent !== null && typeof parent === "object" && Object.hasOwn(parent, segment)
+          ? (parent as Record<string, unknown>)[segment] : undefined;
+      }
+      return formatFieldPath(display);
+    } catch {
+      // Incomplete traversal cannot establish that a spelling is public.
+      return formatFieldPath(segments.map(() => "*"));
+    }
+  };
+}
+
 function buildRepairTicket(
   schema: unknown,
   validationErrors: any[],
   strippedArgs: string[],
+  suppliedKeys: string[],
+  args: unknown,
   attempt: number,
   /**
    * `use_tool` meta-params found nested in `args`, with the fix each needs
@@ -1120,6 +1253,14 @@ function buildRepairTicket(
    */
   misplacedParams: MisplacedParamMap = {},
 ): RepairTicket {
+  try {
+    validationErrors = projectUnionErrors(schema, validationErrors);
+  } catch {
+    logger.warn("Union error projection failed; using raw errors", {
+      errorCount: validationErrors.length,
+      errors: validationErrors.slice(0, 20).map(e => ({ keyword: e?.keyword, schemaPath: e?.schemaPath })),
+    });
+  }
   const missingRequired: string[] = [];
   const typeErrors: Array<{ field: string; expected: string; got: string; value?: unknown }> = [];
   const enumViolations: Array<{ field: string; allowed: unknown[]; got: unknown }> = [];
@@ -1127,26 +1268,36 @@ function buildRepairTicket(
   const rangeErrors: Array<{ field: string; constraint: string; limit: number; got: unknown }> = [];
   const patternErrors: Array<{ field: string; pattern: string; got: unknown }> = [];
   const lengthErrors: Array<{ field: string; constraint: string; limit: number; got: unknown }> = [];
+  const otherErrors: NonNullable<RepairTicket["other_errors"]> = [];
+  const nestedUnknownFields: string[] = [];
   const failingFields = new Set<string>();
   const validFields = isRecord(schema) && isRecord(schema.properties)
     ? Object.keys(schema.properties)
     : [];
+  const suppliedFields = new Set(suppliedKeys);
+  const candidateFields = validFields.filter(field => !suppliedFields.has(field));
   const didYouMean: Record<string, string> = {};
+  const displayPath = diagnosticDisplayPath(schema, args);
+  let suggestionsRemaining = 16;
+  const suggest = (key: string, candidates: () => string[]) => suggestionsRemaining-- > 0 ? findBestMatch(key, candidates()) : null;
 
   for (const validationError of validationErrors) {
     if (!validationError || typeof validationError !== "object") {
       continue;
     }
 
+    // Schema-fragment lookup keeps raw paths; ticket fields are display only.
+    const rawField = validationError.keyword === "required"
+      ? getRequiredFieldFromValidationError(validationError) : getFieldFromValidationError(validationError);
     if (validationError.keyword === "required") {
-      const field = getRequiredFieldFromValidationError(validationError);
+      const field = displayPath(validationError.instancePath, validationError.params?.missingProperty);
       missingRequired.push(field);
-      failingFields.add(field);
+      failingFields.add(rawField);
       continue;
     }
 
     if (validationError.keyword === "type") {
-      const field = getFieldFromValidationError(validationError);
+      const field = displayPath(validationError.instancePath);
       const expected = Array.isArray(validationError.params?.type)
         ? validationError.params.type.join("|")
         : String(validationError.params?.type ?? "unknown");
@@ -1160,13 +1311,13 @@ function buildRepairTicket(
         typeError.value = validationError.data;
       }
       typeErrors.push(typeError);
-      failingFields.add(field);
+      failingFields.add(rawField);
       continue;
     }
 
-    if (validationError.keyword === "enum") {
-      const field = getFieldFromValidationError(validationError);
-      const allowed = Array.isArray(validationError.params?.allowedValues)
+    if (validationError.keyword === "enum" || validationError.keyword === "const") {
+      const field = displayPath(validationError.instancePath);
+      const allowed = validationError.keyword === "const" ? [validationError.params?.allowedValue] : Array.isArray(validationError.params?.allowedValues)
         ? validationError.params.allowedValues
         : [];
       enumViolations.push({
@@ -1174,55 +1325,68 @@ function buildRepairTicket(
         allowed,
         got: validationError.data,
       });
-      failingFields.add(field);
+      if (validationError.keyword === "const" || validationError.schemaOnly) schemaOnlyEnumProse.add(enumViolations[enumViolations.length - 1]);
+      failingFields.add(rawField);
       continue;
     }
 
     if (validationError.keyword === "format") {
-      const field = getFieldFromValidationError(validationError);
+      const field = displayPath(validationError.instancePath);
       formatErrors.push({
         field,
         expected: String(validationError.params?.format ?? "unknown"),
         got: validationError.data,
       });
-      failingFields.add(field);
+      failingFields.add(rawField);
       continue;
     }
 
     if (["maximum", "minimum", "exclusiveMaximum", "exclusiveMinimum"].includes(validationError.keyword)) {
-      const field = getFieldFromValidationError(validationError);
+      const field = displayPath(validationError.instancePath);
       rangeErrors.push({
         field,
         constraint: validationError.keyword,
         limit: getValidationLimit(validationError.params?.limit),
         got: validationError.data,
       });
-      failingFields.add(field);
+      failingFields.add(rawField);
       continue;
     }
 
     if (validationError.keyword === "pattern") {
-      const field = getFieldFromValidationError(validationError);
+      const field = displayPath(validationError.instancePath);
       patternErrors.push({
         field,
         pattern: String(validationError.params?.pattern ?? "unknown"),
         got: validationError.data,
       });
-      failingFields.add(field);
+      failingFields.add(rawField);
       continue;
     }
 
     if (["maxLength", "minLength", "maxItems", "minItems"].includes(validationError.keyword)) {
-      const field = getFieldFromValidationError(validationError);
+      const field = displayPath(validationError.instancePath);
       lengthErrors.push({
         field,
         constraint: validationError.keyword,
         limit: getValidationLimit(validationError.params?.limit),
         got: validationError.data,
       });
-      failingFields.add(field);
+      failingFields.add(rawField);
       continue;
     }
+    if (["additionalProperties", "unevaluatedProperties"].includes(validationError.keyword)) {
+      const key = validationError.params?.additionalProperty ?? validationError.params?.unevaluatedProperty;
+      if (typeof key !== "string") continue;
+      const field = displayPath(validationError.instancePath, key, true, validationError.parentSchema);
+      nestedUnknownFields.push(field);
+      const suggestion = field.split(".").at(-1) === "*" ? null : suggest(key, () =>
+        Object.keys(validationError.parentSchema?.properties ?? {}).filter(candidate =>
+          !isRecord(validationError.data) || !Object.hasOwn(validationError.data, candidate)));
+      if (suggestion) didYouMean[field] = suggestion;
+      continue;
+    }
+    otherErrors.push({ field: displayPath(validationError.instancePath), constraint: validationError.keyword, expected: validationError.message ?? "constraint not satisfied" });
   }
 
   // REBEL-7JD: a stripped key that is really a top-level use_tool meta-param is
@@ -1231,12 +1395,12 @@ function buildRepairTicket(
   // field" (and so a no-arg tool doesn't also claim "takes no arguments" about a
   // call whose only surplus key was the meta-param).
   const misplacedNames = Object.keys(misplacedParams);
-  const unknownFields = strippedArgs.filter((field) => misplacedParams[field] === undefined);
+  const unknownFields = [...new Set([...strippedArgs.filter(field => misplacedParams[field] === undefined).map(field => displayPath("", field, true)), ...nestedUnknownFields])];
 
-  for (const unknownField of unknownFields) {
-    const suggestion = findBestMatch(unknownField, validFields);
-    if (suggestion) {
-      didYouMean[unknownField] = suggestion;
+  for (const unknownField of strippedArgs.filter(field => misplacedParams[field] === undefined)) {
+    const suggestion = suggest(unknownField, () => candidateFields);
+    if (suggestion && displayPath("", unknownField, true) !== "*") {
+      didYouMean[displayPath("", unknownField, true)] = suggestion;
       failingFields.add(suggestion);
     }
   }
@@ -1268,6 +1432,12 @@ function buildRepairTicket(
     repairTicket.length_errors = lengthErrors;
   }
 
+  if (otherErrors.length) repairTicket.other_errors = otherErrors;
+  // Shared constraints and wrappers can report the same field more than once.
+  for (const key of ["missing_required", "type_errors", "enum_violations", "format_errors", "range_errors", "pattern_errors", "length_errors", "other_errors"] as const) {
+    const entries = repairTicket[key];
+    if (entries) (repairTicket[key] as unknown[]) = [...new Map(entries.map(e => [JSON.stringify(e), e])).values()];
+  }
   return repairTicket;
 }
 
@@ -1707,6 +1877,8 @@ export async function handleUseTool(
       schema,
       validationResult.errors,
       strippedArgs,
+      sentArgKeys,
+      args,
       attempt,
       misplacedParams,
     );
@@ -1852,6 +2024,8 @@ export async function handleUseTool(
       schema,
       renameValidationErrors,
       [],
+      sentArgKeys,
+      args,
       attempt,
       misplacedParams,
     );

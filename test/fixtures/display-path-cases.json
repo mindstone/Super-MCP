@@ -1,0 +1,269 @@
+[
+  {
+    "name": "projected discriminator beneath a map",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "object",
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "const": "one"
+                  }
+                }
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "kind": {
+                    "const": "two"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "args": {
+      "data": {
+        "private@example.com": {
+          "kind": "wrong"
+        }
+      }
+    },
+    "hidden": "private@example.com",
+    "list": "enum_violations",
+    "field": "data.*.kind",
+    "suggestions": {}
+  },
+  {
+    "name": "unrelated declaration colliding with a map key",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "maxProperties": 1
+          }
+        },
+        "elsewhere": {
+          "type": "object",
+          "properties": {
+            "recipient": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "args": {
+      "data": {
+        "recipient": {
+          "a": 1,
+          "b": 2
+        }
+      }
+    },
+    "hidden": "recipient",
+    "list": "other_errors",
+    "field": "data.*",
+    "suggestions": {}
+  },
+  {
+    "name": "suggestion key beneath a union-wrapped map",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "data": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "additionalProperties": false
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "elsewhere": {
+          "type": "object",
+          "properties": {
+            "recipient": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "args": {
+      "data": {
+        "recipient": {
+          "vaule": "demo"
+        }
+      }
+    },
+    "hidden": "recipient",
+    "list": "unknown_fields",
+    "field": "data.*.vaule",
+    "suggestions": {
+      "data.*.vaule": "value"
+    }
+  },
+  {
+    "name": "forbidden key at a pattern map parent",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "object",
+          "properties": {
+            "value": {
+              "type": "string"
+            }
+          },
+          "patternProperties": {
+            "^entry_": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        }
+      }
+    },
+    "args": {
+      "data": {
+        "value_private@example.com": "demo"
+      }
+    },
+    "hidden": "value_private@example.com",
+    "list": "unknown_fields",
+    "field": "data.*",
+    "suggestions": {}
+  },
+  {
+    "name": "fixed nested object stays readable",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "object",
+          "properties": {
+            "recipient": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      }
+    },
+    "args": {
+      "data": {
+        "recipient": {
+          "vaule": "demo"
+        }
+      }
+    },
+    "hidden": null,
+    "list": "unknown_fields",
+    "field": "data.recipient.vaule",
+    "suggestions": {
+      "data.recipient.vaule": "value"
+    }
+  },
+  {
+    "name": "local refs and allOf retain fixed nested fields",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "data": {
+          "$ref": "#/$defs/entry"
+        }
+      },
+      "$defs": {
+        "entry": {
+          "allOf": [
+            {
+              "type": "object",
+              "properties": {
+                "recipient": {
+                  "type": "object",
+                  "properties": {
+                    "value": {
+                      "const": "fixed"
+                    }
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "args": {
+      "data": {
+        "recipient": {
+          "value": "wrong"
+        }
+      }
+    },
+    "hidden": null,
+    "list": "enum_violations",
+    "field": "data.recipient.value",
+    "suggestions": {}
+  },
+  {
+    "name": "pattern traversal masks only the map key",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "data": {
+          "type": "object",
+          "patternProperties": {
+            "^entry_": {
+              "type": "object",
+              "properties": {
+                "value": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      }
+    },
+    "args": {
+      "data": {
+        "entry_private": {
+          "vaule": "demo"
+        }
+      }
+    },
+    "hidden": "entry_private",
+    "list": "unknown_fields",
+    "field": "data.*.vaule",
+    "suggestions": {
+      "data.*.vaule": "value"
+    }
+  }
+]
