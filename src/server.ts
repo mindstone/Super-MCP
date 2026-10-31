@@ -1084,8 +1084,11 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
     if (transport === "http") {
       const app = express();
 
-      // DNS rebinding protection - validate Host header
-      // Must be placed BEFORE body parsing middleware
+      // DNS rebinding protection - validate Host header.
+      // Mounted before body parsing for /mcp. Routes that take it as route-level
+      // middleware (POST /api/config/apply) run after express.json(), so a
+      // bad-Host request with a malformed body gets the parser's 400 rather than
+      // 403; no handler runs either way.
       // Note: Server binds to 127.0.0.1 only (IPv4). If IPv6 binding is added,
       // also allow '::1' here.
       const dnsRebindingGuard: express.RequestHandler = (req, res, next) => {

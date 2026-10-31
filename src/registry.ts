@@ -1038,6 +1038,8 @@ export class PackageRegistry {
       for (const current of this.packages) {
         const next = freshById.get(current.id);
         if (!next) {
+          // Also reached when a running package's new entry fails validation: it is
+          // absent from the validated list. Every reason restarts, so only the label differs.
           applied.needsReload.push({ packageId: current.id, reason: "removed" });
         } else if (!isDeepStrictEqual({ ...current, env: undefined }, { ...next, env: undefined })) {
           applied.needsReload.push({ packageId: current.id, reason: "changed" });
