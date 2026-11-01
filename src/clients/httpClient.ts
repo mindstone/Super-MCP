@@ -579,7 +579,7 @@ export class HttpMcpClient implements McpClient {
   }
 
   private async initializeOAuthIfNeeded(forceOAuth: boolean = false) {
-    if (this.config.oauth && !this.oauthProvider) {
+    if (this.config.oauth !== false && !this.oauthProvider) {
       // Use external provider if provided, otherwise create a new one
       const staticCreds = this.getStaticCredentials();
       const simpleProvider = this.externalOAuthProvider ?? new SimpleOAuthProvider(this.packageId, this.oauthPort, staticCreds);

@@ -59,6 +59,7 @@ vi.mock("../../auth/providers/simple.js", () => {
     invalidateCredentials = vi.fn(async () => {});
     setSkipAuthorizeProbe = vi.fn();
     consumeProbeVerdict = vi.fn(() => undefined);
+    hasStartedRedirect = vi.fn(() => false);
   }
   return { SimpleOAuthProvider: MockSimpleOAuthProvider };
 });
@@ -198,11 +199,10 @@ describe("handleAuthenticate finishAuth timeout classification", () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.status).toBe("error");
     // User-facing field: plain-language, actionable, jargon-free.
-    // Stage 5 refinement (F4): says what to DO next (the connector's help
-    // page / its support), with "manual configuration" and "pre-registered
-    // sign-in details" de-jargoned.
-    expect(parsed.error).toMatch(/couldn't set up automatic sign-in/);
-    expect(parsed.error).toMatch(/API key/i);
+    // A failed bootstrap does not establish which sign-in details it needs.
+    // Point to help while allowing either an unavailable server or missing details.
+    expect(parsed.error).toMatch(/Sign-in couldn't start for this connector/);
+    expect(parsed.error).toContain("may not be answering right now, or it may need an API key");
     expect(parsed.error).toMatch(/help page|support/i);
     expect(parsed.error).not.toMatch(/manual configuration|pre-registered/i);
     expect(parsed.error).not.toContain("OAuth setup failed");

@@ -7,6 +7,8 @@ const logger = getLogger();
 export interface HealthCheckPackageOutput {
   package_id: string;
   health: "ok" | "error" | "unavailable";
+  needs_sign_in?: boolean;
+  detail?: string;
 }
 
 export async function handleHealthCheckPackage(
@@ -34,7 +36,10 @@ export async function handleHealthCheckPackage(
 
   logger.info("Handling health_check request", { package_id });
 
-  const health = await registry.healthCheck(package_id);
+  const healthResult = typeof registry.healthCheckWithClient === "function"
+    ? await registry.healthCheckWithClient(package_id)
+    : { health: await registry.healthCheck(package_id) };
+  const { health } = healthResult;
 
   // Sync catalog if registry reports healthy but catalog has stale error
   const catalogStatus = catalog.getPackageStatus(package_id);
@@ -45,6 +50,12 @@ export async function handleHealthCheckPackage(
   const result: HealthCheckPackageOutput = {
     package_id,
     health,
+    ...(healthResult.authRequired ? {
+      needs_sign_in: true,
+      detail: "The server last answered with a sign-in challenge. Run authenticate to sign in.",
+    } : healthResult.error ? {
+      detail: healthResult.error instanceof Error ? healthResult.error.message : String(healthResult.error),
+    } : {}),
   };
 
   return {

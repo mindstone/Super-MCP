@@ -72,6 +72,7 @@ vi.mock("../../auth/providers/simple.js", () => {
     oauthPort: number;
     skipProbe = false;
     probeVerdict?: AuthorizeProbeVerdict;
+    hasStartedRedirect = vi.fn(() => true);
     initialize = vi.fn(async () => {});
     checkAndInvalidateOnPortMismatch = vi.fn(async () => false);
     invalidateCredentials = vi.fn(async () => {});

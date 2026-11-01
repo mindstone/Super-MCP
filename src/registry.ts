@@ -2662,6 +2662,7 @@ export class PackageRegistry {
     health: "ok" | "error" | "unavailable";
     client?: McpClient;
     error?: unknown;
+    authRequired?: boolean;
   }> {
     try {
       const client = await this.getClient(packageId);
@@ -2669,7 +2670,7 @@ export class PackageRegistry {
         const result = await client.healthCheck();
         // Map "needs_auth" to "unavailable" for the registry level
         if (result === "needs_auth") {
-          return { health: "unavailable", client };
+          return { health: "unavailable", client, authRequired: true };
         }
         return { health: result, client };
       }

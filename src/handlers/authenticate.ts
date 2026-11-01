@@ -156,7 +156,7 @@ async function handleAuthenticateCore(
     };
   }
 
-  if (pkg.transport === "http" && pkg.oauth === true && wait_for_completion === false) {
+  if (pkg.transport === "http" && pkg.oauth !== false && wait_for_completion === false) {
     wait_for_completion = true;
     logger.warn("OAuth package received wait_for_completion:false — coerced to true; saveless callback path is unsafe for OAuth", {
       package_id,
@@ -293,7 +293,7 @@ async function handleAuthenticateCore(
     };
   }
 
-  if (!force && pkg.transport === "http" && pkg.oauth === true) {
+  if (!force && pkg.transport === "http" && pkg.oauth !== false) {
     const markerState =
       await SimpleOAuthProvider.readNeedsReconnectMarkerState(package_id);
     if (markerState.state === "present") {
@@ -547,7 +547,7 @@ async function handleAuthenticateCore(
       // Hoisted so both the success path and the catch can suppress the
       // losing promise after the race settles (d).
       let callbackPromise: Promise<string> | undefined;
-      let fatalConnectErrorPromise: Promise<string> | undefined;
+      let fatalConnectErrorPromise: Promise<string | undefined> | undefined;
       try {
         // Wait for callback with state validation for CSRF protection.
         // Outer bound: the desktop host budgets this whole call (callback wait +
@@ -558,11 +558,16 @@ async function handleAuthenticateCore(
         // to this accepted (or browser-floor) attempt (recall#2 F4).
         callbackPromise = callbackServer.waitForCallback(OAUTH_CALLBACK_TIMEOUT_MS, oauthState);
 
-        // Create a promise that rejects early if connectWithOAuth fails with a fatal error.
-        // Without this, a DCR failure or connect timeout would silently fail and the callback
-        // server would wait the full 5 minutes for a browser redirect that will never arrive.
-        fatalConnectErrorPromise = new Promise<string>((_, reject) => {
-          connectPromise.catch(err => {
+        // Bootstrap can connect without a browser, start a redirect, or fail.
+        // Only a started redirect needs the callback wait.
+        fatalConnectErrorPromise = new Promise<string | undefined>((resolve, reject) => {
+          connectPromise.then(async () => {
+            if (await attemptHttpClient.isAuthenticated()) {
+              resolve(undefined);
+            } else if (!oauthProvider.hasStartedRedirect()) {
+              reject(new Error("OAuth setup failed: Connection bootstrap finished without a connection or sign-in redirect"));
+            }
+          }, err => {
             // Code-based fatal branch (recall#2 F2(b)): a classified
             // pre-browser probe rejection. Classified by MACHINE CODE — the
             // message-based classifier below must never see it (its
@@ -582,7 +587,7 @@ async function handleAuthenticateCore(
               errMsg.includes("client registration failed")
             );
 
-            if (isFatalAuthError) {
+            if (!oauthProvider.hasStartedRedirect() || isFatalAuthError) {
               logger.error("OAuth failed with fatal error, aborting callback wait", {
                 package_id,
                 error: oauthErrorLogText(err, errMsg),
@@ -595,17 +600,18 @@ async function handleAuthenticateCore(
               });
               // Non-fatal errors (e.g., redirect initiated) — don't abort the callback wait
             }
-          });
+          }).catch(reject);
         });
 
         const authCode = await Promise.race([callbackPromise, fatalConnectErrorPromise]);
         // Suppress unhandled rejection from the losing promise after the race settles (d)
         callbackPromise.catch(() => {});
         fatalConnectErrorPromise.catch(() => {});
-        logger.info("OAuth callback received", { package_id, has_code: !!authCode });
-
-        logger.info("Exchanging authorization code for tokens", { package_id });
-        await attemptHttpClient.finishOAuth(authCode);
+        if (authCode !== undefined) {
+          logger.info("OAuth callback received", { package_id, has_code: !!authCode });
+          logger.info("Exchanging authorization code for tokens", { package_id });
+          await attemptHttpClient.finishOAuth(authCode);
+        }
 
         logger.info("OAuth flow completed, verifying connection", { package_id });
 
@@ -624,6 +630,11 @@ async function handleAuthenticateCore(
             error: oauthErrorLogText(err, formatError(err))
           });
           health = "error";
+        }
+
+        if (authCode === undefined && oauthProvider.hasStartedRedirect()) {
+          await attemptHttpClient.finishOAuth(await callbackPromise);
+          health = await attemptHttpClient.healthCheck();
         }
 
         if (health === "ok") {
@@ -785,6 +796,7 @@ async function handleAuthenticateCore(
         // actionable error immediately instead of falling through to the generic
         // "check browser for OAuth prompt" message.
         if (isFatalSetupError) {
+          await attemptHttpClient.close();
           return {
             kind: "response",
             response: {
@@ -794,11 +806,7 @@ async function handleAuthenticateCore(
                   text: JSON.stringify({
                     package_id,
                     status: "error",
-                    // Stage 5 refinement (F4): say what to DO next (the
-                    // connector's help page / its support), with "manual
-                    // configuration" / "pre-registered sign-in details"
-                    // de-jargoned for a non-technical reader.
-                    error: "This connector couldn't set up automatic sign-in. It may need an API key or other sign-in details from the provider instead. Check the connector's help page or contact its support to get those details, then try connecting again.",
+                    error: "Sign-in couldn't start for this connector. It may not be answering right now, or it may need an API key or other details from its provider instead. Its help page or support can tell you which.",
                     message: errMsg,
                   }, null, 2),
                 },

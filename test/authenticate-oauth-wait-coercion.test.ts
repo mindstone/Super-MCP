@@ -52,6 +52,7 @@ vi.mock('../src/auth/providers/simple.js', () => {
       invalidateCredentials: vi.fn().mockResolvedValue(undefined),
       setSkipAuthorizeProbe: vi.fn(),
       consumeProbeVerdict: vi.fn().mockReturnValue(undefined),
+      hasStartedRedirect: vi.fn().mockReturnValue(true),
     };
   }
   MockSimpleOAuthProvider.getSavedClientPort = vi.fn().mockResolvedValue(undefined);
@@ -221,4 +222,11 @@ describe('authenticate wait_for_completion coercion for OAuth packages (FOX-3326
       expect.any(Object),
     );
   });
+  it('coerces flagless HTTP wait_for_completion=false into the callback-server path', async () => {
+    const pkg = { ...oauthHttpPkg(), id: 'tarrowline-wiki', name: 'tarrowline-wiki', oauth: undefined };
+    await handleAuthenticate({ package_id: pkg.id, wait_for_completion: false }, createMockRegistry(pkg), createMockCatalog());
+    expect(OAuthCallbackServerCtor).toHaveBeenCalledOnce();
+    expect(mockCallbackServer.start).toHaveBeenCalledOnce();
+  });
+
 });

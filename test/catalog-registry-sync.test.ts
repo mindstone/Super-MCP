@@ -356,13 +356,11 @@ describe('Catalog-Registry sync: authenticate handler', () => {
       settled = true;
       return result;
     });
-    for (let index = 0; index < 8; index += 1) await Promise.resolve();
-
-    expect(settled).toBe(false);
-    expect(refreshNow).toHaveBeenCalledWith('test-pkg', {
+    await vi.waitFor(() => expect(refreshNow).toHaveBeenCalledWith('test-pkg', {
       forceReconnect: true,
       reason: 'authentication',
-    });
+    }));
+    expect(settled).toBe(false);
     releaseRefresh();
     await expect(resultPromise).resolves.toMatchObject({ isError: false });
   });

@@ -63,6 +63,7 @@ vi.mock('../src/auth/providers/simple.js', () => {
       invalidateCredentials: vi.fn().mockResolvedValue(undefined),
       setSkipAuthorizeProbe: vi.fn(),
       consumeProbeVerdict: vi.fn().mockReturnValue(undefined),
+      hasStartedRedirect: vi.fn().mockReturnValue(false),
     };
   }
   MockSimpleOAuthProvider.getSavedClientPort = vi.fn().mockResolvedValue(undefined);
@@ -164,7 +165,7 @@ describe('authenticate handler: DCR fail-fast (FOX-2926)', () => {
     // REBEL-7F9 Stage 5 (c) the fields follow the finishAuth-copy precedent:
     // friendly plain-language copy in `error` (what the desktop displays
     // first), raw technical detail in `message`.
-    expect(parsed.error).toMatch(/couldn't set up automatic sign-in/i);
+    expect(parsed.error).toMatch(/Sign-in couldn't start for this connector/i);
     expect(parsed.message).toMatch(/does not support dynamic client registration/i);
   });
 
@@ -183,7 +184,7 @@ describe('authenticate handler: DCR fail-fast (FOX-2926)', () => {
     // The timeout detail must still be surfaced instead of waiting 5 more
     // minutes — post-Stage 5 (c) it rides `message` (technical detail),
     // while `error` carries the friendly copy (finishAuth-copy precedent).
-    expect(parsed.error).toMatch(/couldn't set up automatic sign-in/i);
+    expect(parsed.error).toMatch(/Sign-in couldn't start for this connector/i);
     expect(parsed.message).toMatch(/timed?\s*out|timeout/i);
   });
 });

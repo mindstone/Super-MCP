@@ -77,8 +77,9 @@ export async function handleHealthCheckAll(
 
         const client = healthResult.client;
         if (!client) throw new Error(`Package '${pkg.id}' is unavailable`);
-        const requiresAuth = client.requiresAuth ? await client.requiresAuth() : false;
-        const isAuthenticated = requiresAuth && client.isAuthenticated ? await client.isAuthenticated() : true;
+        const requiresAuth = healthResult.authRequired || (client.requiresAuth ? await client.requiresAuth() : false);
+        const isAuthenticated = healthResult.authRequired ? false
+          : requiresAuth && client.isAuthenticated ? await client.isAuthenticated() : true;
 
         const result: any = {
           package_id: pkg.id,
@@ -89,7 +90,10 @@ export async function handleHealthCheckAll(
           is_authenticated: isAuthenticated,
         };
         
-        if (health !== "ok") {
+        if (healthResult.authRequired) {
+          result.diagnostic = "The server last answered with a sign-in challenge.";
+          result.suggested_actions = [`Run: authenticate(package_id: "${pkg.id}")`];
+        } else if (health !== "ok") {
           result.diagnostic = "Package is not healthy";
           
           if (health === "unavailable") {
@@ -175,6 +179,9 @@ export async function handleHealthCheckAll(
   }
   if (summary.unavailable > 0) {
     recommendations.push("Some packages are unavailable - they may need installation or authentication");
+  }
+  if (results.some((r) => r.requires_auth && !r.is_authenticated)) {
+    recommendations.push("Some packages need sign-in - run authenticate for those packages");
   }
   if (summary.with_env_issues > 0) {
     recommendations.push("Some packages have environment variable issues - check 'env_issues' for details");

@@ -165,4 +165,14 @@ describe("handleAuthenticate reconnect marker pre-check", () => {
     expect(client.close).toHaveBeenCalledTimes(1);
     expect(findAvailablePortFromCandidates).toHaveBeenCalledTimes(1);
   });
+  it("honours the reconnect marker for a flagless HTTP connector", async () => {
+    readNeedsReconnectMarkerState.mockResolvedValue({ state: "present" });
+    const { client, registry } = createRegistry();
+    const pkg = registry.getPackage(PACKAGE_ID)!;
+    delete pkg.oauth;
+    const result = await handleAuthenticate({ package_id: PACKAGE_ID }, registry, createCatalog());
+    expect(parseResult(result).status).not.toBe("already_authenticated");
+    expect(client.close).toHaveBeenCalledOnce();
+  });
+
 });
