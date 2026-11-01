@@ -3,6 +3,7 @@ import { handleAuthenticate } from '../src/handlers/authenticate.js';
 import type { Catalog } from '../src/catalog.js';
 import type { PackageRegistry } from '../src/registry.js';
 import type { McpClient, PackageConfig } from '../src/types.js';
+import { OAUTH_PROVIDER_ERROR_CODE } from '../src/auth/callbackServer.js';
 
 // Suppress logger output during tests
 vi.mock('../src/logging.js', () => ({
@@ -49,7 +50,10 @@ const mockCallbackServer = {
   }),
 };
 
-vi.mock('../src/auth/callbackServer.js', () => ({
+vi.mock('../src/auth/callbackServer.js', async (importOriginal) => ({
+  // Keep the real exported constants (e.g. OAUTH_PROVIDER_ERROR_CODE) — only
+  // the server class is faked.
+  ...(await importOriginal<typeof import('../src/auth/callbackServer.js')>()),
   OAuthCallbackServer: function() { return mockCallbackServer; },
 }));
 
@@ -77,6 +81,7 @@ const mockHttpClient = {
   finishOAuth: vi.fn(),
   healthCheck: vi.fn().mockResolvedValue('needs_auth' as const),
   close: vi.fn().mockResolvedValue(undefined),
+  getOAuthDiagnosticsSuffix: vi.fn().mockReturnValue(''),
 };
 
 vi.mock('../src/clients/httpClient.js', async (importOriginal) => ({
@@ -185,5 +190,60 @@ describe('authenticate handler: DCR fail-fast (FOX-2926)', () => {
     // while `error` carries the friendly copy (finishAuth-copy precedent).
     expect(parsed.error).toMatch(/couldn't set up automatic sign-in/i);
     expect(parsed.message).toMatch(/timed?\s*out|timeout/i);
+  });
+});
+
+describe("authenticate handler: the provider's error redirect ends the attempt (FOX-5953)", () => {
+  const oauthHttpPkg: PackageConfig = {
+    id: 'acme-tracker',
+    name: 'Acme Tracker',
+    transport: 'http',
+    base_url: 'https://mcp.acme.example/tracker',
+    oauth: true,
+    visibility: 'default',
+  };
+
+  function providerError(code: string): Error {
+    const error = new Error(`OAuth error: ${code}`);
+    (error as NodeJS.ErrnoException).code = OAUTH_PROVIDER_ERROR_CODE;
+    return error;
+  }
+
+  async function authenticateWhenCallbackRejects(callbackError: Error) {
+    // connectWithOAuth resolves (the redirect started normally); only the callback settles.
+    mockHttpClient.connectWithOAuth.mockResolvedValue(undefined);
+    mockCallbackServer.waitForCallback.mockImplementationOnce(() => Promise.reject(callbackError));
+    const result = await handleAuthenticate(
+      { package_id: 'acme-tracker', wait_for_completion: true },
+      createMockRegistry(oauthHttpPkg),
+      createMockCatalog(),
+    );
+    return JSON.parse(result.content[0].text);
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockHttpClient.connectWithOAuth.mockReset();
+    mockHttpClient.healthCheck.mockResolvedValue('needs_auth' as const);
+  });
+
+  it('reports a declined consent screen as a terminal access_denied error, not a pending sign-in', async () => {
+    const parsed = await authenticateWhenCallbackRejects(providerError('access_denied'));
+
+    expect(parsed).toMatchObject({ status: 'error', error: 'OAuth error: access_denied' });
+    expect(mockHttpClient.finishOAuth).not.toHaveBeenCalled();
+  });
+
+  it("keeps any other provider error a failure, with the provider's code", async () => {
+    const parsed = await authenticateWhenCallbackRejects(providerError('server_error'));
+
+    expect(parsed).toMatchObject({ status: 'error', error: 'OAuth error: server_error' });
+  });
+
+  it('keeps a callback wait that ran out as the pending auth_required response', async () => {
+    const parsed = await authenticateWhenCallbackRejects(new Error('OAuth callback timeout'));
+
+    expect(parsed.status).toBe('auth_required');
+    expect(parsed.error).toBeUndefined();
   });
 });
