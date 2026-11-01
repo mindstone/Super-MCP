@@ -7,7 +7,7 @@ import { checkPortAvailable, findAvailablePortFromCandidates, getOAuthCallbackPo
 import { SimpleOAuthProvider } from "../auth/providers/simple.js";
 import { OAUTH_FINISH_AUTH_TIMEOUT_CODE, OAUTH_REDIRECT_URI_REJECTED_CODE } from "../clients/httpClient.js";
 import type { OAuthProbeVerdictTraceEntry } from "../clients/httpClient.js";
-import { isAuthorizeProbeDisabled, type AuthorizeProbeVerdict } from "../auth/authorizeProbe.js";
+import { buildRedirectUriRejectedError, isAuthorizeProbeDisabled, type AuthorizeProbeVerdict } from "../auth/authorizeProbe.js";
 import { formatError } from "../utils/formatError.js";
 import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
 import { coerceStringifiedBoolean } from "../utils/normalizeInput.js";
@@ -548,6 +548,14 @@ async function handleAuthenticateCore(
       // losing promise after the race settles (d).
       let callbackPromise: Promise<string> | undefined;
       let fatalConnectErrorPromise: Promise<string | undefined> | undefined;
+      const discardAttemptClient = async () => {
+        if (clients.get(package_id) === attemptHttpClient) clients.delete(package_id);
+        try {
+          await attemptHttpClient.close();
+        } catch (closeError) {
+          logger.debug("Error closing failed attempt's client", { package_id, error: formatError(closeError) });
+        }
+      };
       try {
         // Wait for callback with state validation for CSRF protection.
         // Outer bound: the desktop host budgets this whole call (callback wait +
@@ -633,8 +641,17 @@ async function handleAuthenticateCore(
         }
 
         if (authCode === undefined && oauthProvider.hasStartedRedirect()) {
-          await attemptHttpClient.finishOAuth(await callbackPromise);
-          health = await attemptHttpClient.healthCheck();
+          const probeVerdict = oauthProvider.getProbeVerdictForTrace();
+          if (probeVerdict?.outcome === "rejected") {
+            throw buildRedirectUriRejectedError(probeVerdict);
+          }
+          try {
+            await attemptHttpClient.finishOAuth(await callbackPromise);
+            health = await attemptHttpClient.healthCheck();
+          } catch (error) {
+            await discardAttemptClient();
+            throw error;
+          }
         }
 
         if (health === "ok") {
@@ -677,6 +694,7 @@ async function handleAuthenticateCore(
           };
         } else {
           logger.error("Authentication verification failed", { package_id, health });
+          await discardAttemptClient();
           return {
             kind: "response",
             response: {

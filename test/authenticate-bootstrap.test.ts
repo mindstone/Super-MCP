@@ -4,15 +4,17 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { handleAuthenticate } from '../src/handlers/authenticate.js';
 import { handleHealthCheckPackage } from '../src/handlers/healthCheckPackage.js';
-import { HttpMcpClient } from '../src/clients/httpClient.js';
+import { FINISH_AUTH_TIMEOUT_MS, HttpMcpClient } from '../src/clients/httpClient.js';
 import { SimpleOAuthProvider } from '../src/auth/providers/simple.js';
 import { PackageRegistry } from '../src/registry.js';
 import type { Catalog } from '../src/catalog.js';
+import { OAUTH_PROVIDER_ERROR_CODE } from '../src/auth/callbackServer.js';
 
 const callback = vi.hoisted(() => ({
   start: vi.fn(async () => {}), stop: vi.fn(async () => {}), setServiceId: vi.fn(),
   waitForCallback: vi.fn<(timeout: number, state: string) => Promise<string>>(),
   resolve: undefined as ((code: string) => void) | undefined,
+  reject: undefined as ((error: Error) => void) | undefined,
 }));
 vi.mock('../src/logging.js', () => ({ getLogger: () => ({
   info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn(),
@@ -43,8 +45,12 @@ describe('authentication bootstrap settlement', () => {
     tokenDir = await fs.mkdtemp(path.join(os.tmpdir(), 'auth-bootstrap-'));
     process.env.SUPER_MCP_OAUTH_TOKEN_DIR = tokenDir;
     callback.resolve = undefined;
-    callback.waitForCallback.mockImplementation(() => new Promise((resolve) => {
+    callback.reject = undefined;
+    callback.start.mockImplementation(async () => {});
+    callback.stop.mockImplementation(async () => {});
+    callback.waitForCallback.mockImplementation(() => new Promise((resolve, reject) => {
       callback.resolve = resolve;
+      callback.reject = reject;
     }));
   });
 
@@ -64,6 +70,172 @@ describe('authentication bootstrap settlement', () => {
       healthCheck: PackageRegistry.prototype.healthCheck,
     } as unknown as PackageRegistry & { clients: Map<string, HttpMcpClient> };
   }
+
+  function mockLateChallengeFetch(hangTokenExchange = false) {
+    globalThis.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.endsWith('/.well-known/oauth-authorization-server')) return Response.json({
+        issuer: 'https://mcp.example.com', authorization_endpoint: 'https://mcp.example.com/authorize',
+        token_endpoint: 'https://mcp.example.com/token', registration_endpoint: 'https://mcp.example.com/register',
+        response_types_supported: ['code'], code_challenge_methods_supported: ['S256'],
+      });
+      if (url.endsWith('/register')) return Response.json({
+        client_id: 'fictional-client', redirect_uris: JSON.parse(String(init?.body)).redirect_uris,
+      }, { status: 201 });
+      if (new URL(url).pathname === '/authorize') return new Response('Callback URL mismatch', { status: 400 });
+      if (url.endsWith('/token') && hangTokenExchange) return new Promise<Response>(() => {});
+      if (url.endsWith('/mcp')) {
+        const body = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined;
+        if (body?.method === 'tools/list') return new Response('Unauthorized', {
+          status: 401, headers: { 'www-authenticate': 'Bearer' },
+        });
+        if (body?.method === 'initialize') return Response.json({ jsonrpc: '2.0', id: body.id, result: {
+          protocolVersion: '2025-11-25', capabilities: {}, serverInfo: { name: 'fictional', version: '1' },
+        } });
+        return new Response(null, { status: init?.method === 'POST' ? 202 : 405 });
+      }
+      return new Response(null, { status: 404 });
+    });
+  }
+
+  it('closes and evicts a tools/list sign-in attempt after declined consent so ordinary health cannot redirect again', async () => {
+    mockLateChallengeFetch();
+    const redirect = vi.spyOn(SimpleOAuthProvider.prototype, 'redirectToAuthorization')
+      .mockImplementation(async function (this: SimpleOAuthProvider) {
+        Reflect.set(this, 'redirectStarted', true);
+        callback.reject?.(Object.assign(new Error('OAuth error: access_denied'), { code: OAUTH_PROVIDER_ERROR_CODE }));
+      });
+    const close = vi.spyOn(HttpMcpClient.prototype, 'close');
+    const reg = registry();
+    // Let an ordinary health check reuse any cached client, exposing leaked interactive auth.
+    vi.mocked(reg.getClient).mockImplementation(async () => reg.clients.get(pkg.id) ?? new HttpMcpClient(pkg.id, pkg));
+    try {
+      const result = parse(await handleAuthenticate({ package_id: pkg.id, force: true }, reg, catalog));
+      expect(result).toEqual({ package_id: pkg.id, status: 'error', error: 'OAuth error: access_denied' });
+      expect(redirect).toHaveBeenCalledOnce();
+      expect(callback.stop).toHaveBeenCalledOnce();
+      await handleHealthCheckPackage({ package_id: pkg.id }, reg, catalog);
+      expect(redirect).toHaveBeenCalledOnce();
+      expect(reg.clients.has(pkg.id)).toBe(false);
+      expect(close).toHaveBeenCalledOnce();
+    } finally { await reg.clients.get(pkg.id)?.close(); }
+  });
+
+  it.each(['callback', 'token-exchange'])('closes a late-challenge attempt after %s timeout so ordinary health cannot redirect again', async (timeout) => {
+    mockLateChallengeFetch(timeout === 'token-exchange');
+    const realSetTimeout = globalThis.setTimeout;
+    const redirect = vi.spyOn(SimpleOAuthProvider.prototype, 'redirectToAuthorization')
+      .mockImplementation(async function (this: SimpleOAuthProvider) {
+        Reflect.set(this, 'redirectStarted', true);
+        if (timeout === 'callback') callback.reject?.(new Error('OAuth callback timeout'));
+        else {
+          // Bootstrap has connected; shorten only the remaining exchange budget.
+          vi.spyOn(globalThis, 'setTimeout').mockImplementation(((handler, delay, ...args) =>
+            realSetTimeout(handler, delay === FINISH_AUTH_TIMEOUT_MS ? 10 : delay, ...args)
+          ) as typeof setTimeout);
+          callback.resolve?.('fictional-code');
+        }
+      });
+    const close = vi.spyOn(HttpMcpClient.prototype, 'close');
+    const reg = registry();
+    vi.mocked(reg.getClient).mockImplementation(async () => reg.clients.get(pkg.id) ?? new HttpMcpClient(pkg.id, pkg));
+    try {
+      const result = parse(await handleAuthenticate({ package_id: pkg.id, force: true }, reg, catalog));
+      expect(result.status).toBe(timeout === 'callback' ? 'auth_required' : 'error');
+      if (timeout === 'token-exchange') expect(result.message).toContain('OAuth token exchange timed out');
+      expect(callback.stop).toHaveBeenCalledOnce();
+      const requests = vi.mocked(globalThis.fetch).mock.calls.length;
+      await handleHealthCheckPackage({ package_id: pkg.id }, reg, catalog);
+      expect(redirect).toHaveBeenCalledOnce();
+      expect(globalThis.fetch).toHaveBeenCalledTimes(requests);
+      expect(close).toHaveBeenCalledOnce();
+      const closedClient = close.mock.contexts[0];
+      expect(await closedClient.healthCheck()).toBe('needs_auth');
+      expect(globalThis.fetch).toHaveBeenCalledTimes(requests);
+      expect(reg.clients.get(pkg.id)).toBe(timeout === 'callback' ? closedClient : undefined);
+    } finally { await reg.clients.get(pkg.id)?.close(); }
+  });
+
+  it('discards a rejected access-token-only attempt so ordinary health cannot redirect again', async () => {
+    mockLateChallengeFetch();
+    const lateChallengeFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.endsWith('/token')) return Response.json({
+        access_token: 'fictional-token', token_type: 'Bearer', expires_in: 3600,
+      });
+      return lateChallengeFetch(input, init);
+    });
+    const redirect = vi.spyOn(SimpleOAuthProvider.prototype, 'redirectToAuthorization')
+      .mockImplementation(async function (this: SimpleOAuthProvider) {
+        Reflect.set(this, 'redirectStarted', true);
+        callback.resolve?.('fictional-code');
+      });
+    const close = vi.spyOn(HttpMcpClient.prototype, 'close');
+    const reg = registry();
+    vi.mocked(reg.getClient).mockImplementation(async () => reg.clients.get(pkg.id) ?? new HttpMcpClient(pkg.id, pkg));
+    try {
+      const result = parse(await handleAuthenticate({ package_id: pkg.id, force: true }, reg, catalog));
+      expect(result.status).toBe('error');
+      const redirects = redirect.mock.calls.length;
+      expect(redirects).toBeGreaterThan(0);
+      await handleHealthCheckPackage({ package_id: pkg.id }, reg, catalog);
+      expect(redirect).toHaveBeenCalledTimes(redirects);
+      expect(reg.clients.has(pkg.id)).toBe(false);
+      expect(close).toHaveBeenCalledOnce();
+    } finally { await reg.clients.get(pkg.id)?.close(); }
+  });
+
+  it.each([false, true])('preserves a replacement cache entry and the late decline result when close fails: %s', async (failClose) => {
+    mockLateChallengeFetch();
+    const reg = registry();
+    const replacement = new HttpMcpClient(pkg.id, pkg);
+    vi.spyOn(SimpleOAuthProvider.prototype, 'redirectToAuthorization')
+      .mockImplementation(async function (this: SimpleOAuthProvider) {
+        Reflect.set(this, 'redirectStarted', true);
+        reg.clients.set(pkg.id, replacement);
+        callback.reject?.(Object.assign(new Error('OAuth error: access_denied'), { code: OAUTH_PROVIDER_ERROR_CODE }));
+      });
+    const realClose = HttpMcpClient.prototype.close;
+    const close = vi.spyOn(HttpMcpClient.prototype, 'close').mockImplementationOnce(async function (this: HttpMcpClient) {
+      await realClose.call(this);
+      if (failClose) throw new Error('test close failed');
+    });
+    try {
+      expect(parse(await handleAuthenticate({ package_id: pkg.id, force: true }, reg, catalog)))
+        .toEqual({ package_id: pkg.id, status: 'error', error: 'OAuth error: access_denied' });
+      expect(reg.clients.get(pkg.id)).toBe(replacement);
+      expect(close).toHaveBeenCalledOnce();
+      expect(close.mock.contexts[0]).not.toBe(replacement);
+      expect(callback.stop).toHaveBeenCalledOnce();
+    } finally { await replacement.close(); }
+  });
+
+  it('advances ports after a verification authorize-probe rejection without waiting for callback expiry', async () => {
+    mockLateChallengeFetch();
+    const expired = vi.fn();
+    let callbackTimer: ReturnType<typeof setTimeout>;
+    callback.waitForCallback.mockImplementation((budget) => new Promise((_resolve, reject) => {
+      expect(budget).toBe(300_000);
+      callbackTimer = setTimeout(() => { expired(); reject(new Error('OAuth callback timeout')); }, 1_000);
+    }));
+    callback.stop.mockImplementation(async () => { clearTimeout(callbackTimer); });
+    callback.start.mockImplementation(async () => {
+      // End the browser-floor attempt before it could open a real browser.
+      if (callback.start.mock.calls.length === 4) throw new Error('test browser floor stopped');
+    });
+    const redirect = vi.spyOn(SimpleOAuthProvider.prototype, 'redirectToAuthorization');
+    const close = vi.spyOn(HttpMcpClient.prototype, 'close');
+    const reg = registry();
+    try {
+      await handleAuthenticate({ package_id: pkg.id }, reg, catalog);
+      expect(redirect).toHaveBeenCalledTimes(3);
+      expect(callback.start).toHaveBeenCalledTimes(4);
+      expect(callback.stop).toHaveBeenCalledTimes(3);
+      expect(close).toHaveBeenCalledTimes(3);
+      expect(expired).not.toHaveBeenCalled();
+    } finally { clearTimeout(callbackTimer!); await reg.clients.get(pkg.id)?.close(); }
+  }, 15_000);
 
   it.each(['registration-404', 'unreachable', 'absorbed-401'])('fails before the callback budget for %s and never caches the client', async (outcome) => {
     const requests: string[] = [];
