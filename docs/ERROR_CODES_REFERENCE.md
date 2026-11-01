@@ -132,11 +132,18 @@ The arguments provided to a tool don't match its expected JSON schema.
    - `format_errors`
    - `unknown_fields` + `did_you_mean`
    - `schema_fragments` (field-level snippets; escalates to full schema on repeated failures)
+   - `other_errors` (optional list of `{field, constraint, expected}` for other constraints and union alternatives)
 2. Fix only the fields listed in the repair ticket and retry
 3. Use `dry_run: true` with `use_tool` to validate arguments before execution
 4. If `repair_ticket.attempt >= 3`, ask the user for clarification before retrying
 
 **Related get_help:** `get_help(error_code: -33003)`
+
+Union diagnostics exclude branches ruled out by AJV's type failures or a supplied discriminator. Synthetic discriminator errors retain their union location for branch ownership and disappear when an enclosing branch is excluded. Compatible branches remain visible and are labelled as alternatives; they are not ranked by error count. `const` constraints use `enum_violations` with one allowed value. The ticket retains `got`, while const and discriminator prose lists only allowed values. Nested forbidden fields use dotted paths in `unknown_fields`. Every ticket path follows the schema at that instance location, resolving local references and `anyOf`/`oneOf`/`allOf` branches under a bounded work budget. Only properties declared at that location and actual array indices with an `items` schema remain visible; caller-chosen map segments become `*`. Unresolved references or budget exhaustion mask the path. A fixed object’s final unknown field remains visible for repair; a parent with `patternProperties` masks that field too and receives no suggestion. The original AJV list remains available in `data.errors`.
+
+Unknown-field suggestions recognise normalised spellings, clear typos and related tokens across snake_case, kebab-case and camelCase names. For example, `thread_ts` can suggest `ts`, and `fromDate` can suggest `fromDateTime`. Ambiguous ties and unrelated short names have no suggestion. Already-supplied fields are excluded from suggestions, including nested objects. Suggestions are diagnostic only: they do not rewrite or dispatch the caller's arguments. A rejection considers at most 16 unknown fields for suggestions, with at most 128 candidates per field; names longer than 128 characters are skipped. These limits leave the rejection code (`-33003`) and raw errors intact.
+
+The existing message prefix, section order and stop-retrying guidance are preserved. The optional `Other errors:` section comes last. If projection cannot resolve a branch or exceeds its work budget, the router logs the error count, keywords and schema paths only (never submitted values or instance paths) and builds the ticket from the original errors.
 
 **Example log message:**
 ```

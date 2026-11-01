@@ -1,0 +1,125 @@
+{
+  "anyOf": [
+    {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "description": "A link to the evidence. Use kind \"url\" for any web link (documents, Notion, Slack, Teams, Drive, calendar), \"email\" for an email thread, \"workspace\" for a local file, or linear/github/asana for a ticket.",
+            "type": "object",
+            "properties": {
+              "kind": {
+                "description": "Which kind of reference (required): workspace (needs path), url (needs url), email (needs threadId), linear (needs issueId), github (needs owner + repo + issueNumber), asana (needs taskId).",
+                "type": "string",
+                "enum": [
+                  "workspace",
+                  "url",
+                  "email",
+                  "linear",
+                  "github",
+                  "asana"
+                ]
+              },
+              "path": {
+                "description": "Text. Used by kind workspace (required); ignored for other kinds."
+              },
+              "url": {
+                "description": "Text. Used by kind url (required); ignored for other kinds."
+              },
+              "threadId": {
+                "description": "Text. Used by kind email (required); ignored for other kinds."
+              },
+              "messageId": {
+                "description": "Text. Used by kind email; ignored for other kinds."
+              },
+              "provider": {
+                "description": "One of: gmail, outlook. Used by kind email; ignored for other kinds."
+              },
+              "issueId": {
+                "description": "Text. Used by kind linear (required); ignored for other kinds."
+              },
+              "owner": {
+                "description": "Text. Used by kind github (required); ignored for other kinds."
+              },
+              "repo": {
+                "description": "Text. Used by kind github (required); ignored for other kinds."
+              },
+              "issueNumber": {
+                "description": "Number. Used by kind github (required); ignored for other kinds."
+              },
+              "taskId": {
+                "description": "Text. Used by kind asana (required); ignored for other kinds."
+              },
+              "label": {
+                "description": "Text. Used by kind workspace, url, email, linear, github, asana; ignored for other kinds."
+              }
+            }
+          },
+          {
+            "type": "string",
+            "minLength": 1
+          }
+        ]
+      }
+    },
+    {
+      "anyOf": [
+        {
+          "description": "A link to the evidence. Use kind \"url\" for any web link (documents, Notion, Slack, Teams, Drive, calendar), \"email\" for an email thread, \"workspace\" for a local file, or linear/github/asana for a ticket.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "description": "Which kind of reference (required): workspace (needs path), url (needs url), email (needs threadId), linear (needs issueId), github (needs owner + repo + issueNumber), asana (needs taskId).",
+              "type": "string",
+              "enum": [
+                "workspace",
+                "url",
+                "email",
+                "linear",
+                "github",
+                "asana"
+              ]
+            },
+            "path": {
+              "description": "Text. Used by kind workspace (required); ignored for other kinds."
+            },
+            "url": {
+              "description": "Text. Used by kind url (required); ignored for other kinds."
+            },
+            "threadId": {
+              "description": "Text. Used by kind email (required); ignored for other kinds."
+            },
+            "messageId": {
+              "description": "Text. Used by kind email; ignored for other kinds."
+            },
+            "provider": {
+              "description": "One of: gmail, outlook. Used by kind email; ignored for other kinds."
+            },
+            "issueId": {
+              "description": "Text. Used by kind linear (required); ignored for other kinds."
+            },
+            "owner": {
+              "description": "Text. Used by kind github (required); ignored for other kinds."
+            },
+            "repo": {
+              "description": "Text. Used by kind github (required); ignored for other kinds."
+            },
+            "issueNumber": {
+              "description": "Number. Used by kind github (required); ignored for other kinds."
+            },
+            "taskId": {
+              "description": "Text. Used by kind asana (required); ignored for other kinds."
+            },
+            "label": {
+              "description": "Text. Used by kind workspace, url, email, linear, github, asana; ignored for other kinds."
+            }
+          }
+        },
+        {
+          "type": "string",
+          "minLength": 1
+        }
+      ]
+    }
+  ]
+}

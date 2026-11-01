@@ -39,7 +39,8 @@ const OAuthCallbackServerCtor = vi.hoisted(() =>
   }),
 );
 
-vi.mock('../src/auth/callbackServer.js', () => ({
+vi.mock('../src/auth/callbackServer.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/auth/callbackServer.js')>()),
   OAuthCallbackServer: OAuthCallbackServerCtor,
 }));
 
