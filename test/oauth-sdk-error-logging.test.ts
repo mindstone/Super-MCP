@@ -24,7 +24,8 @@ vi.mock("../src/utils/portFinder.js", () => ({
   getOAuthCallbackPortCandidates: vi.fn(() => [5173]),
   getOAuthCallbackRetryCandidates: vi.fn(() => []),
 }));
-vi.mock("../src/auth/callbackServer.js", () => ({
+vi.mock("../src/auth/callbackServer.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../src/auth/callbackServer.js")>()),
   OAuthCallbackServer: class {
     setServiceId = vi.fn();
     start = vi.fn(async () => {});
