@@ -94,7 +94,7 @@ vi.mock("../../auth/providers/simple.js", () => {
   return { SimpleOAuthProvider: MockSimpleOAuthProvider };
 });
 
-vi.mock("../../auth/callbackServer.js", () => {
+vi.mock("../../auth/callbackServer.js", async (importOriginal) => {
   class MockOAuthCallbackServer {
     port: number;
     setServiceId = vi.fn();
@@ -121,7 +121,10 @@ vi.mock("../../auth/callbackServer.js", () => {
       callbackServerInstances.push(this);
     }
   }
-  return { OAuthCallbackServer: MockOAuthCallbackServer };
+  return {
+    ...(await importOriginal<typeof import("../../auth/callbackServer.js")>()),
+    OAuthCallbackServer: MockOAuthCallbackServer,
+  };
 });
 
 vi.mock("../../clients/httpClient.js", async (importOriginal) => {

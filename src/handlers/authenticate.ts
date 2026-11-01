@@ -474,7 +474,7 @@ async function handleAuthenticateCore(
       // (e)
       clients.delete(package_id);
 
-      const { OAuthCallbackServer } = await import("../auth/callbackServer.js");
+      const { OAuthCallbackServer, OAUTH_PROVIDER_ERROR_CODE } = await import("../auth/callbackServer.js");
       const callbackServer = new OAuthCallbackServer(attemptPort);
       callbackServer.setServiceId(package_id);
 
@@ -736,13 +736,36 @@ async function handleAuthenticateCore(
         const isFinishAuthTimeout =
           (error as { code?: unknown } | null)?.code === OAUTH_FINISH_AUTH_TIMEOUT_CODE;
         const isFatalSetupError = typeof errMsg === 'string' && errMsg.startsWith('OAuth setup failed:');
+        const isProviderError =
+          (error as { code?: unknown } | null)?.code === OAUTH_PROVIDER_ERROR_CODE;
 
         logger.error("OAuth failed", {
           package_id,
           error: oauthErrorLogText(error, errMsg),
           isFatalSetupError,
           isFinishAuthTimeout,
+          isProviderError,
         });
+
+        // The provider's sign-in page answered with an error (access_denied
+        // when the person declines): the attempt is over, so report it rather
+        // than the pending "check browser for OAuth prompt" response. `error`
+        // keeps the provider's code so a host can tell a decline (which needs
+        // no message) from a failure.
+        if (isProviderError) {
+          return {
+            kind: "response",
+            response: {
+              content: [
+                {
+                  type: "text",
+                  text: JSON.stringify({ package_id, status: "error", error: errMsg }, null, 2),
+                },
+              ],
+              isError: false,
+            },
+          };
+        }
 
         // The user completed sign-in but the token exchange hung past its
         // bound. This is a terminal outcome for this attempt — report it

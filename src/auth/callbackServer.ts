@@ -261,6 +261,13 @@ function generateErrorHtml(error: string, errorDescription?: string): string {
 export const OAUTH_CALLBACK_SERVER_STOPPED_MESSAGE =
   "OAuth callback server stopped before a callback arrived";
 
+/**
+ * Machine code on the rejection a state-validated `?error=` callback settles:
+ * the provider's sign-in page has answered (`access_denied` when the person
+ * declines), so the attempt is over. Classified by code, not message text.
+ */
+export const OAUTH_PROVIDER_ERROR_CODE = "OAUTH_PROVIDER_ERROR";
+
 /** Security headers for OAuth callback responses */
 const SECURITY_HEADERS = {
   "Content-Type": "text/html; charset=utf-8",
@@ -388,7 +395,9 @@ export class OAuthCallbackServer {
         res.end(generateErrorHtml(error, errorDescription || undefined));
 
         if (this.rejectCallback) {
-          this.rejectCallback(new Error(`OAuth error: ${error}`));
+          const providerError: NodeJS.ErrnoException = new Error(`OAuth error: ${error}`);
+          providerError.code = OAUTH_PROVIDER_ERROR_CODE;
+          this.rejectCallback(providerError);
         }
       } else if (code) {
         // Validate state parameter if expected state is set (CSRF protection)

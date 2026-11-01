@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 import * as net from "net";
 
-import { OAuthCallbackServer, OAUTH_CALLBACK_SERVER_STOPPED_MESSAGE } from "../callbackServer.js";
+import {
+  OAuthCallbackServer,
+  OAUTH_CALLBACK_SERVER_STOPPED_MESSAGE,
+  OAUTH_PROVIDER_ERROR_CODE,
+} from "../callbackServer.js";
 
 vi.mock("../../logging.js", () => ({
   getLogger: () => ({
@@ -125,7 +129,12 @@ describe("OAuthCallbackServer ?error= branch state validation (REBEL-7F9 Stage 4
         `http://127.0.0.1:${port}/oauth/callback?error=access_denied&state=state-new`,
       );
       expect(goodRes.status).toBe(200);
-      await expect(waiter).rejects.toThrow("OAuth error: access_denied");
+      // Coded, so authenticate ends the attempt instead of reporting it pending (FOX-5953).
+      expect(OAUTH_PROVIDER_ERROR_CODE).toEqual(expect.any(String));
+      await expect(waiter).rejects.toMatchObject({
+        message: "OAuth error: access_denied",
+        code: OAUTH_PROVIDER_ERROR_CODE,
+      });
     } finally {
       await server.stop();
     }
