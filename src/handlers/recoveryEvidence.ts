@@ -2,7 +2,7 @@
 export interface RecoveryControlCandidate {
   action?: "auth_required";
   auth_tool?: string;
-  reason?: "token_expired" | "not_connected";
+  reason?: "token_expired" | "not_connected" | "missing_permission" | "consent_required" | "tenant_blocked";
   ok?: false;
   code?: string;
   status?: "auth_required";
@@ -30,7 +30,8 @@ function project(value: unknown): RecoveryControlCandidate | undefined {
   if (payload.action === "auth_required") {
     if (typeof payload.auth_tool !== "string" ||
         !/^[a-zA-Z][a-zA-Z0-9_]{0,127}$/.test(payload.auth_tool) ||
-        (payload.reason !== "token_expired" && payload.reason !== "not_connected")) return undefined;
+        (payload.reason !== "token_expired" && payload.reason !== "not_connected" &&
+         payload.reason !== "missing_permission" && payload.reason !== "consent_required")) return undefined;
     return { action: "auth_required", auth_tool: payload.auth_tool, reason: payload.reason };
   }
   const candidate: RecoveryControlCandidate = {};
@@ -39,7 +40,12 @@ function project(value: unknown): RecoveryControlCandidate | undefined {
     candidate.ok = false;
     candidate.code = payload.code;
   }
-  if (payload.status === "auth_required") candidate.status = "auth_required";
+  if (payload.status === "auth_required") {
+    candidate.status = "auth_required";
+    // Keep consent and tenant-policy evidence distinct for the host classifier.
+    if (payload.reason === "consent_required" || payload.reason === "missing_permission" ||
+        payload.reason === "tenant_blocked") candidate.reason = payload.reason;
+  }
   return Object.keys(candidate).length ? candidate : undefined;
 }
 
