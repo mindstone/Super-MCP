@@ -4,7 +4,7 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import PQueue from "p-queue";
-import { McpClient, PackageConfig, ReadResourceResult } from "../types.js";
+import { DEFAULT_TOOL_TIMEOUT_MS, McpClient, PackageConfig, ReadResourceResult } from "../types.js";
 import { getLogger } from "../logging.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
 import { SimpleOAuthProvider, RefreshOnlyOAuthProvider } from "../auth/providers/index.js";
@@ -974,13 +974,11 @@ export class HttpMcpClient implements McpClient {
       throw new Error(`Package '${this.packageId}' is not connected`);
     }
 
-    // 4h sentinel — aligned with Rebel Core's TOOL_CALL_TIMEOUT so this upstream
-    // layer never kills long-running tools (deep research, pair waiting, large
-    // data queries) before the outer layer's timer fires. The agent-turn watchdog
-    // (Layer 2) is the real effective ceiling. Env var overrides for ops tuning.
-    // See: src/core/rebelCore/mcpClient.ts.
+    // Matches Rebel Core's 90-minute TOOL_CALL_TIMEOUT in src/core/rebelCore/mcpClient.ts
+    // so a call Rebel has given up on frees its connector slot at about the same time.
+    // The env var overrides the default.
     const timeout = this.config.timeout ||
-                    parseInt(process.env.SUPER_MCP_TOOL_TIMEOUT || '14400000');
+                    parseInt(process.env.SUPER_MCP_TOOL_TIMEOUT || String(DEFAULT_TOOL_TIMEOUT_MS));
 
     logger.info("Calling tool on HTTP MCP", {
       package_id: this.packageId,

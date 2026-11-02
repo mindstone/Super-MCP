@@ -5,7 +5,7 @@ import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import PQueue from "p-queue";
-import { McpClient, PackageConfig, ReadResourceResult } from "../types.js";
+import { DEFAULT_TOOL_TIMEOUT_MS, McpClient, PackageConfig, ReadResourceResult } from "../types.js";
 import { getLogger } from "../logging.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
 
@@ -917,14 +917,11 @@ export class StdioMcpClient implements McpClient {
   }
 
   async callTool(name: string, args: any): Promise<any> {
-    // 4h sentinel — aligned with httpClient.ts and Rebel Core's TOOL_CALL_TIMEOUT
-    // so long-running tools (deep research, Rebel Browser pair waiting, large data
-    // queries) are never killed by the upstream layer before the outer timers fire.
-    // The agent-turn watchdog (Layer 2) is the real effective ceiling. RebelAppBridge
-    // is stdio-only, so raising the stdio default is required for rebel_bridge_wait_pair_event's
-    // 10min window to be honored end-to-end.
+    // Matches Rebel Core's 90-minute TOOL_CALL_TIMEOUT in src/core/rebelCore/mcpClient.ts
+    // so a call Rebel has given up on frees its connector slot at about the same time.
+    // Stdio connectors run one call at a time. The env var overrides the default.
     const timeout = this.config.timeout ||
-                    parseInt(process.env.SUPER_MCP_TOOL_TIMEOUT || '14400000');
+                    parseInt(process.env.SUPER_MCP_TOOL_TIMEOUT || String(DEFAULT_TOOL_TIMEOUT_MS));
 
     logger.info("Calling tool on stdio MCP", {
       package_id: this.packageId,

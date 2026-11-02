@@ -17,9 +17,9 @@ Timeouts are resolved in the following order (highest priority first):
 
 1. **Per-server `timeout` field** — Set in the server configuration
 2. **`SUPER_MCP_TOOL_TIMEOUT` environment variable** — Global override
-3. **Default: 1,800,000ms (30 minutes)** — Fallback when neither is set
+3. **Default: 5,400,000ms (90 minutes)** — Fallback when neither is set
 
-The default lives in `src/clients/stdioClient.ts` and `src/clients/httpClient.ts` as the literal `'1800000'` env-var fallback. It was raised from 5 min to 30 min to align with Rebel Core's `TOOL_CALL_TIMEOUT` so long-running tools (deep research, browser pair waiting, large data queries, human-in-the-loop flows) aren't killed at the super-mcp layer before the outer Rebel timer fires.
+The default is `DEFAULT_TOOL_TIMEOUT_MS` in `src/types.ts`, used by the stdio, HTTP and package-home clients. It matches Rebel Core's `TOOL_CALL_TIMEOUT`, so a call Rebel has stopped waiting for also frees its connector slot here.
 
 ---
 
@@ -111,6 +111,7 @@ When you see this error:
 
 ## History
 
+- **Unreleased**: Default timeout lowered from 14,400,000ms (4 hours) to 5,400,000ms (90 minutes), from one constant (`DEFAULT_TOOL_TIMEOUT_MS`), to match Rebel Core. A call that never answers no longer holds its connector slot for 4 hours, and the next call reaches the connector.
 - **Post-v2.5.0** (commit `035f2fb`): Default timeout raised from 300,000ms (5 minutes) to 1,800,000ms (30 minutes) to align both stdio and HTTP client defaults with Rebel Core's `TOOL_CALL_TIMEOUT`. Long-running tools (deep research, Rebel Browser pair waiting, large data queries, human-in-the-loop flows) were being killed at the super-mcp layer before the outer Rebel timer fired.
 - **v1.4.0**: Default timeout changed from 60,000ms (1 minute) to 300,000ms (5 minutes) to better support long-running operations like research and AI generation.
 
@@ -119,6 +120,6 @@ When you see this error:
 ## Maintenance
 
 This document should be updated when:
-- Timeout behavior or defaults change in `src/clients/stdioClient.ts` or `src/clients/httpClient.ts`
+- Timeout behavior or defaults change (`DEFAULT_TOOL_TIMEOUT_MS` in `src/types.ts`, or the clients in `src/clients/`)
 - New timeout-related configuration options are added to `src/types.ts`
 - Progress notification handling changes

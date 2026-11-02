@@ -281,7 +281,7 @@ export SUPER_MCP_TOOL_TIMEOUT=600000  # 10 minutes default for all tools
 ```
 
 **How Timeouts Work:**
-- Default timeout: 300,000ms (5 minutes)
+- Default timeout: 5,400,000ms (90 minutes)
 - Per-server `timeout` config overrides the default
 - `SUPER_MCP_TOOL_TIMEOUT` environment variable provides a global default
 - Timeout automatically resets when the tool sends progress notifications
