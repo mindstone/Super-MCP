@@ -129,6 +129,25 @@ describe('PackageRegistry idle reaping', () => {
     registry.stopIdleReaper();
   });
 
+  it('does NOT reap clients that hold live state', () => {
+    const pkg = stdioPackage('browser-pkg');
+    const registry = createRegistry([pkg]);
+    const client = createMockClient({
+      holdsLiveState: vi.fn().mockReturnValue(true),
+    });
+
+    (registry as any).clients.set('browser-pkg', client);
+    (registry as any).lastActivity.set('browser-pkg', Date.now() - 400_000);
+
+    registry.startIdleReaper();
+    vi.advanceTimersByTime(60_000);
+
+    expect(client.close).not.toHaveBeenCalled();
+    expect((registry as any).clients.has('browser-pkg')).toBe(true);
+
+    registry.stopIdleReaper();
+  });
+
   it('does NOT reap clients with queued requests (size > 0, pending === 0)', () => {
     // hasPendingRequests checks both pending > 0 || size > 0
     // Simulating the "queued but not running" case means hasPendingRequests returns true

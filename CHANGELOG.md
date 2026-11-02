@@ -8,10 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Added
+- **Connectors can ask to stay running.** A server that declares the experimental capability `super-mcp/keep-alive` in its initialize result is not stopped for being idle once it has run a tool; it runs until the router stops or restarts it. Use it for a connector that holds live state, such as a browser it opened.
 - **Apply new packages without restarting the router.** `POST /api/config/apply` reloads security policy, admits valid additions and refreshes the catalog. It reports additions and every remaining difference that needs a router reload; adding a package leaves existing clients and their calls running.
 - **`ToolNotesStore.whenIdle()`** resolves once any compaction a `readSnapshot()` started in the background has finished. `readSnapshot()` still does not wait for it; call `whenIdle()` before deleting the notes directory (tests, shutdown) so the compaction's lock and temp file cannot land in a directory being removed.
 
 ### Changed
+- **Connectors get a clean stop.** Stopping a stdio connector now closes its stdin first, as the MCP spec says, and gives it 1 second to tidy up and exit before its process tree is killed, instead of killing it at once. Processes it started that outlive it are still killed. Stopping the router or a connector can take up to 1 second longer; connectors stop in parallel.
 - A tool call that gets no answer now stops after 90 minutes instead of 4 hours, so the connector is free again for the next call. To keep the old limit, set `SUPER_MCP_TOOL_TIMEOUT=14400000` or a per-server `timeout`.
 - **A host app can name itself to outside services.** `SUPER_MCP_APP_NAME` (already used for the callback page) now also sets the OAuth client name a provider shows on its consent screen and in its connected-apps list, and the MCP `clientInfo` name sent to servers. Optional `SUPER_MCP_APP_URL` and `SUPER_MCP_APP_LOGO_URL` (public https URLs) are sent as `client_uri` and `logo_uri`. Unset, the router still identifies as `super-mcp-router`. A client already registered with a provider keeps its old name until it is registered again.
 - OAuth error logs record only the error code, never the provider's description. Token fingerprints have been removed from refresh logs, and the refresh log field `server_error` is now `error`.
