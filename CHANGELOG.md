@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Added
+- **`POST /api/shutdown`** starts the same clean shutdown as SIGTERM, for a host that cannot send a catchable SIGTERM (on Windows, Node's `kill()` ends the process at once, so connectors got no clean stop). Local only; refused when the request carries an `Origin` header, and, when the router was started with `--rebel-owner-id`, unless the `x-super-mcp-owner-id` header matches it.
 - **Connectors can ask to stay running.** A server that declares the experimental capability `super-mcp/keep-alive` in its initialize result is not stopped for being idle once it has run a tool; it runs until the router stops or restarts it. Use it for a connector that holds live state, such as a browser it opened.
 - **Apply new packages without restarting the router.** `POST /api/config/apply` reloads security policy, admits valid additions and refreshes the catalog. It reports additions and every remaining difference that needs a router reload; adding a package leaves existing clients and their calls running.
 - **`ToolNotesStore.whenIdle()`** resolves once any compaction a `readSnapshot()` started in the background has finished. `readSnapshot()` still does not wait for it; call `whenIdle()` before deleting the notes directory (tests, shutdown) so the compaction's lock and temp file cannot land in a directory being removed.
