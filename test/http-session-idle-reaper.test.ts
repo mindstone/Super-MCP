@@ -188,7 +188,7 @@ describe("HTTP session idle reaper", () => {
     release.resolve();
     expect(toolResponse().closed).toBe(false);
 
-    now += 4 * 60 * MINUTE + IDLE_LIMIT;
+    now += 90 * MINUTE + IDLE_LIMIT;
     sweep();
     expect(wasReaped()).toBe(false);
     now += 1;
