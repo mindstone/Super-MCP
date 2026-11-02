@@ -60,6 +60,7 @@ vi.mock("../../auth/providers/simple.js", () => {
     oauthPort: number;
     skipProbe = false;
     probeVerdict?: AuthorizeProbeVerdict;
+    browserUnavailable = vi.fn(() => new Promise<Error>(() => {}));
     initialize = vi.fn(async () => {});
     checkAndInvalidateOnPortMismatch = vi.fn(async () => false);
     invalidateCredentials = vi.fn(async () => {});
@@ -85,7 +86,10 @@ vi.mock("../../auth/providers/simple.js", () => {
       providerInstances.push(this);
     }
   }
-  return { SimpleOAuthProvider: MockSimpleOAuthProvider };
+  return {
+    SimpleOAuthProvider: MockSimpleOAuthProvider,
+    OAUTH_BROWSER_UNAVAILABLE_CODE: "OAUTH_BROWSER_UNAVAILABLE",
+  };
 });
 
 vi.mock("../../auth/callbackServer.js", async (importOriginal) => {

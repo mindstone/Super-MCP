@@ -33,17 +33,21 @@ vi.mock("../../utils/portFinder.js", async (importOriginal) => {
   };
 });
 
-vi.mock("../../auth/providers/simple.js", () => {
+vi.mock("../../auth/providers/simple.js", async (importOriginal) => {
   class MockSimpleOAuthProvider {
     static readNeedsReconnectMarkerState = readNeedsReconnectMarkerState;
     static getSavedClientPort = getSavedClientPort;
     static hasPersistedAccessToken = vi.fn(async () => false);
 
+    browserUnavailable = vi.fn(() => new Promise<Error>(() => {}));
     initialize = vi.fn(async () => {});
     invalidateCredentials = vi.fn(async () => {});
   }
 
-  return { SimpleOAuthProvider: MockSimpleOAuthProvider };
+  return {
+    ...(await importOriginal<typeof import("../../auth/providers/simple.js")>()),
+    SimpleOAuthProvider: MockSimpleOAuthProvider,
+  };
 });
 
 const PACKAGE_ID = "remote-connector-test";
