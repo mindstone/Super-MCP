@@ -1127,9 +1127,10 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
 
       const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
       // A session with an open tool call is kept until no client can still be
-      // waiting on it: the 4h tool-call sentinel (SUPER_MCP_TOOL_TIMEOUT, Rebel
-      // Core's TOOL_CALL_TIMEOUT) plus the idle limit. A cancelled call leaves
-      // its POST open with no response, so the open count alone would never drop.
+      // waiting on it: 4 hours, above the default per-call limit (90 minutes) so
+      // a deployment that sets a longer SUPER_MCP_TOOL_TIMEOUT keeps its sessions,
+      // plus the idle limit. A cancelled call leaves its POST open with no
+      // response, so the open count alone would never drop.
       const BUSY_SESSION_IDLE_TIMEOUT_MS = 4 * 60 * 60 * 1000 + SESSION_IDLE_TIMEOUT_MS;
       const GC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 

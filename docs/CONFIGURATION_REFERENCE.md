@@ -43,7 +43,7 @@ These fields follow the standard MCP configuration format:
 | `type` | `"stdio"` \| `"sse"` \| `"http"` | No | Transport type (auto-detected from other fields if omitted) |
 | `url` | string | For HTTP | Server URL for HTTP/SSE transport |
 | `headers` | object | No | HTTP headers to send with requests |
-| `timeout` | number | No | Tool execution timeout in milliseconds (default: 300000 = 5 minutes) |
+| `timeout` | number | No | Tool execution timeout in milliseconds (default: 5400000 = 90 minutes) |
 
 ### Extended Fields (Super-MCP Specific)
 
