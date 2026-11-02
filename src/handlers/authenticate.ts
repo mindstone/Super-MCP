@@ -4,7 +4,7 @@ import { PackageRegistry } from "../registry.js";
 import { Catalog, type CatalogRefreshController } from "../catalog.js";
 import { getLogger } from "../logging.js";
 import { checkPortAvailable, findAvailablePortFromCandidates, getOAuthCallbackPortCandidates, getOAuthCallbackRetryCandidates } from "../utils/portFinder.js";
-import { SimpleOAuthProvider } from "../auth/providers/simple.js";
+import { OAUTH_BROWSER_UNAVAILABLE_CODE, SimpleOAuthProvider } from "../auth/providers/simple.js";
 import { OAUTH_FINISH_AUTH_TIMEOUT_CODE, OAUTH_REDIRECT_URI_REJECTED_CODE } from "../clients/httpClient.js";
 import type { OAuthProbeVerdictTraceEntry } from "../clients/httpClient.js";
 import { buildRedirectUriRejectedError, isAuthorizeProbeDisabled, type AuthorizeProbeVerdict } from "../auth/authorizeProbe.js";
@@ -564,7 +564,10 @@ async function handleAuthenticateCore(
         // that constant must strictly exceed the sum of these inner legs.
         // The 300s callback wait applies exactly ONCE per authenticate call —
         // to this accepted (or browser-floor) attempt (recall#2 F4).
-        callbackPromise = callbackServer.waitForCallback(OAUTH_CALLBACK_TIMEOUT_MS, oauthState);
+        callbackPromise = Promise.race([
+          callbackServer.waitForCallback(OAUTH_CALLBACK_TIMEOUT_MS, oauthState),
+          oauthProvider.browserUnavailable().then((error) => { throw error; }),
+        ]);
 
         // Bootstrap can connect without a browser, start a redirect, or fail.
         // Only a started redirect needs the callback wait.
@@ -717,6 +720,24 @@ async function handleAuthenticateCore(
         callbackPromise?.catch(() => {});
         fatalConnectErrorPromise?.catch(() => {});
         connectPromise.catch(() => {});
+
+        if ((error as { code?: unknown } | null)?.code === OAUTH_BROWSER_UNAVAILABLE_CODE) {
+          await discardAttemptClient();
+          return {
+            kind: "response",
+            response: {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  package_id,
+                  status: "auth_required",
+                  message: "Sign-in needs a web browser, and none could be opened. Check that a default browser is set, or sign in from a computer that has one, then try again.",
+                }, null, 2),
+              }],
+              isError: false,
+            },
+          };
+        }
 
         const errMsg = formatError(error);
         // Primary classification signal (recall#2 F2(a)): the provider's

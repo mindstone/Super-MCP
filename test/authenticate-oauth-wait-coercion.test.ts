@@ -44,9 +44,10 @@ vi.mock('../src/auth/callbackServer.js', async (importOriginal) => ({
   OAuthCallbackServer: OAuthCallbackServerCtor,
 }));
 
-vi.mock('../src/auth/providers/simple.js', () => {
+vi.mock('../src/auth/providers/simple.js', async (importOriginal) => {
   function MockSimpleOAuthProvider() {
     return {
+      browserUnavailable: vi.fn(() => new Promise<Error>(() => {})),
       initialize: vi.fn().mockResolvedValue(undefined),
       checkAndInvalidateOnPortMismatch: vi.fn().mockResolvedValue(false),
       state: vi.fn().mockResolvedValue('test-state'),
@@ -59,7 +60,10 @@ vi.mock('../src/auth/providers/simple.js', () => {
   MockSimpleOAuthProvider.getSavedClientPort = vi.fn().mockResolvedValue(undefined);
   MockSimpleOAuthProvider.hasPersistedAccessToken = vi.fn().mockResolvedValue(false);
   MockSimpleOAuthProvider.readNeedsReconnectMarkerState = async () => ({ state: 'absent' });
-  return { SimpleOAuthProvider: MockSimpleOAuthProvider };
+  return {
+    ...(await importOriginal<typeof import('../src/auth/providers/simple.js')>()),
+    SimpleOAuthProvider: MockSimpleOAuthProvider,
+  };
 });
 
 const mockHttpClient = {
