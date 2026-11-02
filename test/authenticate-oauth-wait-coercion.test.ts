@@ -73,13 +73,11 @@ const mockHttpClient = {
   close: vi.fn().mockResolvedValue(undefined),
 };
 
-vi.mock('../src/clients/httpClient.js', () => ({
+vi.mock('../src/clients/httpClient.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/clients/httpClient.js')>()),
   HttpMcpClient: function () {
     return mockHttpClient;
   },
-  // authenticate.ts imports this re-export at module load; without it the
-  // module evaluation throws (surfacing as unhandled rejections in the run).
-  OAUTH_REDIRECT_URI_REJECTED_CODE: 'OAUTH_REDIRECT_URI_REJECTED',
 }));
 
 function createMockCatalog(): Catalog {

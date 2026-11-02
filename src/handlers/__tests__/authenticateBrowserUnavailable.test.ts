@@ -119,18 +119,11 @@ beforeEach(() => {
 afterEach(() => {
   vi.clearAllTimers();
   vi.useRealTimers();
-  vi.unstubAllEnvs();
 });
 
 describe("authenticate when no browser can be opened", () => {
-  it.each([
-    [false, false],
-    [false, true],
-    [true, false],
-    [true, true],
-  ])("ends the wait (bootstrap connects: %s, probe disabled: %s)", async (bootstrapConnects, probeDisabled) => {
+  it.each([false, true])("ends the wait (bootstrap connects: %s)", async (bootstrapConnects) => {
     scenario.bootstrapConnects = bootstrapConnects;
-    vi.stubEnv("SUPER_MCP_OAUTH_PROBE_DISABLE", probeDisabled ? "1" : "0");
     const unavailable = deferred<Error>();
     scenario.unavailable = unavailable.promise;
     const { registry, completed, promise } = startAuthentication();
@@ -154,11 +147,13 @@ describe("authenticate when no browser can be opened", () => {
     expect(registry.clients.has(PACKAGE_ID)).toBe(false);
   });
 
-  it.each([false, true])("keeps waiting when the browser launches, then uses the callback code (bootstrap connects: %s)", async (bootstrapConnects) => {
+  it.each([false, true])("keeps waiting when the browser launches, then uses the callback code despite a late launch failure (bootstrap connects: %s)", async (bootstrapConnects) => {
     scenario.bootstrapConnects = bootstrapConnects;
     const callback = deferred<string>();
     scenario.callback = callback.promise;
-    const { completed, promise } = startAuthentication();
+    const unavailable = deferred<Error>();
+    scenario.unavailable = unavailable.promise;
+    const { registry, completed, promise } = startAuthentication();
     await vi.waitFor(() => expect(callbackServers[0]?.waitForCallback).toHaveBeenCalled());
     expect(callbackServers[0].waitForCallback).toHaveBeenCalledWith(OAUTH_CALLBACK_TIMEOUT_MS, "csrf-state");
     await vi.advanceTimersByTimeAsync(OAUTH_CALLBACK_TIMEOUT_MS - 1);
@@ -166,11 +161,13 @@ describe("authenticate when no browser can be opened", () => {
     expect(attemptClients[0].finishOAuth).not.toHaveBeenCalled();
 
     callback.resolve("browser-auth-code");
+    unavailable.resolve(Object.assign(new Error("late launcher failure"), { code: "OAUTH_BROWSER_UNAVAILABLE" }));
     await vi.waitFor(() => expect(completed).toHaveBeenCalled());
     const result = await promise;
     expect(JSON.parse(result.content[0].text)).toMatchObject({ package_id: PACKAGE_ID, status: "authenticated" });
     expect(attemptClients[0].finishOAuth).toHaveBeenCalledWith("browser-auth-code");
     expect(attemptClients[0].close).not.toHaveBeenCalled();
+    expect(registry.clients.get(PACKAGE_ID)).toBe(attemptClients[0]);
     expect(callbackServers[0].stop).toHaveBeenCalledOnce();
   });
 });

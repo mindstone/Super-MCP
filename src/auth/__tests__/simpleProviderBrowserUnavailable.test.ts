@@ -50,6 +50,11 @@ describe("SimpleOAuthProvider browser unavailable signal", () => {
     expect(error).toMatchObject({ code: OAUTH_BROWSER_UNAVAILABLE_CODE });
     child.emit("error", new Error("another launch failure"));
     expect(await provider.browserUnavailable()).toBe(error);
+    expect(mockLogger.error).toHaveBeenCalledWith("Failed to open browser", {
+      package_id: "browser-unavailable-test",
+      error: "spawn launcher ENOENT",
+    });
+    expect(JSON.stringify(mockLogger.error.mock.calls)).not.toContain(AUTH_URL.toString());
   });
 
   it("settles when spawn throws synchronously", async () => {

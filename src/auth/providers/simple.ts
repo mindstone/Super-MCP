@@ -813,21 +813,12 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       // Handle spawn errors to prevent crashing the process
       child.on('error', (err) => {
         this.markBrowserUnavailable(err);
-        logger.error("Failed to open browser", {
-          package_id: this.packageId,
-          error: err.message
-        });
       });
       // rundll32 exit codes do not reliably say whether a browser opened.
       if (process.platform !== 'win32') {
         child.on('exit', (code) => {
           if (code !== null && code !== 0) {
-            const error = new Error(`Browser launcher exited with code ${code}`);
-            this.markBrowserUnavailable(error);
-            logger.error("Failed to open browser", {
-              package_id: this.packageId,
-              error: error.message,
-            });
+            this.markBrowserUnavailable(new Error(`Browser launcher exited with code ${code}`));
           }
         });
       }
@@ -835,10 +826,6 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       logger.info("Browser launch requested for OAuth", { package_id: this.packageId });
     } catch (error) {
       this.markBrowserUnavailable(error);
-      logger.error("Failed to open browser", {
-        package_id: this.packageId,
-        error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error))
-      });
     }
   }
 
@@ -851,6 +838,10 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       new Error("Failed to open browser for OAuth", { cause }),
       { code: OAUTH_BROWSER_UNAVAILABLE_CODE },
     ));
+    logger.error("Failed to open browser", {
+      package_id: this.packageId,
+      error: oauthErrorLogText(cause, cause instanceof Error ? cause.message : String(cause))
+    });
   }
 
   hasStartedRedirect(): boolean {
