@@ -391,6 +391,8 @@ export interface McpClient {
   listResources?(): Promise<ListResourcesResult>;
   supportsResources?(): boolean;
   hasPendingRequests?(): boolean;
+  /** The server holds live state that must last until the host stops; the idle reaper skips it. */
+  holdsLiveState?(): boolean;
 }
 
 /** Stable categories used by the refresher's bounded retry policy. */
