@@ -3,6 +3,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
+import { TemporarilyUnavailableError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import PQueue from "p-queue";
 import { DEFAULT_TOOL_TIMEOUT_MS, McpClient, PackageConfig, ReadResourceResult } from "../types.js";
 import { getLogger } from "../logging.js";
@@ -15,6 +16,7 @@ import { runRefreshTransaction } from "../auth/refreshTransaction.js";
 import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
 
 const logger = getLogger();
+const REFRESH_TEMPORARILY_UNAVAILABLE_MESSAGE = "This connector's service didn't respond just now. It'll retry automatically.";
 
 export type OAuthDiscoveryKind =
   | "protected-resource"
@@ -198,6 +200,7 @@ function classifyOAuthDiscoveryStatus(status: unknown): OAuthDiscoveryStatusClas
  */
 function createResponseNormalizingFetch(
   baseFetch: typeof fetch,
+  refreshOnly: boolean,
   onOAuthError?: (error: OAuthErrorSummary) => void,
   refreshProvider?: SimpleOAuthProvider,
   onOAuthDiscoveryRequest?: (
@@ -285,15 +288,31 @@ function createResponseNormalizingFetch(
     // disk token, present the freshest refresh token, and recover/clear on
     // invalid_grant. The transaction internally calls baseFetch, so the result
     // still flows through the normalization + error-capture below.
+    const isRefresh = refreshProvider && isOAuthTokenEndpoint(input) && isRefreshGrantBody(init);
     let response: unknown;
     try {
-      response =
-        refreshProvider && isOAuthTokenEndpoint(input) && isRefreshGrantBody(init)
-          ? await runRefreshTransaction({ provider: refreshProvider, baseFetch, rejectedAccessToken }, input, init)
-          : await baseFetch(input, init);
+      response = isRefresh
+        ? await runRefreshTransaction({ provider: refreshProvider, baseFetch, rejectedAccessToken }, input, init)
+        : await baseFetch(input, init);
     } catch (error) {
       if (discoveryClassification) {
         onOAuthDiscoveryRequest?.(discoveryClassification, "network-error");
+      }
+      // Failed rotations clear tokens before throwing; leave those on the sign-in path.
+      if (refreshOnly && isRefresh && (await refreshProvider.tokens())?.refresh_token) {
+        const cause = error !== null && typeof error === "object"
+          ? error as { name?: unknown; code?: unknown }
+          : undefined;
+        logger.warn("OAuth refresh temporarily unavailable", {
+          package_id: refreshProvider.getPackageId(),
+          name: typeof cause?.name === "string" ? cause.name.slice(0, 80).replace(/[\r\n]/g, " ") : undefined,
+          code: typeof cause?.code === "string" || typeof cause?.code === "number"
+            ? String(cause.code).slice(0, 80).replace(/[\r\n]/g, " ")
+            : undefined,
+        });
+        const temporaryError = new TemporarilyUnavailableError(REFRESH_TEMPORARILY_UNAVAILABLE_MESSAGE);
+        temporaryError.cause = error;
+        throw temporaryError;
       }
       throw error;
     }
@@ -333,6 +352,21 @@ function createResponseNormalizingFetch(
 
     if (isOAuthTokenEndpoint(input)) {
       await captureOAuthErrorIfPresent(normalizedResponse);
+    }
+    if (
+      refreshOnly &&
+      isRefresh &&
+      (normalizedResponse.status >= 500 || normalizedResponse.status === 408 || normalizedResponse.status === 429) &&
+      (await refreshProvider.tokens())?.refresh_token
+    ) {
+      // This SDK OAuthError bypasses auth()'s redirect fallback for this attempt only.
+      logger.warn("OAuth refresh temporarily unavailable", {
+        package_id: refreshProvider.getPackageId(),
+        status: normalizedResponse.status,
+      });
+      const temporaryError = new TemporarilyUnavailableError(REFRESH_TEMPORARILY_UNAVAILABLE_MESSAGE);
+      temporaryError.cause = normalizedResponse;
+      throw temporaryError;
     }
     return normalizedResponse;
   }) as typeof fetch;
@@ -840,6 +874,7 @@ export class HttpMcpClient implements McpClient {
       if (this.isAuthLikeErrorMessage(errorMessage)) {
         logger.error("Authentication required for MCP server", {
           package_id: this.packageId,
+          error: oauthErrorLogText(error, errorMessage),
           message: `Run 'authenticate(package_id: "${this.packageId}")' to connect`,
           oauth_configured: this.config.oauth === true,
           has_saved_tokens: this.useOAuth,
@@ -929,6 +964,7 @@ export class HttpMcpClient implements McpClient {
     // is detected, ensuring the SDK can properly read the response body.
     options.fetch = createResponseNormalizingFetch(
       fetch,
+      this.oauthProvider instanceof RefreshOnlyOAuthProvider,
       (error) => {
         this.simpleOAuthProvider?.setLastOAuthError(error);
       },

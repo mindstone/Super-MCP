@@ -305,6 +305,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       ...identity,                      // client_name (RFC 7591 standard), client_uri, logo_uri
       name: identity.client_name,       // Fallback for non-compliant servers
       description: "MCP Router for aggregating multiple MCP servers",
+      grant_types: ["authorization_code", "refresh_token"],
       redirect_uris: [`http://localhost:${this.oauthPort}/oauth/callback`]
     };
   }

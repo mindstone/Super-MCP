@@ -2166,6 +2166,13 @@ export class PackageRegistry {
         continue;
       }
 
+      // A server holding live state (e.g. an open browser) runs until the
+      // host stops, when it is stopped cleanly.
+      if (client.holdsLiveState?.()) {
+        logger.debug("Skipping reap: holds live state", { package_id: packageId });
+        continue;
+      }
+
       // Check if idle beyond threshold
       const lastActive = this.lastActivity.get(packageId) ?? 0;
       if (now - lastActive < this.reaperTimeoutMs) {

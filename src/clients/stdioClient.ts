@@ -15,6 +15,53 @@ const logger = getLogger();
 const MAX_PROCESS_TREE_DEPTH = 20;
 
 /**
+ * List every descendant of `parentPid` on Unix/macOS, deepest first, using
+ * `pgrep -P` recursively. Empty on Windows and when there are none.
+ */
+const listDescendants = (parentPid: number, depth = 0): Promise<number[]> => {
+  if (process.platform === "win32") return Promise.resolve([]);
+  // Depth limit prevents infinite recursion in pathological cases
+  if (depth >= MAX_PROCESS_TREE_DEPTH) {
+    logger.warn("Process tree depth limit reached", { parentPid, depth, max: MAX_PROCESS_TREE_DEPTH });
+    return Promise.resolve([]);
+  }
+
+  return new Promise((resolve) => {
+    // pgrep -P finds direct children; we recursively gather all descendants
+    exec(`pgrep -P ${parentPid} 2>/dev/null`, async (error, stdout) => {
+      if (error || !stdout.trim()) {
+        resolve([]);
+        return;
+      }
+      const directChildren = stdout.trim().split('\n').map(p => parseInt(p, 10)).filter(p => !isNaN(p));
+
+      // Recursively get grandchildren in parallel (reduces race window for PID reparenting)
+      const grandchildrenArrays = await Promise.all(
+        directChildren.map(childPid => listDescendants(childPid, depth + 1))
+      );
+
+      // Result order: deepest descendants first, then work up to direct children
+      const allDescendants: number[] = [];
+      for (const arr of grandchildrenArrays) {
+        allDescendants.push(...arr);
+      }
+      allDescendants.push(...directChildren);
+      resolve(allDescendants);
+    });
+  });
+};
+
+const killPids = (pids: number[]): void => {
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Process may already be dead
+    }
+  }
+};
+
+/**
  * Kill a process tree to ensure all child/grandchild processes are terminated.
  * This is critical for MCP servers launched via wrappers like `npm run dev` or `npx`,
  * where the actual MCP server is a grandchild process.
@@ -41,71 +88,26 @@ const killProcessTree = async (pid: number): Promise<void> => {
         resolve();
       });
     });
-  } else {
-    // On Unix/macOS: recursively find all descendants and kill them leaf-first
-    // This ensures children don't get reparented before we can kill them
-    const getAllDescendants = (parentPid: number, depth = 0): Promise<number[]> => {
-      // Depth limit prevents infinite recursion in pathological cases
-      if (depth >= MAX_PROCESS_TREE_DEPTH) {
-        logger.warn("Process tree depth limit reached", { parentPid, depth, max: MAX_PROCESS_TREE_DEPTH });
-        return Promise.resolve([]);
-      }
-      
-      return new Promise((resolve) => {
-        // pgrep -P finds direct children; we recursively gather all descendants
-        exec(`pgrep -P ${parentPid} 2>/dev/null`, async (error, stdout) => {
-          if (error || !stdout.trim()) {
-            resolve([]);
-            return;
-          }
-          const directChildren = stdout.trim().split('\n').map(p => parseInt(p, 10)).filter(p => !isNaN(p));
-          
-          // Recursively get grandchildren in parallel (reduces race window for PID reparenting)
-          const grandchildrenArrays = await Promise.all(
-            directChildren.map(childPid => getAllDescendants(childPid, depth + 1))
-          );
-          
-          // Flatten grandchildren arrays, then append direct children
-          // Result order: deepest descendants first, then work up to direct children
-          const allDescendants: number[] = [];
-          for (const arr of grandchildrenArrays) {
-            allDescendants.push(...arr);
-          }
-          allDescendants.push(...directChildren);
-          resolve(allDescendants);
-        });
-      });
-    };
-    
-    try {
-      // Get all descendants (leaves first)
-      const descendants = await getAllDescendants(pid);
-      
-      // Kill all descendants (leaves first, then work up to direct children)
-      for (const descendantPid of descendants) {
-        try {
-          process.kill(descendantPid, "SIGKILL");
-        } catch {
-          // Process may already be dead
-        }
-      }
-      
-      // Finally kill the root process
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // Process may already be dead
-      }
-    } catch {
-      // Best effort - if anything fails, still try to kill the root
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // Ignore
-      }
-    }
   }
+  // Kill all descendants leaves first, then the root.
+  killPids([...(await listDescendants(pid)), pid]);
 };
+
+/**
+ * How long a connector gets to exit by itself once its stdin is closed (the
+ * MCP stdio stop order), so it can tidy up helpers it started, before its
+ * process tree is killed. Connectors close in parallel when the router stops,
+ * and the host gives the router 2 s to stop.
+ */
+export const CLEAN_STOP_GRACE_MS = 1000;
+
+/**
+ * Experimental capability a server declares in its initialize result when it
+ * holds state that must live until the host stops (e.g. a browser it opened).
+ * Once such a server has served a tool call, the idle reaper leaves it running;
+ * it is still stopped, cleanly, on restart and at shutdown.
+ */
+export const KEEP_ALIVE_CAPABILITY = "super-mcp/keep-alive";
 
 // STDIO transport uses a single stdin/stdout pipe, so requests must be serialized
 // to avoid race conditions and "stream busy" errors documented in:
@@ -454,6 +456,8 @@ export class StdioMcpClient implements McpClient {
   // invocation, precomputed at spawn for narrow startup-diagnostic redaction.
   private filesystemSensitiveRoots: string[] = [];
   private warnedAboutAmbiguousFilesystemInvocation = false;
+  // Set once the connector has been asked to run a tool (see holdsLiveState).
+  private servedToolCall = false;
 
   constructor(packageId: string, config: PackageConfig) {
     this.packageId = packageId;
@@ -932,6 +936,7 @@ export class StdioMcpClient implements McpClient {
       queue_pending: this.requestQueue.pending,
     });
 
+    this.servedToolCall = true;
     return this.requestQueue.add(async () => {
       try {
         const response = await this.client.callTool({
@@ -976,16 +981,37 @@ export class StdioMcpClient implements McpClient {
       // Clear any pending requests in the queue
       this.requestQueue.clear();
       
-      // IMPORTANT: Kill the process tree BEFORE SDK close, while PPID linkage is still valid.
-      // The SDK's close() kills the spawned process, which causes children to be reparented
-      // to PID 1 on Unix, making pkill -P ineffective. We must kill descendants first.
+      // Read the tree first: once the connector exits, its children are
+      // re-parented and can no longer be found by parent pid.
+      const descendants = pid ? await listDescendants(pid) : [];
+
+      // The SDK's close ends the child's stdin at once, which is the MCP stdio
+      // stop order, then waits for it to exit. Give the connector a short grace
+      // to tidy up and exit by itself before killing what is left.
+      const sdkClose = this.client.close();
+      let graceTimer: NodeJS.Timeout | undefined;
+      const exitedInGrace = await Promise.race([
+        // A failed SDK close leaves the child's state unknown: kill the tree.
+        sdkClose.then(() => true, () => false),
+        new Promise<false>((resolve) => {
+          graceTimer = setTimeout(() => resolve(false), CLEAN_STOP_GRACE_MS);
+        }),
+      ]).finally(() => clearTimeout(graceTimer));
+
       if (pid) {
-        logger.debug("Killing process tree before SDK close (while PPID linkage is valid)", { package_id: this.packageId, pid });
-        await killProcessTree(pid);
+        if (!exitedInGrace) {
+          logger.debug("Connector did not exit within the clean-stop grace; killing its process tree", {
+            package_id: this.packageId,
+            pid,
+            grace_ms: CLEAN_STOP_GRACE_MS,
+          });
+          await killProcessTree(pid);
+        }
+        // Children the connector left behind, now re-parented.
+        killPids(descendants);
       }
-      
-      // Now let the SDK clean up (will detect process already exited)
-      await this.client.close();
+
+      await sdkClose;
 
       logger.info("Stdio MCP client closed", {
         package_id: this.packageId,
@@ -1057,6 +1083,18 @@ export class StdioMcpClient implements McpClient {
 
   hasPendingRequests(): boolean {
     return this.requestQueue.pending > 0 || this.requestQueue.size > 0;
+  }
+
+  /**
+   * True when the server declared KEEP_ALIVE_CAPABILITY and has been asked to
+   * run a tool, so it may hold live state (e.g. an open browser) that should
+   * last until the host stops. A server started only to list its tools holds
+   * none, so it can still be reaped when idle.
+   */
+  holdsLiveState(): boolean {
+    if (!this.servedToolCall) return false;
+    const experimental = this.client?.getServerCapabilities()?.experimental;
+    return experimental !== undefined && Object.hasOwn(experimental, KEEP_ALIVE_CAPABILITY);
   }
 
   /**
