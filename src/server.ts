@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import crypto from "node:crypto";
 import express from "express";
-import { DEFAULT_TOOL_TIMEOUT_MS, ERROR_CODES } from "./types.js";
+import { ERROR_CODES } from "./types.js";
 import { PackageRegistry } from "./registry.js";
 import { Catalog } from "./catalog.js";
 import { CatalogRefresher } from "./catalogRefresher.js";
@@ -1126,11 +1126,12 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       const sessions = new Map<string, SessionEntry>();
 
       const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
-      // Keep a session with an open tool call for the default 90-minute per-call
-      // limit (matching Rebel Core's TOOL_CALL_TIMEOUT) plus the idle limit.
-      // A cancelled call leaves its POST open with no response, so the open count
-      // alone would never drop.
-      const BUSY_SESSION_IDLE_TIMEOUT_MS = DEFAULT_TOOL_TIMEOUT_MS + SESSION_IDLE_TIMEOUT_MS;
+      // A session with an open tool call is kept until no client can still be
+      // waiting on it: 4 hours, above the default per-call limit (90 minutes) so
+      // a deployment that sets a longer SUPER_MCP_TOOL_TIMEOUT keeps its sessions,
+      // plus the idle limit. A cancelled call leaves its POST open with no
+      // response, so the open count alone would never drop.
+      const BUSY_SESSION_IDLE_TIMEOUT_MS = 4 * 60 * 60 * 1000 + SESSION_IDLE_TIMEOUT_MS;
       const GC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
       const gcInterval = setInterval(() => {

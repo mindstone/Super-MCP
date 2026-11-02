@@ -228,7 +228,7 @@ Create a `super-mcp-config.json` file:
 - `name`: Human-readable name for the package
 - `description`: Description of the package's capabilities
 - `visibility`: "default" or "hidden" (controls display in tool lists)
-- `timeout`: Tool execution timeout in milliseconds (default: 300000 = 5 minutes)
+- `timeout`: Tool execution timeout in milliseconds (default: 5400000 = 90 minutes)
 
 ### Environment Variable Expansion
 
@@ -257,7 +257,7 @@ This allows you to:
 
 > **See also**: [Timeout Configuration](docs/TIMEOUT_CONFIGURATION.md) for detailed timeout guide.
 
-Super MCP Router supports configurable timeouts for long-running tool executions. By default, tools timeout after 5 minutes (300,000ms), but you can customize this per-server or globally.
+Super MCP Router supports configurable timeouts for long-running tool executions. By default, tools time out after 90 minutes (5,400,000ms), but you can customize this per-server or globally.
 
 **Per-Server Timeout:**
 ```json
