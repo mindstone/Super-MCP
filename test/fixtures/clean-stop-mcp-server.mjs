@@ -4,6 +4,8 @@
 //                     that tidies up when stopped); declares keep-alive.
 //   mode "stubborn":  ignores stdin end and keeps running; spawns a child that
 //                     also keeps running and writes the child's pid to the marker.
+//   mode "orphaning": spawns a long-running child (pid to the marker), and on
+//                     stdin end exits at once, leaving the child behind.
 import { spawn } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -25,6 +27,11 @@ if (mode === 'tidy') {
     writeFileSync(marker, 'tidied');
     process.exit(0);
   });
+} else if (mode === 'orphaning') {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  child.unref();
+  writeFileSync(marker, String(child.pid));
+  process.stdin.on('end', () => process.exit(0));
 } else {
   const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
   writeFileSync(marker, String(child.pid));

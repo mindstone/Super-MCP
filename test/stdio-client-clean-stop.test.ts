@@ -26,7 +26,7 @@ function isAlive(pid: number): boolean {
   }
 }
 
-function makeClient(mode: 'tidy' | 'stubborn', marker: string): StdioMcpClient {
+function makeClient(mode: 'tidy' | 'stubborn' | 'orphaning', marker: string): StdioMcpClient {
   const config: PackageConfig = {
     id: `clean-stop-${mode}`,
     name: 'Clean stop fixture',
@@ -92,6 +92,27 @@ describe('StdioMcpClient clean stop', () => {
       expect(Date.now() - started).toBeGreaterThanOrEqual(CLEAN_STOP_GRACE_MS - 50);
       expect(isAlive(pid)).toBe(false);
       // SIGKILL delivery is asynchronous; allow the kernel a moment to reap.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(isAlive(childPid)).toBe(false);
+    },
+  );
+});
+
+describe('StdioMcpClient clean stop, children left behind', () => {
+  it.skipIf(process.platform === 'win32')(
+    'kills a child the connector leaves behind when it exits within the grace',
+    async () => {
+      const marker = path.join(dir, 'orphan-pid');
+      const client = makeClient('orphaning', marker);
+      await client.connect();
+      rootPid(client);
+      const childPid = Number(readFileSync(marker, 'utf8'));
+      strays.push(childPid);
+
+      const started = Date.now();
+      await client.close();
+      expect(Date.now() - started).toBeLessThan(CLEAN_STOP_GRACE_MS);
+
       await new Promise((resolve) => setTimeout(resolve, 100));
       expect(isAlive(childPid)).toBe(false);
     },
