@@ -2,6 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import type { McpClient, PackageConfig, PackageHome } from "../types.js";
+import { DEFAULT_TOOL_TIMEOUT_MS } from "../types.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
 
 export class PackageHomeClient implements McpClient {
@@ -58,7 +59,7 @@ export class PackageHomeClient implements McpClient {
   async callTool(name: string, args: unknown) {
     // No replay after dispatch, even if the response is lost.
     return this.request(() => this.client.callTool({ name, arguments: args as Record<string, unknown> }, undefined, {
-      timeout: this.config.timeout ?? Number(process.env.SUPER_MCP_TOOL_TIMEOUT || 14_400_000),
+      timeout: this.config.timeout ?? Number(process.env.SUPER_MCP_TOOL_TIMEOUT || DEFAULT_TOOL_TIMEOUT_MS),
     }));
   }
   async listResources() {
