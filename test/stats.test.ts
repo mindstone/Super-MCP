@@ -17,6 +17,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import express from "express";
 import type { AddressInfo } from "node:net";
+import { countRefreshRefusal, resetRefreshRefusalCountsForTests } from "../src/auth/refreshRefusals.js";
 import { PackageRegistry } from "../src/registry.js";
 import { registerHttpApiRoutes } from "../src/server.js";
 import type { McpClient, PackageConfig, SuperMcpConfig } from "../src/types.js";
@@ -144,11 +145,39 @@ async function startApiServer(
 
 afterEach(() => {
   vi.clearAllMocks();
+  vi.restoreAllMocks();
+  resetRefreshRefusalCountsForTests();
 });
 
 // ── Route shape tests ────────────────────────────────────────────────
 
 describe("GET /stats route shape", () => {
+  it("keeps process identity stable and exposes isolated refusal counters through the real route callback", () => {
+    const registry = createRegistry([stdioPackage("alpha"), stdioPackage("beta")]);
+    let stats!: express.RequestHandler;
+    const app = {
+      get: (route: string, ...handlers: express.RequestHandler[]) => {
+        if (route === "/stats") stats = handlers[handlers.length - 1];
+      },
+      post: vi.fn(),
+    } as unknown as express.Express;
+    registerHttpApiRoutes(app, { registry, catalog: { getPackageDiagnostics: () => undefined } as unknown as Catalog, dnsRebindingGuard: (_req, _res, next) => next() });
+    const json = vi.fn();
+    const read = () => {
+      stats({} as express.Request, { json } as unknown as express.Response, vi.fn());
+      return json.mock.calls[json.mock.calls.length - 1][0];
+    };
+    const first = read();
+    expect(first.children.map((child: { refresh_refused_count: number }) => child.refresh_refused_count)).toEqual([0, 0]);
+    countRefreshRefusal("alpha"); countRefreshRefusal("alpha");
+    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 10_000);
+    const next = read();
+    expect(next.router.started_at).toBe(first.router.started_at);
+    expect(next.router.pid).toBe(first.router.pid);
+    expect(next.children.map((child: { refresh_refused_count: number }) => child.refresh_refused_count)).toEqual([2, 0]);
+    expect(read().children[0].refresh_refused_count).toBe(2);
+  });
+
   it("includes catalog degradation diagnostics in each child snapshot", () => {
     const registry = createRegistry([stdioPackage("alpha")]);
     const catalog = {
@@ -193,6 +222,11 @@ describe("GET /stats route shape", () => {
       expect(body.router.uptime_ms).toBeGreaterThanOrEqual(0);
       expect(typeof body.router.started_at).toBe("string");
       // ISO-8601 shape.
+      // A wall-clock adjustment must not change this process identity.
+      const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 10_000);
+      const next = await (await fetch(`${server.baseUrl}/stats`)).json();
+      clock.mockRestore();
+      expect(next.router.started_at).toBe(body.router.started_at);
       expect(body.router.started_at).toMatch(/^\d{4}-\d{2}-\d{2}T.*Z$/);
 
       expect(Array.isArray(body.children)).toBe(true);
@@ -216,6 +250,7 @@ describe("GET /stats route shape", () => {
         connected: false,
         pending_requests: false,
         spawn_count: 0,
+        refresh_refused_count: 0,
         reap_count: 0,
         eviction_count: 0,
         connect_retry_count: 0,
