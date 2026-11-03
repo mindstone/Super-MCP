@@ -301,13 +301,19 @@ function createResponseNormalizingFetch(
       // Failed rotations clear tokens before throwing; leave those on the sign-in path.
       if (refreshOnly && isRefresh && (await refreshProvider.tokens())?.refresh_token) {
         const cause = error !== null && typeof error === "object"
-          ? error as { name?: unknown; code?: unknown }
+          ? error as { name?: unknown; code?: unknown; cause?: unknown }
           : undefined;
+        const nestedCause = cause?.cause !== null && typeof cause?.cause === "object"
+          ? cause.cause as { code?: unknown }
+          : undefined;
+        const code = typeof cause?.code === "string" || typeof cause?.code === "number"
+          ? cause.code
+          : nestedCause?.code;
         logger.warn("OAuth refresh temporarily unavailable", {
           package_id: refreshProvider.getPackageId(),
           name: typeof cause?.name === "string" ? cause.name.slice(0, 80).replace(/[\r\n]/g, " ") : undefined,
-          code: typeof cause?.code === "string" || typeof cause?.code === "number"
-            ? String(cause.code).slice(0, 80).replace(/[\r\n]/g, " ")
+          code: typeof code === "string" || typeof code === "number"
+            ? String(code).slice(0, 80).replace(/[\r\n]/g, " ")
             : undefined,
         });
         const temporaryError = new TemporarilyUnavailableError(REFRESH_TEMPORARILY_UNAVAILABLE_MESSAGE);
@@ -874,7 +880,7 @@ export class HttpMcpClient implements McpClient {
       if (this.isAuthLikeErrorMessage(errorMessage)) {
         logger.error("Authentication required for MCP server", {
           package_id: this.packageId,
-          error: oauthErrorLogText(error, errorMessage),
+          error: oauthErrorLogText(error, error instanceof Error ? error.name.slice(0, 80) : "unknown"),
           message: `Run 'authenticate(package_id: "${this.packageId}")' to connect`,
           oauth_configured: this.config.oauth === true,
           has_saved_tokens: this.useOAuth,
