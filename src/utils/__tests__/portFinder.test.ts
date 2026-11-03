@@ -74,38 +74,55 @@ describe("getOAuthCallbackRetryCandidates (REBEL-7F9 Stage 3)", () => {
 });
 
 describe("findAvailablePortFromCandidates", () => {
-  function occupy(port: number): Promise<net.Server> {
+  // Ports come from the OS (listen on 0), never fixed numbers: test files run
+  // in parallel and bind port 0 too, so the kernel can hand any fixed port in
+  // its 32768–60999 range to a sibling first.
+  function occupy(): Promise<{ server: net.Server; port: number }> {
     return new Promise((resolve, reject) => {
       const server = net.createServer();
       server.once("error", reject);
-      server.once("listening", () => resolve(server));
-      server.listen(port, "127.0.0.1");
+      server.once("listening", () => resolve({ server, port: (server.address() as net.AddressInfo).port }));
+      server.listen(0, "127.0.0.1");
     });
   }
 
+  function release(server: net.Server): Promise<void> {
+    return new Promise((resolve) => server.close(() => resolve()));
+  }
+
+  // Held together while picked, so the ports always differ.
+  async function freePorts(count: number): Promise<number[]> {
+    const held = [];
+    for (let i = 0; i < count; i++) held.push(await occupy());
+    await Promise.all(held.map(({ server }) => release(server)));
+    return held.map(({ port }) => port);
+  }
+
   it("returns the first candidate when free", async () => {
-    const port = await findAvailablePortFromCandidates([53173, 53174]);
-    expect(port).toBe(53173);
+    const [first, second] = await freePorts(2);
+    const port = await findAvailablePortFromCandidates([first, second]);
+    expect(port).toBe(first);
   });
 
   it("skips busy candidates and returns the next one in ORDER", async () => {
-    const blocker = await occupy(53175);
+    const blocker = await occupy();
     try {
-      const port = await findAvailablePortFromCandidates([53175, 53176, 53177]);
-      expect(port).toBe(53176);
+      const [next, after] = await freePorts(2);
+      const port = await findAvailablePortFromCandidates([blocker.port, next, after]);
+      expect(port).toBe(next);
     } finally {
-      await new Promise((resolve) => blocker.close(resolve));
+      await release(blocker.server);
     }
   });
 
   it("throws when every candidate is busy", async () => {
-    const blocker = await occupy(53178);
+    const blocker = await occupy();
     try {
-      await expect(findAvailablePortFromCandidates([53178])).rejects.toThrow(
+      await expect(findAvailablePortFromCandidates([blocker.port])).rejects.toThrow(
         /No available port/,
       );
     } finally {
-      await new Promise((resolve) => blocker.close(resolve));
+      await release(blocker.server);
     }
   });
 
