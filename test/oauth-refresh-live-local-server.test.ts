@@ -329,6 +329,40 @@ describe("OAuth refresh over a real local authorization server", () => {
     return { server, registry, packageId, provider };
   }
 
+  it.each([
+    [undefined, "ECONNRESET", "ECONNRESET"],
+    ["ETIMEDOUT", "ECONNRESET", "ETIMEDOUT"],
+    [undefined, 42, "42"],
+    [undefined, `ECONNRESET\r\n${"x".repeat(100)}`, `ECONNRESET  ${"x".repeat(68)}`],
+  ])("bounds the refresh network warning code (top-level %s, cause %s)", async (code, nestedCode, expectedCode) => {
+    const packageId = "fictional-network-failure";
+    const provider = new SimpleOAuthProvider(packageId, 5173);
+    await provider.initialize();
+    await provider.saveTokens({ access_token: "fictional-old-access", refresh_token: "fictional-old-refresh", token_type: "Bearer", expires_in: 0 });
+    const canary = "fictional-acme-credential-canary";
+    const error = Object.assign(new TypeError(canary, {
+      cause: Object.assign(new Error(canary), { code: nestedCode }),
+    }), { code });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(error);
+    const client = new HttpMcpClient(packageId, oauthHttpPackage(packageId), { oauthProvider: provider });
+
+    try {
+      await (client as unknown as { initializeOAuthIfNeeded(): Promise<void> }).initializeOAuthIfNeeded();
+      const { fetch: wrappedFetch } = (client as unknown as { getTransportOptions(): { fetch: typeof fetch } }).getTransportOptions();
+      await expect(wrappedFetch("https://oauth.example.test/token", {
+        method: "POST", body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: "fictional-old-refresh" }),
+      })).rejects.toMatchObject({ name: "TemporarilyUnavailableError", cause: error });
+      expect(mockLogger.warn).toHaveBeenCalledWith("OAuth refresh temporarily unavailable", {
+        package_id: packageId, name: "TypeError", code: expectedCode,
+      });
+      expect(JSON.stringify(mockLogger.warn.mock.calls)).not.toContain(canary);
+      expect(await readDiskTokens(tempDir, packageId)).toMatchObject({ refresh_token: "fictional-old-refresh" });
+    } finally {
+      fetchSpy.mockRestore();
+      await client.close();
+    }
+  });
+
   it("keeps a temporary refresh failure transient and reconnects on the next attempt", async () => {
     const { server, registry, packageId } = await connectionFixture();
     const outcome = await registry.connectForCatalog(packageId);

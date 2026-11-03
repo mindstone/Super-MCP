@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SseError } from "@modelcontextprotocol/sdk/client/sse.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
 import { ErrorEvent } from "eventsource";
 import { exchangeAuthorization, parseErrorResponse, refreshAuthorization } from "@modelcontextprotocol/sdk/client/auth.js";
 import { CustomOAuthError, OAuthError, OAUTH_ERRORS } from "@modelcontextprotocol/sdk/server/auth/errors.js";
@@ -222,11 +223,34 @@ describe("SDK OAuth error logging", () => {
     }
   });
 
-  it.each(transportErrors)("bounds a %s without a numeric status", (_name, makeError) => {
+  it.each(transportErrors)("labels a %s without a positive numeric status", (name, makeError) => {
+    const expected = name === "SseError" ? "sse_no_status" : "http_no_status";
+    for (const code of [undefined, -1, 0, NaN, Infinity]) {
+      const error = makeError(code);
+      expect(oauthErrorLogText(error, error.message)).toBe(expected);
+    }
     const error = makeError(undefined);
-    expect(oauthErrorLogText(error, error.message)).toBe("unrecognized");
     Object.defineProperty(error, "code", { value: CREDENTIAL_CANARY });
-    expect(oauthErrorLogText(error, error.message)).toBe("unrecognized");
+    expect(oauthErrorLogText(error, error.message)).toBe(expected);
+  });
+
+  it.each([
+    new Error(`Error POSTing to endpoint (HTTP 401): ${CREDENTIAL_CANARY}`),
+    new McpError(ErrorCode.InternalError, `Unauthorized: ${CREDENTIAL_CANARY}`),
+  ])("logs only the error name for an auth-like $name through the HTTP client", async (error) => {
+    vi.spyOn(Client.prototype, "connect").mockRejectedValue(error);
+    const client = new HttpMcpClient(config.id, { ...config, oauth: false });
+
+    try {
+      await expect(client.connect()).rejects.toMatchObject({ name: "UnauthorizedError" });
+      expect(logger.error).toHaveBeenCalledWith("Authentication required for MCP server", expect.objectContaining({
+        package_id: config.id, error: error.name,
+      }));
+      expect(error.message).toContain(CREDENTIAL_CANARY);
+      expectSafeLogs();
+    } finally {
+      await client.close();
+    }
   });
 
   it("redacts a provider's raw transport response through the real HTTP client", async () => {
