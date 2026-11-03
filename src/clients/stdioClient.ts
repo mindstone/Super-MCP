@@ -3,6 +3,7 @@ import { exec } from "child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { getWorkspacePath } from "../forwardedFiles.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import PQueue from "p-queue";
 import { DEFAULT_TOOL_TIMEOUT_MS, McpClient, PackageConfig, ReadResourceResult } from "../types.js";
@@ -656,9 +657,7 @@ export class StdioMcpClient implements McpClient {
     // superMcpHttpManager.ts and cloud-service/src/bootstrap.ts when
     // coreDirectory is unset) falls through to MCP_WORKSPACE_PATH rather
     // than short-circuiting.
-    const rebelTrimmed = process.env.REBEL_WORKSPACE_PATH?.trim();
-    const mcpTrimmed = process.env.MCP_WORKSPACE_PATH?.trim();
-    const workspacePath = rebelTrimmed || mcpTrimmed || undefined;
+    const workspacePath = getWorkspacePath();
 
     let mergedEnv: Record<string, string> | undefined = this.config.env;
     if (workspacePath) {

@@ -3,8 +3,9 @@ import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSche
 import type { PackageRegistry } from "./registry.js";
 import { assertToolAccess } from "./toolAccess.js";
 import { getSecurityPolicy } from "./security.js";
+import { getWorkspacePath, runWithForwardedFiles } from "./forwardedFiles.js";
 
-export function createPackageServer(registry: PackageRegistry, packageId: string): Server {
+export function createPackageServer(registry: PackageRegistry, packageId: string, workspacePath = getWorkspacePath()): Server {
   const server = new Server({ name: "super-mcp-package", version: "1.0.0" }, { capabilities: { tools: {}, resources: {} } });
   const allowed = (name: string) => {
     const policy = getSecurityPolicy();
@@ -22,7 +23,7 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
   server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
     try {
       assertToolAccess(registry, packageId, params.name);
-      return await registry.callTool(packageId, params.name, params.arguments ?? {});
+      return await runWithForwardedFiles(params.arguments ?? {}, params._meta?.["rebel/forwardedFiles"], args => registry.callTool(packageId, params.name, args), workspacePath, registry.getPackage(packageId)?.name ?? packageId);
     } catch (error) {
       return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String((error as { message?: string }).message ?? error) }] };
     }
