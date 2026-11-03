@@ -65,7 +65,7 @@ Passive discovery (`list_tool_packages`, `list_tools`, `get_tool_details`, `sear
 
 `GET /api/tools` is immediate unless the caller supplies `wait_for_snapshot_ms`. That option races the refresher's current-generation readiness promise against the requested bounded wait. A timeout returns `snapshot_complete: false` plus `degraded_packages`; it does not convert an incomplete snapshot into success.
 
-Every catalog status transition logs `package_id`, `from`, `to`, `reason`, `consecutive_failures`, `next_retry_at`, and `generation`. `/stats` exposes the matching degradation diagnostics for each child. A 500 ms watchdog emits `discovery_watchdog_exceeded` if a passive discovery handler crosses its latency budget.
+Every catalog status transition logs `package_id`, `from`, `to`, `reason`, `consecutive_failures`, `next_retry_at`, and `generation`. `/stats` exposes the matching degradation diagnostics for each child. Each child also exposes `refresh_refused_count`, counting confirmed `invalid_grant` answers after bounded peer recovery fails since this router process started; `router.started_at` stays stable across reads so hosts can recognize a counter reset on restart. See `src/auth/refreshRefusals.ts`. A 500 ms watchdog emits `discovery_watchdog_exceeded` if a passive discovery handler crosses its latency budget.
 
 Explicit execution paths remain allowed to connect within their own bounds. For example, when Claude calls `use_tool(package_id, tool_id, args)`, the following flow occurs:
 

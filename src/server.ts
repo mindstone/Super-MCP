@@ -222,6 +222,8 @@ async function waitForCurrentSnapshot(
   }
 }
 
+const routerStartedAt = new Date(Date.now() - process.uptime() * 1000).toISOString();
+
 /**
  * POST /api/shutdown: the same clean shutdown as SIGTERM, for a host that has
  * no catchable SIGTERM to send (Windows, where Node's kill() terminates the
@@ -524,13 +526,12 @@ export function registerHttpApiRoutes(
   // using the PIDs returned in `children[].pid`.
   app.get("/stats", dnsRebindingGuard, (_req, res) => {
     try {
-      const startedAt = new Date(Date.now() - process.uptime() * 1000).toISOString();
       res.json({
         router: {
           running: true,
           pid: process.pid,
           uptime_ms: Math.round(process.uptime() * 1000),
-          started_at: startedAt,
+          started_at: routerStartedAt,
           // Stage 4b S3 refinement: start_count/restart_count are always
           // 1/0 at the router level; super-mcp itself doesn't self-restart.
           // Rebel-side restart count lives on

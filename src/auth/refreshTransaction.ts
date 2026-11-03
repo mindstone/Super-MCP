@@ -1,3 +1,4 @@
+import { countRefreshRefusal } from "./refreshRefusals.js";
 import * as fs from "fs/promises";
 import { OAuthTokensSchema } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { getLogger } from "../logging.js";
@@ -475,6 +476,7 @@ export async function runRefreshTransaction(
       disk_matches_presented: refreshTokenToSend === finalDisk?.refresh_token,
       ...oauthErrorLogFields(summary),
     });
+    countRefreshRefusal(packageId);
     await provider.clearTokensAndMarkNeedsReconnect(summary);
     return response;
   });
