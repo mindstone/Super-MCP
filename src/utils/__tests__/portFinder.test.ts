@@ -90,23 +90,25 @@ describe("findAvailablePortFromCandidates", () => {
     return new Promise((resolve) => server.close(() => resolve()));
   }
 
-  async function freePort(): Promise<number> {
-    const { server, port } = await occupy();
-    await release(server);
-    return port;
+  // Held together while picked, so the ports always differ.
+  async function freePorts(count: number): Promise<number[]> {
+    const held = [];
+    for (let i = 0; i < count; i++) held.push(await occupy());
+    await Promise.all(held.map(({ server }) => release(server)));
+    return held.map(({ port }) => port);
   }
 
   it("returns the first candidate when free", async () => {
-    const first = await freePort();
-    const port = await findAvailablePortFromCandidates([first, await freePort()]);
+    const [first, second] = await freePorts(2);
+    const port = await findAvailablePortFromCandidates([first, second]);
     expect(port).toBe(first);
   });
 
   it("skips busy candidates and returns the next one in ORDER", async () => {
     const blocker = await occupy();
     try {
-      const next = await freePort();
-      const port = await findAvailablePortFromCandidates([blocker.port, next, await freePort()]);
+      const [next, after] = await freePorts(2);
+      const port = await findAvailablePortFromCandidates([blocker.port, next, after]);
       expect(port).toBe(next);
     } finally {
       await release(blocker.server);
