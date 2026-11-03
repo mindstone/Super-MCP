@@ -4,6 +4,8 @@ import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import type { McpClient, PackageConfig, PackageHome } from "../types.js";
 import { DEFAULT_TOOL_TIMEOUT_MS } from "../types.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
+import { collectForwardedFiles, forwardedFilesTooLargeMessage } from "../forwardedFiles.js";
+import { getLogger } from "../logging.js";
 
 export class PackageHomeClient implements McpClient {
   private client = new Client(getMcpClientInfo());
@@ -21,6 +23,7 @@ export class PackageHomeClient implements McpClient {
     try {
       return await run();
     } catch (error) {
+      if (error instanceof StreamableHTTPError && error.code === 413) throw new Error(`Rebel couldn't send that to ${this.config.name}, so nothing was sent. An update may be finishing, which needs nothing from you; try again in a few minutes.`, { cause: error });
       if (error instanceof StreamableHTTPError && (error.code === 401 || error.code === 404)) {
         this.connected = false;
         if (error.code === 401) throw new Error("Rebel couldn't reach your cloud with its current sign-in. It'll retry automatically.", { cause: error });
@@ -57,8 +60,15 @@ export class PackageHomeClient implements McpClient {
     return this.request(async () => (await this.client.listTools()).tools);
   }
   async callTool(name: string, args: unknown) {
+    const { files, bytes, tooLarge } = await collectForwardedFiles(args);
+    if (files.length || tooLarge) getLogger().info("Forwarded connector files", {
+      package_id: this.config.id, tool_id: name, files: files.length + (tooLarge ? 1 : 0), bytes, outcome: tooLarge ? "too_large" : "attached",
+    });
+    if (tooLarge) return { isError: true, content: [{ type: "text" as const, text: forwardedFilesTooLargeMessage(bytes, this.config.name) }] };
     // No replay after dispatch, even if the response is lost.
-    return this.request(() => this.client.callTool({ name, arguments: args as Record<string, unknown> }, undefined, {
+    return this.request(() => this.client.callTool({ name, arguments: args as Record<string, unknown>,
+      ...(files.length ? { _meta: { "rebel/forwardedFiles": files } } : {}),
+    }, undefined, {
       timeout: this.config.timeout ?? Number(process.env.SUPER_MCP_TOOL_TIMEOUT || DEFAULT_TOOL_TIMEOUT_MS),
     }));
   }
