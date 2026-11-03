@@ -4,6 +4,7 @@ import type { PackageRegistry } from "./registry.js";
 import { assertToolAccess } from "./toolAccess.js";
 import { getSecurityPolicy } from "./security.js";
 import { getWorkspacePath, runWithForwardedFiles } from "./forwardedFiles.js";
+import { ERROR_CODES } from "./types.js";
 
 export function createPackageServer(registry: PackageRegistry, packageId: string, workspacePath = getWorkspacePath()): Server {
   const server = new Server({ name: "super-mcp-package", version: "1.0.0" }, { capabilities: { tools: {}, resources: {} } });
@@ -11,7 +12,16 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
     const policy = getSecurityPolicy();
     return !policy.isToolBlocked(packageId, name, false).blocked && !policy.isAdminDisabled(registry.getPackage(packageId)?.catalogId, name) && !policy.isUserDisabled(packageId, name);
   };
-  const tools = async () => (await registry.getClient(packageId)).listTools();
+  const errorText = (error: unknown) => error instanceof Error ? error.message : String((error as { message?: string }).message ?? error);
+  // The registry knows this state; keep the words for older clients while carrying the type.
+  const withSignInState = async (error: unknown): Promise<unknown> =>
+    (await registry.connectForCatalog(packageId)).kind === "auth_required"
+      ? Object.assign(new Error(errorText(error)), { code: ERROR_CODES.AUTH_REQUIRED, data: { package_id: packageId, status: "auth_required" } })
+      : error;
+  const tools = async () => {
+    try { return await (await registry.getClient(packageId)).listTools(); }
+    catch (error) { throw await withSignInState(error); }
+  };
   const resourceAllowed = (uri: string, toolList: Awaited<ReturnType<typeof tools>>) => {
     const owners = toolList.filter(tool => tool._meta?.ui?.resourceUri === uri);
     return owners.length === 0 || owners.some(tool => allowed(tool.name));
@@ -23,9 +33,15 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
   server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
     try {
       assertToolAccess(registry, packageId, params.name);
+    } catch (error) {
+      return { isError: true, content: [{ type: "text", text: errorText(error) }] };
+    }
+    try {
       return await runWithForwardedFiles(params.arguments ?? {}, params._meta?.["rebel/forwardedFiles"], args => registry.callTool(packageId, params.name, args), workspacePath, registry.getPackage(packageId)?.name ?? packageId);
     } catch (error) {
-      return { isError: true, content: [{ type: "text", text: error instanceof Error ? error.message : String((error as { message?: string }).message ?? error) }] };
+      const typed = await withSignInState(error);
+      if (typed !== error) throw typed;
+      return { isError: true, content: [{ type: "text", text: errorText(error) }] };
     }
   });
   server.setRequestHandler(ListResourcesRequestSchema, async () => {

@@ -1,3 +1,4 @@
+import { getRefreshRefusalCount, resetRefreshRefusalCountsForTests } from "../src/auth/refreshRefusals.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as fs from "fs/promises";
 import * as os from "os";
@@ -211,6 +212,7 @@ describe("OAuth refresh-token rotation race (red harness)", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    resetRefreshRefusalCountsForTests();
     savedFetch = globalThis.fetch;
     previousTokenDir = process.env[ENV_KEY];
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "super-mcp-oauth-race-"));
@@ -283,6 +285,7 @@ describe("OAuth refresh-token rotation race (red harness)", () => {
 
     // Exactly one rotation should ever be consumed against the server.
     expect(endpoint.successCount()).toBe(1);
+    expect(getRefreshRefusalCount(packageId)).toBe(0);
 
     // Both processes should converge on the latest on-disk refresh token.
     const disk = await readDiskTokens(tempDir, packageId);
@@ -414,6 +417,7 @@ describe("OAuth refresh-token rotation race (red harness)", () => {
     const out = await runSdkRefreshCycle(a.provider, a.wrappedFetch, { refreshOnly: true });
     expect(out.ok).toBe(false);
     expect(out.invalidGrant).toBe(true);
+    expect(getRefreshRefusalCount(packageId)).toBe(1);
 
     const tokenFile = path.join(tempDir, `${packageId}_tokens.json`);
     const reconnectMarker = path.join(tempDir, `${packageId}_needsReconnect.json`);
@@ -547,6 +551,7 @@ describe("OAuth refresh-token rotation race (red harness)", () => {
     // Despite N contenders replaying the same single-use seed, exactly one
     // rotation is consumed against the server — the rest short-circuit.
     expect(endpoint.successCount()).toBe(1);
+    expect(getRefreshRefusalCount(packageId)).toBe(0);
 
     // Disk converges on the server's latest valid refresh token.
     const disk = await readDiskTokens(tempDir, packageId);

@@ -66,6 +66,22 @@ afterEach(async () => {
 });
 
 describe("checkAndInvalidateOnPortMismatch — full-URI staleness", () => {
+  it("keeps a saved authorization-code-only registration and its tokens", async () => {
+    await writeClientFile({
+      client_id: "fictional-saved-client",
+      redirect_uris: ["http://localhost:5173/oauth/callback"],
+      grant_types: ["authorization_code"],
+    });
+    await writeTokenFile();
+    const provider = new SimpleOAuthProvider(PACKAGE_ID, 5173);
+    await provider.initialize();
+
+    expect(await provider.checkAndInvalidateOnPortMismatch()).toBe(false);
+    expect((await provider.clientInformation()).client_id).toBe("fictional-saved-client");
+    expect(await fileExists(clientFilePath())).toBe(true);
+    expect(await fileExists(tokenFilePath())).toBe(true);
+  });
+
   it("invalidates when the saved registration has the SAME PORT but a different path", async () => {
     await writeClientFile({
       client_id: "cid",

@@ -6,6 +6,8 @@ import { tmpdir } from 'node:os';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
 import { PackageRegistry } from '../src/registry.js';
+import { HttpMcpClient } from '../src/clients/httpClient.js';
+import { handleRestartPackage } from '../src/handlers/restartPackage.js';
 import { StdioMcpClient } from '../src/clients/stdioClient.js';
 import { createPackageServer } from '../src/packageEndpoint.js';
 import { Catalog } from '../src/catalog.js';
@@ -79,7 +81,72 @@ function desktop() {
   }));
 }
 
+async function signInHome() {
+  const dir = await mkdtemp(path.join(tmpdir(), 'homes-sign-in-'));
+  cleanup.push(() => rm(dir, { recursive: true, force: true }));
+  vi.stubEnv('SUPER_MCP_OAUTH_TOKEN_DIR', dir);
+  const cloud = keep(new PackageRegistry({ mcpServers: { notebook: { url: 'https://upstream.example.test/mcp', oauth: true, name: 'Fictional Notes' } } }));
+  harness(cloud);
+  const transport = globalThis.fetch;
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    if (new URL(request.url).hostname === 'upstream.example.test') return new Response('Unauthorized', { status: 401 });
+    return transport(input, init);
+  });
+  const registry = desktop();
+  const catalog = new Catalog(registry);
+  const refresher = new CatalogRefresher(catalog, registry);
+  cleanup.push(() => refresher.dispose());
+  return { cloud, registry, catalog, refresher };
+}
+
 describe('package homes over in-memory streamable HTTP', () => {
+  it('carries a cloud sign-in requirement into the desktop catalog and auth probe', async () => {
+    const { catalog, refresher } = await signInHome();
+    refresher.start();
+    await refresher.refreshNow('notebook', { forceReconnect: true, reason: 'explicit' });
+    expect(catalog.getPackageStatus('notebook')).toBe('auth_required');
+    expect(catalog.getRetryHint('notebook')).toMatchObject({ schedule: 'auth_probe', retryAt: expect.any(Number), retryInMs: expect.any(Number) });
+  });
+
+  it('preserves the not-connected words with a typed cloud sign-in requirement', async () => {
+    const { registry } = await signInHome();
+    const client = await registry.getClient('notebook');
+    await expect(client.listTools()).rejects.toMatchObject({ code: -33005, data: { package_id: 'notebook', status: 'auth_required' }, message: expect.stringContaining("Package 'notebook' is not connected") });
+  });
+
+  it('updates a ready desktop catalog after a typed cloud tool-call sign-in failure', async () => {
+    const { registry, catalog, refresher } = await signInHome();
+    catalog.commitReady('notebook', [rawTool], catalog.beginRefresh('notebook'));
+    expect(catalog.getPackageStatus('notebook')).toBe('ready');
+    refresher.start();
+    await expect(handleUseTool({ package_id: 'notebook', tool_id: 'write_note', args: { text: 'waiting' } }, registry, catalog, getValidator())).rejects.toMatchObject({ code: -33005, data: { package_id: 'notebook', status: 'auth_required' } });
+    await vi.waitFor(() => expect(catalog.getPackageStatus('notebook')).toBe('auth_required'));
+  });
+
+  it('keeps a connected upstream tool failure as a plain tool result', async () => {
+    const cloud = keep(new PackageRegistry({ mcpServers: { notebook: entry } }));
+    const upstream = await cloud.getClient('notebook');
+    harness(cloud);
+    vi.spyOn(upstream, 'callTool').mockRejectedValue(new Error('boom'));
+    const registry = desktop();
+    const catalog = new Catalog(registry);
+    await catalog.ensurePackageLoaded('notebook');
+    expect(await (await registry.getClient('notebook')).callTool('write_note', { text: 'failed' })).toMatchObject({ isError: true, content: [{ type: 'text', text: 'boom' }] });
+    expect(catalog.getPackageStatus('notebook')).toBe('ready');
+  });
+
+  it('restarts both routers after sign-in and refreshes ready without a timer advance', async () => {
+    const { cloud, registry, catalog, refresher } = await signInHome();
+    refresher.start();
+    await refresher.refreshNow('notebook', { forceReconnect: true, reason: 'explicit' });
+    vi.spyOn(HttpMcpClient.prototype, 'connect').mockImplementation(async function () { (this as any).isConnected = true; });
+    vi.spyOn(HttpMcpClient.prototype, 'listTools').mockResolvedValue([rawTool]);
+    expect(await handleRestartPackage({ package_id: 'notebook' }, cloud, new Catalog(cloud))).toMatchObject({ isError: false });
+    expect(await handleRestartPackage({ package_id: 'notebook' }, registry, catalog, refresher)).toMatchObject({ isError: false });
+    expect(catalog.getPackageStatus('notebook')).toBe('ready');
+  });
+
   it('round-trips tools and MCP Apps through two real registries with raw metadata', async () => {
     const cloud = keep(new PackageRegistry({ mcpServers: { notebook: entry } }));
     const { requests } = harness(cloud);

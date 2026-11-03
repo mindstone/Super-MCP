@@ -5,10 +5,12 @@ import * as path from "path";
 import http from "node:http";
 import { randomBytes } from "node:crypto";
 
-import { refreshAuthorization } from "@modelcontextprotocol/sdk/client/auth.js";
+import { auth, refreshAuthorization } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { AuthorizationServerMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
-import { InvalidGrantError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import { InvalidGrantError, TemporarilyUnavailableError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 
+import { PackageRegistry } from "../src/registry.js";
+import { isAuthLikeErrorMessageText } from "../src/auth/authLikeVocabulary.js";
 import { HttpMcpClient } from "../src/clients/httpClient.js";
 import { SimpleOAuthProvider } from "../src/auth/providers/simple.js";
 import { RefreshOnlyOAuthProvider } from "../src/auth/providers/refreshOnly.js";
@@ -146,6 +148,62 @@ async function startLocalAuthServer(
   };
 }
 
+async function startConnectionServer() {
+  let tokenStatus = 503;
+  let tokenError = "server_error";
+  let refreshRequests = 0;
+  let baseUrl = "";
+  const metadata = () => ({ issuer: baseUrl, authorization_endpoint: `${baseUrl}/authorize`, token_endpoint: `${baseUrl}/token`, response_types_supported: ["code"], token_endpoint_auth_methods_supported: ["none"] });
+  const server = http.createServer((req, res) => {
+    const json = (status: number, body: unknown) => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    if (req.url?.includes("oauth-protected-resource")) {
+      json(200, { resource: `${baseUrl}/mcp`, authorization_servers: [baseUrl] });
+      return;
+    }
+    if (req.url?.includes(".well-known")) { json(200, metadata()); return; }
+    if (req.url === "/token") {
+      refreshRequests++;
+      req.resume();
+      json(tokenStatus, tokenStatus === 200
+        ? { access_token: "fictional-new-access", refresh_token: "fictional-new-refresh", token_type: "Bearer", expires_in: 3600 }
+        : { error: tokenError });
+      return;
+    }
+    if (req.headers.authorization !== "Bearer fictional-new-access") {
+      res.writeHead(401, { "WWW-Authenticate": `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource/mcp"` });
+      res.end("Unauthorized");
+      return;
+    }
+    if (req.method !== "POST") { res.writeHead(405); res.end(); return; }
+    let body = "";
+    req.on("data", chunk => { body += chunk; });
+    req.on("end", () => {
+      const message = JSON.parse(body);
+      if (message.id === undefined) { res.writeHead(202); res.end(); return; }
+      const result = message.method === "initialize"
+        ? { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "fictional-notebook", version: "1.0.0" } }
+        : { tools: [] };
+      json(200, { jsonrpc: "2.0", id: message.id, result });
+    });
+  });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Could not start the fictional service");
+  baseUrl = `http://127.0.0.1:${address.port}`;
+  return {
+    baseUrl,
+    setTokenStatus: (status: number, error = status === 400 ? "invalid_grant" : "server_error") => {
+      tokenStatus = status;
+      tokenError = error;
+    },
+    refreshRequests: () => refreshRequests,
+    close: () => new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }),
+  };
+}
+
 function oauthHttpPackage(id: string): PackageConfig {
   return {
     id,
@@ -235,7 +293,8 @@ async function readDiskTokens(tempDir: string, packageId: string): Promise<{ ref
 describe("OAuth refresh over a real local authorization server", () => {
   let tempDir: string;
   let previousTokenDir: string | undefined;
-  let servers: LocalAuthServer[] = [];
+  let servers: Array<{ close(): Promise<void> }> = [];
+  let registries: PackageRegistry[] = [];
 
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -243,9 +302,11 @@ describe("OAuth refresh over a real local authorization server", () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "super-mcp-oauth-live-"));
     process.env[ENV_KEY] = tempDir;
     servers = [];
+    registries = [];
   });
 
   afterEach(async () => {
+    await Promise.all(registries.map(registry => registry.closeAll()));
     await Promise.all(servers.map((s) => s.close()));
     if (previousTokenDir === undefined) {
       delete process.env[ENV_KEY];
@@ -253,6 +314,158 @@ describe("OAuth refresh over a real local authorization server", () => {
       process.env[ENV_KEY] = previousTokenDir;
     }
     await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  async function connectionFixture(issuerMismatch = false) {
+    const server = await startConnectionServer();
+    servers.push(server);
+    const packageId = "fictional-notebook";
+    const provider = new SimpleOAuthProvider(packageId, 5173);
+    await provider.initialize();
+    await provider.saveClientInformation({ client_id: "fictional-client", redirect_uris: [provider.redirectUrl], issuer: server.baseUrl });
+    await provider.saveTokens({ access_token: "fictional-old-access", refresh_token: "fictional-old-refresh", token_type: "Bearer", expires_in: 0, issuer: issuerMismatch ? "https://other.example.test" : server.baseUrl });
+    const registry = new PackageRegistry({ mcpServers: { [packageId]: { url: `${server.baseUrl}/mcp`, oauth: true, name: "Fictional Notes" } } });
+    registries.push(registry);
+    return { server, registry, packageId, provider };
+  }
+
+  it.each([
+    [undefined, "ECONNRESET", "ECONNRESET"],
+    ["ETIMEDOUT", "ECONNRESET", "ETIMEDOUT"],
+    [undefined, 42, "42"],
+    [undefined, `ECONNRESET\r\n${"x".repeat(100)}`, `ECONNRESET  ${"x".repeat(68)}`],
+  ])("bounds the refresh network warning code (top-level %s, cause %s)", async (code, nestedCode, expectedCode) => {
+    const packageId = "fictional-network-failure";
+    const provider = new SimpleOAuthProvider(packageId, 5173);
+    await provider.initialize();
+    await provider.saveTokens({ access_token: "fictional-old-access", refresh_token: "fictional-old-refresh", token_type: "Bearer", expires_in: 0 });
+    const canary = "fictional-acme-credential-canary";
+    const error = Object.assign(new TypeError(canary, {
+      cause: Object.assign(new Error(canary), { code: nestedCode }),
+    }), { code });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(error);
+    const client = new HttpMcpClient(packageId, oauthHttpPackage(packageId), { oauthProvider: provider });
+
+    try {
+      await (client as unknown as { initializeOAuthIfNeeded(): Promise<void> }).initializeOAuthIfNeeded();
+      const { fetch: wrappedFetch } = (client as unknown as { getTransportOptions(): { fetch: typeof fetch } }).getTransportOptions();
+      await expect(wrappedFetch("https://oauth.example.test/token", {
+        method: "POST", body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: "fictional-old-refresh" }),
+      })).rejects.toMatchObject({ name: "TemporarilyUnavailableError", cause: error });
+      expect(mockLogger.warn).toHaveBeenCalledWith("OAuth refresh temporarily unavailable", {
+        package_id: packageId, name: "TypeError", code: expectedCode,
+      });
+      expect(JSON.stringify(mockLogger.warn.mock.calls)).not.toContain(canary);
+      expect(await readDiskTokens(tempDir, packageId)).toMatchObject({ refresh_token: "fictional-old-refresh" });
+    } finally {
+      fetchSpy.mockRestore();
+      await client.close();
+    }
+  });
+
+  it("keeps a temporary refresh failure transient and reconnects on the next attempt", async () => {
+    const { server, registry, packageId } = await connectionFixture();
+    const outcome = await registry.connectForCatalog(packageId);
+    expect(server.refreshRequests()).toBeGreaterThan(0);
+    expect(outcome.kind).toBe("transient_failure");
+    expect(mockLogger.warn).toHaveBeenCalledWith("OAuth refresh temporarily unavailable", { package_id: packageId, status: 503 });
+    if (outcome.kind !== "transient_failure") throw new Error("Expected a temporary connection failure");
+    const message = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+    const sentence = "This connector's service didn't respond just now. It'll retry automatically.";
+    expect(message).toContain(sentence);
+    expect(isAuthLikeErrorMessageText(message)).toBe(false);
+    expect(sentence.toLowerCase()).not.toMatch(/authentication required|unauthorized|401|invalid_token|oauth|authorization/);
+    expect(await readDiskTokens(tempDir, packageId)).toMatchObject({ refresh_token: "fictional-old-refresh" });
+    expect(await SimpleOAuthProvider.readNeedsReconnectMarkerState(packageId)).toEqual({ state: "absent" });
+    server.setTokenStatus(200);
+    expect(await registry.connectForCatalog(packageId)).toMatchObject({ kind: "connected" });
+    expect(await readDiskTokens(tempDir, packageId)).toMatchObject({ refresh_token: "fictional-new-refresh" });
+  });
+
+  it("falls through to browser sign-in after a temporary refresh failure during unforced explicit sign-in", async () => {
+    const { server, packageId, provider } = await connectionFixture();
+    const client = new HttpMcpClient(packageId, {
+      ...oauthHttpPackage(packageId), base_url: `${server.baseUrl}/mcp`,
+    }, { oauthProvider: provider });
+    await (client as unknown as { initializeOAuthIfNeeded(f: boolean): Promise<void> }).initializeOAuthIfNeeded(true);
+    const { fetch: wrappedFetch } = (client as unknown as { getTransportOptions(): { fetch: typeof fetch } }).getTransportOptions();
+    const redirect = vi.spyOn(provider, "redirectToAuthorization").mockResolvedValue();
+
+    // Keep the saved refresh token, as an explicit sign-in without force does.
+    expect(await auth(provider, { serverUrl: `${server.baseUrl}/mcp`, fetchFn: wrappedFetch })).toBe("REDIRECT");
+    expect(server.refreshRequests()).toBe(1);
+    expect(redirect).toHaveBeenCalledWith(expect.any(URL));
+    expect(await readDiskTokens(tempDir, packageId)).toMatchObject({ refresh_token: "fictional-old-refresh" });
+  });
+
+  it("keeps a dead grant as auth_required, removes tokens, and logs the cause", async () => {
+    const { server, registry, packageId } = await connectionFixture();
+    server.setTokenStatus(400);
+    expect(await registry.connectForCatalog(packageId)).toMatchObject({ kind: "auth_required" });
+    expect(server.refreshRequests()).toBeGreaterThan(0);
+    expect(await readDiskTokens(tempDir, packageId)).toBeUndefined();
+    expect(await SimpleOAuthProvider.readNeedsReconnectMarkerState(packageId)).toEqual({ state: "present" });
+    expect(mockLogger.error).toHaveBeenCalledWith("Authentication required for MCP server", expect.objectContaining({ package_id: packageId, error: expect.any(String) }));
+  });
+
+  it("requires sign-in for tokens from another issuer without attempting a refresh", async () => {
+    const { server, registry, packageId } = await connectionFixture(true);
+    expect(await registry.connectForCatalog(packageId)).toMatchObject({ kind: "auth_required" });
+    expect(server.refreshRequests()).toBe(0);
+  });
+
+  it("does not carry a temporary refresh failure across a success into an issuer mismatch", async () => {
+    const { server, registry, packageId, provider } = await connectionFixture();
+    const client = new HttpMcpClient(packageId, {
+      ...oauthHttpPackage(packageId), base_url: `${server.baseUrl}/mcp`,
+    }, { oauthProvider: provider });
+    await (client as unknown as { initializeOAuthIfNeeded(): Promise<void> }).initializeOAuthIfNeeded();
+    const { fetch: wrappedFetch } = (client as unknown as { getTransportOptions(): { fetch: typeof fetch } }).getTransportOptions();
+    const refreshOnly = new RefreshOnlyOAuthProvider(provider);
+    const options = { serverUrl: `${server.baseUrl}/mcp`, fetchFn: wrappedFetch };
+    const redirect = vi.spyOn(refreshOnly, "redirectToAuthorization");
+
+    // Reuse the same provider: replacing it between attempts would hide a stale flag.
+    server.setTokenStatus(503, "temporarily_unavailable");
+    const temporaryError = await auth(refreshOnly, options).catch(error => error);
+    expect(redirect).not.toHaveBeenCalled();
+    server.setTokenStatus(200);
+    expect(await auth(refreshOnly, options)).toBe("AUTHORIZED");
+    expect(await provider.tokens()).toMatchObject({ refresh_token: "fictional-new-refresh" });
+
+    await provider.saveTokens({ access_token: "fictional-other-access", refresh_token: "fictional-other-refresh", token_type: "Bearer", expires_in: 0, issuer: "https://other.example.test" });
+    const refreshCount = server.refreshRequests();
+    const mismatchError = await auth(refreshOnly, options).catch(error => error);
+    expect(mismatchError).toBeInstanceOf(Error);
+    expect(mismatchError.message).toContain("Authentication required");
+    expect(mismatchError.message).not.toMatch(/retry/i);
+    expect(redirect).toHaveBeenCalledTimes(1);
+    const outcome = await registry.connectForCatalog(packageId);
+    expect(outcome.kind).toBe("auth_required");
+    if (outcome.kind !== "auth_required") throw new Error("Expected sign-in for the other issuer");
+    expect(String(outcome.error)).not.toMatch(/retry/i);
+    expect(server.refreshRequests()).toBe(refreshCount);
+    expect(temporaryError).toBeInstanceOf(TemporarilyUnavailableError);
+    expect(temporaryError.message).toBe("This connector's service didn't respond just now. It'll retry automatically.");
+    expect(temporaryError.cause).toBeInstanceOf(Response);
+    expect(temporaryError.cause.status).toBe(503);
+    expect(isAuthLikeErrorMessageText(temporaryError.message)).toBe(false);
+  });
+
+  it("keeps a rate-limited refresh transient without clearing tokens", async () => {
+    const { server, registry, packageId } = await connectionFixture();
+    server.setTokenStatus(429, "too_many_requests");
+    const outcome = await registry.connectForCatalog(packageId);
+    expect(outcome.kind).toBe("transient_failure");
+    if (outcome.kind !== "transient_failure") throw new Error("Expected a temporary connection failure");
+    expect(outcome.error).toHaveProperty("cause", expect.any(TemporarilyUnavailableError));
+    const message = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
+    expect(message).toContain("This connector's service didn't respond just now. It'll retry automatically.");
+    expect(isAuthLikeErrorMessageText(message)).toBe(false);
+    expect(message.toLowerCase()).not.toMatch(/authentication required|unauthorized|401|invalid_token|oauth|authorization/);
+    expect(server.refreshRequests()).toBeGreaterThan(0);
+    expect(await readDiskTokens(tempDir, packageId)).toMatchObject({ refresh_token: "fictional-old-refresh" });
+    expect(await SimpleOAuthProvider.readNeedsReconnectMarkerState(packageId)).toEqual({ state: "absent" });
   });
 
   it("single refresh rotates and persists over a real socket", async () => {
