@@ -54,7 +54,10 @@ export class RefreshOnlyOAuthProvider implements OAuthClientProvider {
   }
   
   async redirectToAuthorization(_authUrl: URL): Promise<void> {
+    const tokens = await this.delegate.tokens();
     logger.info("OAuth browser redirect blocked (refresh-only mode)", {
+      package_id: this.delegate.getPackageId(),
+      has_refresh_token: !!tokens?.refresh_token,
       message: "Use authenticate() to sign in"
     });
     throw new Error("Authentication required. Use 'authenticate(package_id: \"...\")' to sign in.");

@@ -10,6 +10,11 @@ vi.mock("../logging.js", () => ({
 const KEYS = ["SUPER_MCP_APP_NAME", "SUPER_MCP_APP_URL", "SUPER_MCP_APP_LOGO_URL"] as const;
 
 describe("client identity", () => {
+  it("declares both grants for new registrations", () => {
+    expect(new SimpleOAuthProvider("fictional-notebook", 5173).clientMetadata.grant_types)
+      .toEqual(["authorization_code", "refresh_token"]);
+  });
+
   const saved: Record<string, string | undefined> = {};
 
   beforeEach(() => {

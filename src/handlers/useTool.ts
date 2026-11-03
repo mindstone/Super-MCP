@@ -13,6 +13,7 @@ import { Catalog } from "../catalog.js";
 import type { ValidationResult } from "../validator.js";
 import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { getLogger } from "../logging.js";
+import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
 import { assertToolAccess } from "../toolAccess.js";
 import { findBestMatch } from "../utils/fuzzyMatch.js";
 import { projectUnionErrors } from "./unionErrorProjection.js";
@@ -2460,7 +2461,17 @@ export async function handleUseTool(
 
     resetValidationAttempt(downstreamValidationAttemptKey);
     
-    if (registry.isPackageHomed?.(package_id)) throw error;
+    if (registry.isPackageHomed?.(package_id)) {
+      if ((error as { code?: unknown }).code === ERROR_CODES.AUTH_REQUIRED) {
+        void catalog.ensurePackageLoaded(package_id, { forceReconnect: true, reason: "explicit" }).catch((refreshError) => {
+          logger.warn("Failed to refresh package sign-in state", {
+            package_id,
+            error: oauthErrorLogText(refreshError, refreshError instanceof Error ? refreshError.message : String(refreshError)),
+          });
+        });
+      }
+      throw error;
+    }
     let diagnosticMessage = `Tool execution failed in package '${package_id}', tool '${tool_id}'.\n`;
     
     if (errorMessage.includes("not found") || errorMessage.includes("undefined")) {
