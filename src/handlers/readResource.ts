@@ -1,3 +1,4 @@
+import { setupIncompleteMessage } from "../utils/setupIncompleteMessage.js";
 import { ERROR_CODES, ReadResourceResult } from "../types.js";
 import { PackageRegistry } from "../registry.js";
 import { Catalog } from "../catalog.js";
@@ -65,7 +66,8 @@ export async function handleReadResource(
   if (packageStatus === "setup_incomplete") {
     throw {
       code: ERROR_CODES.PACKAGE_UNAVAILABLE,
-      message: `Package '${packageId}' is not set up on this instance. Signing in again will not fix it.`,
+      message: setupIncompleteMessage(packageId, catalog.getPackageError(packageId),
+        `Package '${packageId}' is not set up on this instance. Signing in again will not fix it.`),
       data: {
         package_id: packageId,
         status: packageStatus,

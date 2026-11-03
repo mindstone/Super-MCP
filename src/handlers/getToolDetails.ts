@@ -1,3 +1,4 @@
+import { setupIncompleteMessage } from "../utils/setupIncompleteMessage.js";
 import { ERROR_CODES, ToolInfo } from "../types.js";
 import type {
   CatalogRefreshScheduler,
@@ -216,7 +217,8 @@ export async function handleGetToolDetails(
           const description = packageStatus === "auth_required"
             ? `Package '${packageId}' requires authentication.`
             : packageStatus === "setup_incomplete"
-              ? `Package '${packageId}' is not set up on this instance (${setupReason || 'setup incomplete'}). Signing in again will not fix it.`
+              ? setupIncompleteMessage(packageId, setupReason,
+                `Package '${packageId}' is not set up on this instance (${setupReason || 'setup incomplete'}). Signing in again will not fix it.`)
               : packageStatus === "connecting"
                 ? `Package '${packageId}' catalog is still connecting.`
                 : `Package '${packageId}' is unavailable: ${setupReason || 'unknown error'}`;

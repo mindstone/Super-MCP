@@ -7,7 +7,7 @@ export interface StandardMcpConfig {
 
 // Wire contract mirrored by Rebel's src/shared/types/mcp.ts (MCP_SETUP_INCOMPLETE_REASONS).
 // Keep both reason lists in sync; Rebel's mcpSetupStatusContract.test.ts enforces parity.
-export const SETUP_INCOMPLETE_REASONS = ['missing_managed_credentials', 'cloud_reprovision_required'] as const;
+export const SETUP_INCOMPLETE_REASONS = ['missing_managed_credentials', 'cloud_reprovision_required', 'reconnect_required'] as const;
 export type SetupIncompleteReason = (typeof SETUP_INCOMPLETE_REASONS)[number];
 
 export interface PackageSetupStatus {

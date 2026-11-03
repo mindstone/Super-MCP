@@ -1,3 +1,4 @@
+import { setupIncompleteMessage } from "../utils/setupIncompleteMessage.js";
 import { once } from "node:events";
 import { createWriteStream } from "node:fs";
 import fs from "node:fs/promises";
@@ -820,7 +821,8 @@ async function validatePackageAvailable(packageId: string, catalog: Catalog): Pr
     return `Package '${packageId}' requires authentication. Run 'authenticate(package_id: "${packageId}")'.`;
   }
   if (packageStatus === "setup_incomplete") {
-    return `Package '${packageId}' is not set up on this instance. Signing in again will not fix it.`;
+    return setupIncompleteMessage(packageId, catalog.getPackageError(packageId),
+      `Package '${packageId}' is not set up on this instance. Signing in again will not fix it.`);
   }
   if (packageStatus === "error") {
     const reason = catalog.getPackageError(packageId) || "See logs for details";

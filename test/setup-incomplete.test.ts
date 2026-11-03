@@ -1,13 +1,22 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { Catalog } from '../src/catalog.js';
 import { handleGetToolDetails } from '../src/handlers/getToolDetails.js';
 import { handleListToolPackages } from '../src/handlers/listToolPackages.js';
 import { handleListTools } from '../src/handlers/listTools.js';
 import { PackageRegistry } from '../src/registry.js';
+import { handleUseTool } from '../src/handlers/useTool.js';
+import { handleReadResource } from '../src/handlers/readResource.js';
+import { handleBulkExport } from '../src/handlers/bulkExport.js';
+import type { SetupIncompleteReason } from '../src/types.js';
+import type { Validator } from '../src/validator.js';
 
 const packageId = 'GoogleWorkspace-example-com';
 
-function createBlockedPackage(): {
+vi.mock('../src/logging.js', () => ({
+  getLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
+}));
+
+function createBlockedPackage(reason: SetupIncompleteReason = 'missing_managed_credentials'): {
   registry: PackageRegistry;
   catalog: Catalog;
 } {
@@ -19,7 +28,7 @@ function createBlockedPackage(): {
         name: 'Google Workspace',
         setupStatus: {
           state: 'blocked',
-          reason: 'missing_managed_credentials',
+          reason,
         },
       },
     },
@@ -47,6 +56,37 @@ function createReprovisionRequiredPackage(): {
 }
 
 describe('setup_incomplete package carrier', () => {
+  it.each(['reconnect_required', 'missing_managed_credentials', 'cloud_reprovision_required', 'future_reason'])(
+    'preserves setup recovery copy and structured reason for %s across all five handlers', async (reason) => {
+      const { registry, catalog } = createBlockedPackage(
+        reason === 'future_reason' ? 'missing_managed_credentials' : reason as SetupIncompleteReason,
+      );
+      if (reason === 'future_reason') vi.spyOn(catalog, 'getPackageError').mockReturnValue(reason);
+      const message = reason === 'reconnect_required'
+        ? `Connection '${packageId}' needs setup. Try reconnecting it in Rebel's settings on your computer.`
+        : `Package '${packageId}' is not set up on this instance. Signing in again will not fix it.`;
+      const data = { package_id: packageId, status: 'setup_incomplete', reason };
+      try {
+        await expect(handleListTools({ package_id: packageId }, catalog, null, registry)).rejects.toMatchObject({ code: -33004, message, data });
+        await expect(handleUseTool({ package_id: packageId, tool_id: 'search_emails', args: {} }, registry, catalog, {} as Validator)).rejects.toMatchObject({ code: -33004, message, data });
+        await expect(handleReadResource({ uri: `ui://${packageId}/view` }, registry, catalog)).rejects.toMatchObject({ code: -33004, message, data });
+        const details = await handleGetToolDetails({ tool_ids: [`${packageId}__search_emails`] }, catalog, registry);
+        expect(JSON.parse(details.content[0].text).tools[0]).toMatchObject({
+          ...data,
+          error: 'setup_incomplete',
+          description: reason === 'reconnect_required' ? message
+            : `Package '${packageId}' is not set up on this instance (${reason}). Signing in again will not fix it.`,
+        });
+        const bulk = await handleBulkExport({ package_id: packageId, tool_id: 'search_emails', args: {}, output_file: 'emails.ndjson', items_path: 'emails' }, registry, catalog);
+        expect(bulk).toMatchObject({ isError: true, content: [{ type: 'text', text: `Error: ${message}` }] });
+        expect(registry.getChildStats()[0]).toMatchObject({ spawn_count: 0, connected: false });
+      } finally {
+        await registry.closeAll();
+        vi.restoreAllMocks();
+      }
+    },
+  );
+
   it('does not spawn a blocked package and reports its reason from list_tool_packages', async () => {
     const { registry, catalog } = createBlockedPackage();
 

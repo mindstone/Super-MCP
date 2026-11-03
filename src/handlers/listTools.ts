@@ -1,3 +1,4 @@
+import { setupIncompleteMessage } from "../utils/setupIncompleteMessage.js";
 import { ListToolsInput, ListToolsOutput, ERROR_CODES, ToolInfo } from "../types.js";
 import type {
   CatalogRefreshScheduler,
@@ -91,7 +92,8 @@ export async function handleListTools(
     const reason = catalog.getPackageError(package_id) || "setup_incomplete";
     throw {
       code: ERROR_CODES.PACKAGE_UNAVAILABLE,
-      message: `Package '${package_id}' is not set up on this instance. Signing in again will not fix it.`,
+      message: setupIncompleteMessage(package_id, reason,
+        `Package '${package_id}' is not set up on this instance. Signing in again will not fix it.`),
       data: { package_id, status: packageStatus, reason },
     };
   }

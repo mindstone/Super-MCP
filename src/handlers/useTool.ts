@@ -1,3 +1,4 @@
+import { setupIncompleteMessage } from "../utils/setupIncompleteMessage.js";
 import { randomUUID } from "crypto";
 import { computeProgressDigest, type ProgressDigestV1 } from './progressDigest.js';
 import { extractRecoveryEvidenceV1, stripConnectorRecoveryEvidence, type RecoveryEvidenceV1 } from "./recoveryEvidence.js";
@@ -1679,7 +1680,8 @@ export async function handleUseTool(
     const reason = catalog.getPackageError(package_id) || "setup_incomplete";
     throw {
       code: ERROR_CODES.PACKAGE_UNAVAILABLE,
-      message: `Package '${package_id}' is not set up on this instance. Signing in again will not fix it.`,
+      message: setupIncompleteMessage(package_id, reason,
+        `Package '${package_id}' is not set up on this instance. Signing in again will not fix it.`),
       data: { package_id, status: packageStatus, reason },
     };
   }
