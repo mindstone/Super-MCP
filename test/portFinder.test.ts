@@ -95,10 +95,18 @@ describe("portFinder dual-stack availability", () => {
   });
 
   it("findAvailablePort skips ports that are busy on either stack", async () => {
-    // Hold an IPv4-only busy port; findAvailablePort should advance past it.
-    const start = 59000 + Math.floor(Math.random() * 500);
-    const v4 = await bindTo(OAUTH_CALLBACK_HOST_V4, start);
+    // Hold an IPv4-only busy port, picked by the OS so no other test can
+    // already hold it; findAvailablePort should advance past it. Re-picked
+    // until the ten-port scan stays at or below 65535 (macOS and Windows hand
+    // out ports up to there).
+    let v4 = await bindTo(OAUTH_CALLBACK_HOST_V4, 0);
+    while (v4.port > 65526) {
+      const next = await bindTo(OAUTH_CALLBACK_HOST_V4, 0);
+      await v4.close();
+      v4 = next;
+    }
     openServers.push(v4);
+    const start = v4.port;
 
     let v6: StackedServer | undefined;
     if (await ipv6LoopbackUsable()) {
