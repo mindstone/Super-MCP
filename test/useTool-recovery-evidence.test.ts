@@ -8,6 +8,11 @@ import type { PackageRegistry } from "../src/registry.js";
 import type { Catalog } from "../src/catalog.js";
 import type { UseToolInput } from "../src/types.js";
 
+// This producer test does not exercise the process logger or its home-directory files.
+vi.mock("../src/logging.js", () => ({ getLogger: () => ({
+  debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(),
+}) }));
+
 const packageId = "example-package";
 const toolId = "lookup";
 function mocks(inner: unknown) {
@@ -61,6 +66,17 @@ describe("use_tool constructed recovery evidence", () => {
 
   it("does not classify codes and preserves direct-before-content ordering", () => {
     expect(extractRecoveryEvidenceV1({ ok: false, code: "unknown_control_code", content: [text({ ok: false, code: "channel_not_found" }), text({ status: "auth_required" })] })).toEqual({ version: 1, candidates: [{ ok: false, code: "unknown_control_code" }, { ok: false, code: "channel_not_found" }, { status: "auth_required" }] });
+  });
+
+  it.each([
+    { ok: false, code: "missing_scope" },
+    { status: "auth_required", reason: "consent_required" },
+    { status: "auth_required", reason: "tenant_blocked" },
+    { action: "auth_required", auth_tool: "authenticate", reason: "consent_required" },
+    { action: "auth_required", auth_tool: "authenticate", reason: "missing_permission" },
+  ])("preserves consent and policy controls before materialization: %j", async (payload) => {
+    const { result } = await produce({ content: [text({ ...payload, error: "x".repeat(31_000) })], isError: true });
+    expect(result._meta.superMcp.recoveryEvidenceV1).toEqual({ version: 1, candidates: [payload] });
   });
 
   it("preserves action-first rejection and ignores metadata/structured data as authority", () => {
