@@ -53,6 +53,7 @@ vi.mock("../../auth/providers/simple.js", () => {
     static async readNeedsReconnectMarkerState() {
       return { state: "absent" as const };
     }
+    browserUnavailable = vi.fn(() => new Promise<Error>(() => {}));
     initialize = vi.fn(async () => {});
     checkAndInvalidateOnPortMismatch = vi.fn(async () => false);
     state = vi.fn(async () => "csrf-state");
@@ -61,7 +62,10 @@ vi.mock("../../auth/providers/simple.js", () => {
     consumeProbeVerdict = vi.fn(() => undefined);
     hasStartedRedirect = vi.fn(() => false);
   }
-  return { SimpleOAuthProvider: MockSimpleOAuthProvider };
+  return {
+    SimpleOAuthProvider: MockSimpleOAuthProvider,
+    OAUTH_BROWSER_UNAVAILABLE_CODE: "OAUTH_BROWSER_UNAVAILABLE",
+  };
 });
 
 vi.mock("../../auth/callbackServer.js", async (importOriginal) => {

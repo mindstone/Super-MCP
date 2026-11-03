@@ -2,7 +2,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import http from 'node:http';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -13,11 +14,13 @@ import { handleUseTool } from '../src/handlers/useTool.js';
 import { Catalog } from '../src/catalog.js';
 import { getValidator } from '../src/validator.js';
 import { SecurityPolicy, setSecurityPolicy } from '../src/security.js';
+import { FORWARDED_FILES_RELATIVE_DIR } from '../src/forwardedFiles.js';
 
 vi.mock('../src/logging.js', () => ({ getLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }) }));
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   setSecurityPolicy(new SecurityPolicy({}));
   for (const close of cleanup.splice(0).reverse()) await close();
 });
@@ -36,7 +39,7 @@ function keep(registry: PackageRegistry) {
   cleanup.push(() => registry.closeAll());
   return registry;
 }
-async function router(extra: object = {}) {
+async function router(extra: object = {}, env: NodeJS.ProcessEnv = {}) {
   const dir = await temp();
   const reserve = http.createServer();
   reserve.listen(0, '127.0.0.1');
@@ -46,7 +49,7 @@ async function router(extra: object = {}) {
   const config = path.join(dir, 'config.json');
   const entry = { command: process.execPath, args: [path.resolve('test/fixtures/package-home/server.mjs')], catalogId: 'fictional-notebook' };
   await writeFile(config, JSON.stringify({ mcpServers: { notebook: entry, journal: entry }, ...extra }));
-  const child = spawn(process.execPath, ['dist/cli.js', '--config', config, '--transport', 'http', '--port', String(port), '--log-level', 'error'], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, ['dist/cli.js', '--config', config, '--transport', 'http', '--port', String(port), '--log-level', 'error'], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, ...env } });
   let output = '';
   child.stderr!.on('data', data => { output += data; });
   cleanup.push(async () => {
@@ -85,6 +88,35 @@ function statusWithHost(url: string, host: string, headers: Record<string, strin
 }
 
 describe('package homes and raw package endpoint', () => {
+  it('carries a 3 MB desktop file through the real route and removes the cloud copy', async () => {
+    const dir = await temp();
+    const desktop = path.join(dir, 'desktop'); const cloud = path.join(dir, 'cloud');
+    await mkdir(desktop); await mkdir(cloud);
+    const bytes = Buffer.alloc(3 * 1024 * 1024, 0x61);
+    const source = path.join(desktop, 'report.txt'); await writeFile(source, bytes);
+    const base = await router({}, { REBEL_WORKSPACE_PATH: cloud, MCP_WORKSPACE_PATH: cloud });
+    vi.stubEnv('REBEL_WORKSPACE_PATH', desktop);
+    const registry = keep(new PackageRegistry({ mcpServers: { notebook: { command: '/must-never-run' } }, packageHomes: { notebook: { url: `${base}/mcp/packages/notebook` } } }));
+    const result = await registry.callTool('notebook', 'read_file', { file_path: source });
+    expect(result).toMatchObject({ content: [{ text: createHash('sha256').update(bytes).digest('hex') }] });
+    expect(await readdir(path.join(cloud, FORWARDED_FILES_RELATIVE_DIR))).toEqual([]);
+    expect(await readFile(source)).toEqual(bytes);
+  }, 25_000);
+
+  it('returns a plain error for a sparse 51 MiB file without dispatching it', async () => {
+    const desktop = await temp(); const cloud = await temp();
+    const source = path.join(desktop, 'large.bin');
+    const file = await open(source, 'w'); await file.truncate(51 * 1024 * 1024); await file.close();
+    const base = await router({}, { REBEL_WORKSPACE_PATH: cloud, MCP_WORKSPACE_PATH: cloud });
+    vi.stubEnv('REBEL_WORKSPACE_PATH', desktop);
+    const registry = keep(new PackageRegistry({ mcpServers: { notebook: { command: '/must-never-run' } }, packageHomes: { notebook: { url: `${base}/mcp/packages/notebook` } } }));
+    const client = await registry.getClient('notebook');
+    const dispatch = vi.spyOn(Client.prototype, 'callTool');
+    expect(await client.callTool('read_file', { file_path: source })).toMatchObject({ isError: true, content: [{ text: 'The files for notebook add up to 51.0 MB, over the 50 MB limit for one send, so nothing was sent. Try fewer or smaller files.' }] });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(await readdir(cloud)).toEqual([]);
+  }, 25_000);
+
   it('forwards tool discovery, calls and resources through a real second registry without starting stdio locally', async () => {
     const base = await router();
     const localSpawn = vi.spyOn(StdioMcpClient.prototype, 'connect').mockRejectedValue(new Error('Local spawn is forbidden'));
@@ -164,7 +196,7 @@ describe('package homes and raw package endpoint', () => {
     setSecurityPolicy(policy);
     await expect(handleUseTool({ package_id: 'notebook', tool_id: 'write_note', args: { text: 'blocked' } }, registry, new Catalog(registry), getValidator())).rejects.toMatchObject({ code: -33008 });
     if ('blockedPackages' in (restrictions.security ?? {})) await expect(client.listTools()).rejects.toThrow();
-    else expect((await client.listTools()).tools).toEqual([]);
+    else expect((await client.listTools()).tools.map(tool => tool.name)).toEqual(['read_file']);
   }, 25_000);
 
   it('returns the paused message for a refused connection and 502/503/504', async () => {
@@ -227,7 +259,7 @@ describe('package homes and raw package endpoint', () => {
 
   it('contains no provider or connector names in new mechanism files', async () => {
     const denied = /notion|google|slack|hubspot|microsoft|granola|fireflies|salesforce|zendesk|quickbooks|workday/i;
-    for (const file of ['src/packageEndpoint.ts', 'src/clients/packageHomeClient.ts', 'src/toolAccess.ts']) {
+    for (const file of ['src/packageEndpoint.ts', 'src/clients/packageHomeClient.ts', 'src/toolAccess.ts', 'src/forwardedFiles.ts']) {
       expect(await readFile(file, 'utf8'), file).not.toMatch(denied);
     }
   });

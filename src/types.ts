@@ -17,6 +17,8 @@ export interface PackageSetupStatus {
 
 export type CatalogStatus = 'connecting' | 'ready' | 'auth_required' | 'setup_incomplete' | 'error';
 
+export const DEFAULT_TOOL_TIMEOUT_MS = 90 * 60 * 1000;
+
 export interface StandardServerConfig {
   command?: string;
   args?: string[];
@@ -29,9 +31,8 @@ export interface StandardServerConfig {
   type?: 'stdio' | 'sse' | 'http';
   url?: string;
   headers?: Record<string, string>;
-  // Tool execution timeout in milliseconds (default: 14400000ms = 4 hours sentinel)
-  // The Rebel Core agent-turn watchdog is the real effective ceiling; this is the
-  // last-resort upstream cap. Can be overridden by SUPER_MCP_TOOL_TIMEOUT environment variable.
+  // Tool execution timeout in milliseconds (default: DEFAULT_TOOL_TIMEOUT_MS, 90 minutes).
+  // SUPER_MCP_TOOL_TIMEOUT overrides the default; this field takes precedence.
   timeout?: number;
   /** Cloud-owned setup state. A blocked package must never be spawned. */
   setupStatus?: PackageSetupStatus;
@@ -390,6 +391,8 @@ export interface McpClient {
   listResources?(): Promise<ListResourcesResult>;
   supportsResources?(): boolean;
   hasPendingRequests?(): boolean;
+  /** The server holds live state that must last until the host stops; the idle reaper skips it. */
+  holdsLiveState?(): boolean;
 }
 
 /** Stable categories used by the refresher's bounded retry policy. */

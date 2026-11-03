@@ -52,8 +52,12 @@ import { resolveToolTarget } from "./toolTargetResolution.js";
 // FM6 (260706_mcp-oauth-fm6-graceful-drain): give an in-flight single-use
 // refresh-token rotation time to finish its atomic persist before we exit, so a
 // quit/restart mid-refresh can't leave a consumed-but-unpersisted token on disk.
-// Bounded so shutdown stays within the host's per-service cleanup budget (3s):
-// drain 1.5s + host SIGTERM grace 2s keeps worst-case stop ~2.2s.
+// Bounded so shutdown stays within the host's per-service cleanup budget (3s).
+// The host allows 2s after SIGTERM (or POST /api/shutdown) before it kills the
+// router's process tree. The drain returns at once when no refresh is in flight;
+// connectors then close in parallel, each getting CLEAN_STOP_GRACE_MS (1s) to
+// tidy up. Only a refresh in flight at quit leaves connectors less than their
+// full grace before the host's kill.
 const TOKEN_REFRESH_DRAIN_TIMEOUT_MS = 1500;
 
 async function drainRefreshesForShutdown(): Promise<void> {
@@ -216,6 +220,37 @@ async function waitForCurrentSnapshot(
   } finally {
     if (timeoutHandle) clearTimeout(timeoutHandle);
   }
+}
+
+const routerStartedAt = new Date(Date.now() - process.uptime() * 1000).toISOString();
+
+/**
+ * POST /api/shutdown: the same clean shutdown as SIGTERM, for a host that has
+ * no catchable SIGTERM to send (Windows, where Node's kill() terminates the
+ * process at once, so connectors would get no clean stop). Local only; refused
+ * when the request carries an Origin (every browser request does) or, when the
+ * router was started for an owner, when the owner id does not match.
+ */
+export function registerShutdownRoute(
+  app: express.Express,
+  options: {
+    dnsRebindingGuard: express.RequestHandler;
+    ownerId?: string;
+    shutdown: (reason: string) => void;
+  },
+): void {
+  app.post("/api/shutdown", options.dnsRebindingGuard, (req, res) => {
+    if (req.headers.origin !== undefined) {
+      res.status(403).end();
+      return;
+    }
+    if (options.ownerId !== undefined && req.headers["x-super-mcp-owner-id"] !== options.ownerId) {
+      res.status(403).end();
+      return;
+    }
+    res.status(202).end();
+    options.shutdown("host_request");
+  });
 }
 
 export function registerHttpApiRoutes(
@@ -491,13 +526,12 @@ export function registerHttpApiRoutes(
   // using the PIDs returned in `children[].pid`.
   app.get("/stats", dnsRebindingGuard, (_req, res) => {
     try {
-      const startedAt = new Date(Date.now() - process.uptime() * 1000).toISOString();
       res.json({
         router: {
           running: true,
           pid: process.pid,
           uptime_ms: Math.round(process.uptime() * 1000),
-          started_at: startedAt,
+          started_at: routerStartedAt,
           // Stage 4b S3 refinement: start_count/restart_count are always
           // 1/0 at the router level; super-mcp itself doesn't self-restart.
           // Rebel-side restart count lives on
@@ -1106,6 +1140,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       // Apply DNS rebinding protection to /mcp endpoint; /health is left open for external probes
       app.use('/mcp', dnsRebindingGuard);
 
+      app.use('/mcp/packages', express.json({ limit: '70mb' }));
       app.use(express.json());
       registerHttpApiRoutes(app, {
         registry,
@@ -1127,9 +1162,10 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
 
       const SESSION_IDLE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
       // A session with an open tool call is kept until no client can still be
-      // waiting on it: the 4h tool-call sentinel (SUPER_MCP_TOOL_TIMEOUT, Rebel
-      // Core's TOOL_CALL_TIMEOUT) plus the idle limit. A cancelled call leaves
-      // its POST open with no response, so the open count alone would never drop.
+      // waiting on it: 4 hours, above the default per-call limit (90 minutes) so
+      // a deployment that sets a longer SUPER_MCP_TOOL_TIMEOUT keeps its sessions,
+      // plus the idle limit. A cancelled call leaves its POST open with no
+      // response, so the open count alone would never drop.
       const BUSY_SESSION_IDLE_TIMEOUT_MS = 4 * 60 * 60 * 1000 + SESSION_IDLE_TIMEOUT_MS;
       const GC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -1280,6 +1316,11 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
 
       process.on("SIGINT", () => shutdown());
       process.on("SIGTERM", () => shutdown());
+      registerShutdownRoute(app, {
+        dnsRebindingGuard,
+        ownerId: ownerInfo?.ownerId,
+        shutdown: (reason) => void shutdown(reason),
+      });
 
       const httpServer = app.listen(port, '127.0.0.1', () => {
         logger.info("Super MCP Router started successfully", {
@@ -1300,6 +1341,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           });
         }
       });
+      httpServer.requestTimeout = 0;
     } else {
       const server = createMcpServer();
       const stdioTransport = new StdioServerTransport();

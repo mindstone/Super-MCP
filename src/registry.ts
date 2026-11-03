@@ -1,3 +1,4 @@
+import { getRefreshRefusalCount } from "./auth/refreshRefusals.js";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { isDeepStrictEqual } from "util";
@@ -409,6 +410,8 @@ export interface ChildStatsEntry {
   connect_retry_skipped_permanent_count: number;
   /** Cumulative pre-send liveness re-establishes in `callTool` (closed-transport recovery). */
   reestablish_count: number;
+  /** Confirmed dead-grant refresh refusals since this router process started. */
+  refresh_refused_count: number;
   catalog_status: CatalogStatus;
   consecutive_failures: number;
   next_retry_at: number | null;
@@ -2163,6 +2166,13 @@ export class PackageRegistry {
         continue;
       }
 
+      // A server holding live state (e.g. an open browser) runs until the
+      // host stops, when it is stopped cleanly.
+      if (client.holdsLiveState?.()) {
+        logger.debug("Skipping reap: holds live state", { package_id: packageId });
+        continue;
+      }
+
       // Check if idle beyond threshold
       const lastActive = this.lastActivity.get(packageId) ?? 0;
       if (now - lastActive < this.reaperTimeoutMs) {
@@ -2628,6 +2638,7 @@ export class PackageRegistry {
 
       return {
         package_id: pkg.id,
+        refresh_refused_count: getRefreshRefusalCount(pkg.id),
         transport: pkg.transport,
         pid,
         connected: Boolean(client),

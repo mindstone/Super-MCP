@@ -140,6 +140,11 @@ class Logger {
     const sensitiveParams = new Set(['token', 'key', 'secret', 'password', 'code', 'access_token', 'refresh_token', 'client_secret', 'api_key', 'apikey']);
     
     for (const [key, value] of Object.entries(data)) {
+      if (typeof value === "boolean") {
+        sanitized[key] = value;
+        continue;
+      }
+
       // Redact sensitive information based on key names
       if (key.toLowerCase().includes("token") || 
           key.toLowerCase().includes("secret") ||

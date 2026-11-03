@@ -62,6 +62,7 @@ vi.mock("../../auth/providers/simple.js", () => {
     }
     oauthPort: number;
     staticCredentials: unknown;
+    browserUnavailable = vi.fn(() => new Promise<Error>(() => {}));
     initialize = vi.fn(async () => {});
     checkAndInvalidateOnPortMismatch = vi.fn(async () => false);
     state = vi.fn(async () => "csrf-state");
@@ -75,7 +76,10 @@ vi.mock("../../auth/providers/simple.js", () => {
       providerInstances.push({ packageId, oauthPort, staticCredentials });
     }
   }
-  return { SimpleOAuthProvider: MockSimpleOAuthProvider };
+  return {
+    SimpleOAuthProvider: MockSimpleOAuthProvider,
+    OAUTH_BROWSER_UNAVAILABLE_CODE: "OAUTH_BROWSER_UNAVAILABLE",
+  };
 });
 
 vi.mock("../../auth/callbackServer.js", async (importOriginal) => {

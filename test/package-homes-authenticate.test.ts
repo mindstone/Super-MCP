@@ -85,6 +85,81 @@ it('starts fresh HTTP authorization, sends zero refresh requests, and never cach
   expect(JSON.parse(await readFile(path.join(dir, 'notebook_tokens.json'), 'utf8')).refresh_token).toBe('fictional-new-refresh');
 }, 10_000);
 
+it('replaces a saved dynamic registration with both grants on forced sign-in', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'homes-auth-'));
+  cleanup.push(() => rm(dir, { recursive: true, force: true }));
+  vi.stubEnv('SUPER_MCP_OAUTH_TOKEN_DIR', dir);
+  vi.spyOn(ports, 'checkPortAvailable').mockResolvedValue(true);
+  vi.spyOn(ports, 'findAvailablePortFromCandidates').mockResolvedValue(5173);
+  vi.spyOn(OAuthCallbackServer.prototype, 'start').mockResolvedValue(undefined);
+  vi.spyOn(OAuthCallbackServer.prototype, 'stop').mockResolvedValue(undefined);
+  let completeCallback: (code: string) => void;
+  vi.spyOn(OAuthCallbackServer.prototype, 'waitForCallback').mockImplementation(() => new Promise(resolve => { completeCallback = resolve; }));
+  const authorizations: URL[] = [];
+  vi.spyOn(SimpleOAuthProvider.prototype, 'redirectToAuthorization').mockImplementation(async function (url) {
+    (this as any).redirectStarted = true;
+    authorizations.push(url);
+    completeCallback('fictional-code');
+  });
+  await writeFile(path.join(dir, 'notebook_tokens.json'), JSON.stringify({ access_token: 'fictional-old-access', refresh_token: 'fictional-old-refresh', token_type: 'Bearer', expires_in: 1, __superMcpObtainedAtMs: 0 }));
+  await writeFile(path.join(dir, 'notebook_client.json'), JSON.stringify({ client_id: 'fictional-old-client', redirect_uris: ['http://localhost:5173/oauth/callback'], grant_types: ['authorization_code'] }));
+  const registrations: Record<string, unknown>[] = [];
+  const grants: Array<string | null> = [];
+  const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
+  const base = 'https://auth.example.test';
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    const request = new Request(input, init);
+    const url = new URL(request.url);
+    const json = (body: object) => Response.json(body);
+    if (url.pathname.includes('oauth-protected-resource')) return json({ resource: `${base}/mcp`, authorization_servers: [base] });
+    if (url.pathname.includes('.well-known')) return json({ issuer: base, authorization_endpoint: `${base}/authorize`, registration_endpoint: `${base}/register`, token_endpoint: `${base}/token`, response_types_supported: ['code'], code_challenge_methods_supported: ['S256'], token_endpoint_auth_methods_supported: ['none'], grant_types_supported: ['authorization_code', 'refresh_token'] });
+    if (url.pathname === '/register' && request.method === 'POST') {
+      const metadata = await request.json();
+      registrations.push(metadata);
+      return json({ ...metadata, client_id: 'fictional-new-client' });
+    }
+    if (url.pathname === '/token') {
+      const form = new URLSearchParams(await request.text());
+      grants.push(form.get('grant_type'));
+      return json({ access_token: 'fictional-new-access', refresh_token: 'fictional-new-refresh', token_type: 'Bearer', expires_in: 3600 });
+    }
+    if (request.headers.get('authorization') !== 'Bearer fictional-new-access') return new Response('', { status: 401, headers: { 'WWW-Authenticate': `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"` } });
+    const body = request.method === 'POST' ? await request.clone().json() : undefined;
+    let transport = sessions.get(request.headers.get('mcp-session-id') ?? '');
+    if (body?.method === 'initialize') {
+      const server = new Server({ name: 'fictional-auth-service', version: '1.0.0' }, { capabilities: { tools: {} } });
+      server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));
+      transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: randomUUID, enableJsonResponse: true });
+      await server.connect(transport);
+      cleanup.push(() => server.close());
+    }
+    if (!transport) return new Response('No session', { status: 404 });
+    const response = await transport.handleRequest(request);
+    const id = response.headers.get('mcp-session-id');
+    if (id) sessions.set(id, transport);
+    return response;
+  });
+  const registry = new PackageRegistry({ mcpServers: { notebook: { url: `${base}/mcp`, oauth: true } }, packageHomes: { notebook: { url: 'https://cloud.example.test/mcp/packages/notebook' } } });
+  cleanup.push(() => registry.closeAll());
+  const ambient = vi.spyOn(registry, 'getClient');
+  const localClose = vi.spyOn(HttpMcpClient.prototype, 'close');
+  const result = await handleAuthenticate({ package_id: 'notebook', force: true }, registry, new Catalog(registry));
+  expect(result.isError).toBe(false);
+  expect(JSON.parse(result.content[0].text).status).toBe('authenticated');
+  expect(authorizations).toHaveLength(1);
+  expect(authorizations[0].searchParams.get('response_type')).toBe('code');
+  expect(grants).toEqual(['authorization_code']);
+  expect(registrations).toHaveLength(1);
+  const savedClient = JSON.parse(await readFile(path.join(dir, 'notebook_client.json'), 'utf8'));
+  expect(savedClient.client_id).toBe('fictional-new-client');
+  expect(registrations[0].grant_types).toEqual(['authorization_code', 'refresh_token']);
+  expect(savedClient.grant_types).toEqual(['authorization_code', 'refresh_token']);
+  expect(ambient).not.toHaveBeenCalled();
+  expect((registry as any).clients.has('notebook')).toBe(false);
+  expect(localClose).toHaveBeenCalledOnce();
+  expect(JSON.parse(await readFile(path.join(dir, 'notebook_tokens.json'), 'utf8')).refresh_token).toBe('fictional-new-refresh');
+}, 10_000);
+
 it('delegates homed stdio authentication locally and closes that temporary client', async () => {
   const registry = new PackageRegistry({ mcpServers: { notebook: { command: 'fictional-command' } }, packageHomes: { notebook: { url: 'https://cloud.example.test/mcp/packages/notebook' } } });
   cleanup.push(() => registry.closeAll());

@@ -9,6 +9,7 @@ import { PackageRegistry } from "./registry.js";
 import { argsSkeleton, createSchemaHash } from "./summarize.js";
 import { getLogger } from "./logging.js";
 import { oauthErrorLogText } from "./auth/oauthErrorLogging.js";
+import { ERROR_CODES } from "./types.js";
 
 const logger = getLogger();
 const LEGACY_ERROR_RETRY_INTERVAL_MS = 60_000;
@@ -900,6 +901,7 @@ export class Catalog implements CatalogView {
     }
     const message = error.message.toLowerCase();
     return (
+      (error as { code?: unknown }).code === ERROR_CODES.AUTH_REQUIRED ||
       error.name === "UnauthorizedError" ||
       message.includes("oauth") ||
       message.includes("401") ||

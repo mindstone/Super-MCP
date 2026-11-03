@@ -3,6 +3,10 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { SseError } from "@modelcontextprotocol/sdk/client/sse.js";
+import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import { ErrorEvent } from "eventsource";
 import { exchangeAuthorization, parseErrorResponse, refreshAuthorization } from "@modelcontextprotocol/sdk/client/auth.js";
 import { CustomOAuthError, OAuthError, OAUTH_ERRORS } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { HttpMcpClient } from "../src/clients/httpClient.js";
@@ -35,6 +39,12 @@ vi.mock("../src/auth/callbackServer.js", async (importOriginal) => ({
 }));
 
 const SENTINEL = "oauth-provider-description-sentinel";
+const CREDENTIAL_CANARY = "fictional-acme-credential-canary";
+const transportErrors = [
+  ["StreamableHTTPError", (code: number | undefined) => new StreamableHTTPError(code, CREDENTIAL_CANARY)],
+  ["SseError", (code: number | undefined) => new SseError(code, CREDENTIAL_CANARY,
+    new ErrorEvent("error", { code, message: CREDENTIAL_CANARY }))],
+] as const;
 const config: PackageConfig = {
   id: "Acme-log-safety", name: "Acme", transport: "http",
   base_url: "https://mcp.example.com/mcp", oauth: true, visibility: "default",
@@ -47,8 +57,9 @@ function errorResponse(error: string): Response {
 }
 
 function expectSafeLogs(): void {
-  expect(JSON.stringify(Object.values(logger).flatMap((fn) => fn.mock.calls)))
-    .not.toContain(SENTINEL);
+  const logs = JSON.stringify(Object.values(logger).flatMap((fn) => fn.mock.calls));
+  expect(logs).not.toContain(SENTINEL);
+  expect(logs).not.toContain(CREDENTIAL_CANARY);
 }
 
 function registry(): PackageRegistry {
@@ -200,6 +211,63 @@ describe("SDK OAuth error logging", () => {
     expect(error).toBeInstanceOf(OAuthError);
     expect(oauthErrorLogText(new Error(SENTINEL, { cause: error }), SENTINEL)).toBe(code);
     expect(oauthErrorLogFields({ error: code })).toEqual({ error: code });
+  });
+
+  it.each(transportErrors)("logs only the status for direct and cause-wrapped %s", (_name, makeError) => {
+    const transportError = makeError(403);
+    for (const error of [transportError, new Error(CREDENTIAL_CANARY, { cause: transportError })]) {
+      expect(error.message).toContain(CREDENTIAL_CANARY);
+      const text = oauthErrorLogText(error, error.message);
+      expect(text).toBe("http_403");
+      expect(text).not.toContain(CREDENTIAL_CANARY);
+    }
+  });
+
+  it.each(transportErrors)("labels a %s without a positive numeric status", (name, makeError) => {
+    const expected = name === "SseError" ? "sse_no_status" : "http_no_status";
+    for (const code of [undefined, -1, 0, NaN, Infinity]) {
+      const error = makeError(code);
+      expect(oauthErrorLogText(error, error.message)).toBe(expected);
+    }
+    const error = makeError(undefined);
+    Object.defineProperty(error, "code", { value: CREDENTIAL_CANARY });
+    expect(oauthErrorLogText(error, error.message)).toBe(expected);
+  });
+
+  it.each([
+    new Error(`Error POSTing to endpoint (HTTP 401): ${CREDENTIAL_CANARY}`),
+    new McpError(ErrorCode.InternalError, `Unauthorized: ${CREDENTIAL_CANARY}`),
+  ])("logs only the error name for an auth-like $name through the HTTP client", async (error) => {
+    vi.spyOn(Client.prototype, "connect").mockRejectedValue(error);
+    const client = new HttpMcpClient(config.id, { ...config, oauth: false });
+
+    try {
+      await expect(client.connect()).rejects.toMatchObject({ name: "UnauthorizedError" });
+      expect(logger.error).toHaveBeenCalledWith("Authentication required for MCP server", expect.objectContaining({
+        package_id: config.id, error: error.name,
+      }));
+      expect(error.message).toContain(CREDENTIAL_CANARY);
+      expectSafeLogs();
+    } finally {
+      await client.close();
+    }
+  });
+
+  it("redacts a provider's raw transport response through the real HTTP client", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(
+      `Unauthorized: ${CREDENTIAL_CANARY}`, { status: 403 },
+    ));
+    const client = new HttpMcpClient(config.id, { ...config, oauth: false });
+
+    try {
+      await expect(client.connect()).rejects.toMatchObject({ name: "UnauthorizedError" });
+      expect(logger.error).toHaveBeenCalledWith("Authentication required for MCP server", expect.objectContaining({
+        package_id: config.id, error: "http_403",
+      }));
+      expectSafeLogs();
+    } finally {
+      await client.close();
+    }
   });
 
   it("bounds cycles, deep causes and aggregate errors without changing their messages", () => {

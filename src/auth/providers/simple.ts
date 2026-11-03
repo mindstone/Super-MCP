@@ -16,6 +16,7 @@ import {
 
 const logger = getLogger();
 const OAUTH_TOKEN_DIR_ENV = "SUPER_MCP_OAUTH_TOKEN_DIR";
+export const OAUTH_BROWSER_UNAVAILABLE_CODE = "OAUTH_BROWSER_UNAVAILABLE";
 
 function getOAuthTokenStoragePath(): string {
   return process.env[OAUTH_TOKEN_DIR_ENV] || path.join(homedir(), ".super-mcp", "oauth-tokens");
@@ -143,6 +144,11 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   private stateValue?: string;
   private staticCredentials?: StaticOAuthCredentials;
   private redirectStarted: boolean = false;
+  private resolveBrowserUnavailable!: (error: Error) => void;
+  // Resolve with an error rather than reject: a provider can be used without a waiter.
+  private readonly browserUnavailablePromise = new Promise<Error>((resolve) => {
+    this.resolveBrowserUnavailable = resolve;
+  });
   private lastOAuthError?: OAuthErrorSummary;
   /**
    * Out-of-band channel for the authorize pre-flight probe verdict (REBEL-7F9
@@ -299,6 +305,7 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       ...identity,                      // client_name (RFC 7591 standard), client_uri, logo_uri
       name: identity.client_name,       // Fallback for non-compliant servers
       description: "MCP Router for aggregating multiple MCP servers",
+      grant_types: ["authorization_code", "refresh_token"],
       redirect_uris: [`http://localhost:${this.oauthPort}/oauth/callback`]
     };
   }
@@ -806,19 +813,36 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       }
       // Handle spawn errors to prevent crashing the process
       child.on('error', (err) => {
-        logger.error("Failed to open browser", {
-          package_id: this.packageId,
-          error: err.message
+        this.markBrowserUnavailable(err);
+      });
+      // rundll32 exit codes do not reliably say whether a browser opened.
+      if (process.platform !== 'win32') {
+        child.on('exit', (code) => {
+          if (code !== null && code !== 0) {
+            this.markBrowserUnavailable(new Error(`Browser launcher exited with code ${code}`));
+          }
         });
-      });
+      }
       child.unref();
-      logger.info("Browser opened for OAuth", { package_id: this.packageId });
+      logger.info("Browser launch requested for OAuth", { package_id: this.packageId });
     } catch (error) {
-      logger.error("Failed to open browser", {
-        package_id: this.packageId,
-        error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error))
-      });
+      this.markBrowserUnavailable(error);
     }
+  }
+
+  browserUnavailable(): Promise<Error> {
+    return this.browserUnavailablePromise;
+  }
+
+  private markBrowserUnavailable(cause: unknown): void {
+    this.resolveBrowserUnavailable(Object.assign(
+      new Error("Failed to open browser for OAuth", { cause }),
+      { code: OAUTH_BROWSER_UNAVAILABLE_CODE },
+    ));
+    logger.error("Failed to open browser", {
+      package_id: this.packageId,
+      error: oauthErrorLogText(cause, cause instanceof Error ? cause.message : String(cause))
+    });
   }
 
   hasStartedRedirect(): boolean {
