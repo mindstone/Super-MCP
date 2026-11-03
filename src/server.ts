@@ -1140,6 +1140,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       // Apply DNS rebinding protection to /mcp endpoint; /health is left open for external probes
       app.use('/mcp', dnsRebindingGuard);
 
+      app.use('/mcp/packages', express.json({ limit: '70mb' }));
       app.use(express.json());
       registerHttpApiRoutes(app, {
         registry,
@@ -1340,6 +1341,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           });
         }
       });
+      httpServer.requestTimeout = 0;
     } else {
       const server = createMcpServer();
       const stdioTransport = new StdioServerTransport();
