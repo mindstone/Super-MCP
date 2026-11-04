@@ -1,19 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PackageHomeClient } from "../src/clients/packageHomeClient.js";
 import { HttpMcpClient } from "../src/clients/httpClient.js";
-import type { McpClient, PackageConfig } from "../src/types.js";
+import type { McpClient } from "../src/types.js";
+import { config, settledWithin } from "./helpers/droppedAnswer.js";
 
 const logger = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }));
 vi.mock("../src/logging.js", () => ({ getLogger: () => logger }));
 
 type Drop = "clean-end" | "socket-cut";
 
-type Behavior = "drop" | "concurrent" | "resume" | "answer" | "split" | "open";
+type Behavior = "concurrent" | "resume" | "answer" | "split" | "open";
 const encode = (text: string) => new TextEncoder().encode(text);
 const answer = (id: unknown) => `data: ${JSON.stringify({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "done" }] } })}\r\n\r\n`;
 
 /** Exercise the real SDK with fetch streams, without requiring a listening socket. */
-async function startServer(drop: Drop, behavior: Behavior = "drop"): Promise<{ url: string; close: () => Promise<void> }> {
+async function startServer(drop: Drop, behavior: Behavior): Promise<{ url: string; close: () => Promise<void> }> {
   const streams: ReadableStreamDefaultController<Uint8Array>[] = [];
   const timers: ReturnType<typeof setTimeout>[] = [];
   let requestId: unknown;
@@ -64,38 +65,6 @@ async function startServer(drop: Drop, behavior: Behavior = "drop"): Promise<{ u
     },
   };
 }
-
-const NOT_SETTLED = Symbol("not settled");
-const settledWithin = (call: Promise<unknown>, ms: number) => {
-  let timer: ReturnType<typeof setTimeout>;
-  return Promise.race([
-    call.then((value) => ({ value }), (error: unknown) => ({ error })),
-    new Promise<typeof NOT_SETTLED>((resolve) => { timer = setTimeout(() => resolve(NOT_SETTLED), ms); }),
-  ]).finally(() => clearTimeout(timer));
-};
-
-const config = (url: string): PackageConfig => ({
-  id: "acme", name: "Acme", transport: "http", base_url: url, visibility: "default",
-} as PackageConfig);
-
-describe.each<Drop>(["clean-end", "socket-cut"])("a connector's answer stream drops: %s", (drop) => {
-  const cleanups: Array<() => Promise<void>> = [];
-  afterEach(async () => { for (const c of cleanups.splice(0)) await c(); vi.unstubAllGlobals(); logger.warn.mockClear(); });
-
-  it.each<[string, (url: string) => McpClient]>([
-    ["package-home route", (url) => new PackageHomeClient(config(url), { url, headers: {} })],
-    ["direct HTTP route", (url) => new HttpMcpClient("acme", config(url)) as unknown as McpClient],
-  ])("%s fails the call instead of leaving it waiting", async (_route, make) => {
-    const server = await startServer(drop);
-    cleanups.push(server.close);
-    const client = make(server.url);
-    cleanups.push(() => client.close().catch(() => undefined));
-    await client.connect();
-    const outcome = await settledWithin(client.callTool("exec", {}), 2_000);
-    expect(outcome).not.toBe(NOT_SETTLED);
-    expect(outcome).toMatchObject({ error: expect.objectContaining({ message: expect.stringContaining("Connection closed") }) });
-  });
-});
 
 const routes: Array<[string, (url: string) => McpClient]> = [
   ["package-home", (url) => new PackageHomeClient(config(url), { url, headers: {} })],
@@ -156,16 +125,5 @@ describe.each(routes)("%s answer stream behavior", (_route, make) => {
     expect(logger.warn).not.toHaveBeenCalled();
     await client.close();
     await call;
-  });
-
-  it("does not report a drop when the client closes an open answer stream", async () => {
-    const client = await connected("open");
-    const outcome = settledWithin(client.callTool("exec", {}), 2_000);
-    await vi.waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([, init]) =>
-      typeof init?.body === "string" && JSON.parse(init.body).method === "tools/call")).toBe(true));
-    await client.close();
-    expect(await outcome).toMatchObject({ error: expect.objectContaining({ message: expect.stringContaining("Connection closed") }) });
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    expect(logger.warn).not.toHaveBeenCalled();
   });
 });

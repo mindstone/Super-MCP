@@ -1,15 +1,10 @@
 import { createParser } from "eventsource-parser";
 import { isJSONRPCRequest, isJSONRPCResultResponse, isJSONRPCErrorResponse, JSONRPCMessageSchema, type JSONRPCRequest } from "@modelcontextprotocol/sdk/types.js";
 
-async function readJsonRpcRequest(input: RequestInfo | URL, init?: RequestInit): Promise<JSONRPCRequest | undefined> {
-  const method = init?.method ?? (input instanceof Request ? input.method : "GET");
-  if (method.toUpperCase() !== "POST") return;
+function readJsonRpcRequest(init?: RequestInit): JSONRPCRequest | undefined {
+  if (init?.method !== "POST" || typeof init.body !== "string") return;
   try {
-    let body: string;
-    if (typeof init?.body === "string") body = init.body;
-    else if (input instanceof Request && !init?.body) body = await input.clone().text();
-    else return;
-    const request: unknown = JSON.parse(body);
+    const request: unknown = JSON.parse(init.body);
     if (isJSONRPCRequest(request)) return request;
   } catch { /* Not a readable JSON-RPC request. */ }
 }
@@ -17,7 +12,7 @@ async function readJsonRpcRequest(input: RequestInfo | URL, init?: RequestInit):
 /** Fail only the request whose non-resumable POST answer stream disappeared. */
 export function failDroppedAnswers(baseFetch: typeof fetch, onDrop: (request: JSONRPCRequest) => void): typeof fetch {
   return async (input, init) => {
-    const request = await readJsonRpcRequest(input, init);
+    const request = readJsonRpcRequest(init);
     const response = await baseFetch(input, init);
     if (!request || !response.ok ||
         !response.headers.get("content-type")?.includes("text/event-stream") || !response.body) return response;

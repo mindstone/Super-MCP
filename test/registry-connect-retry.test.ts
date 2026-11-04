@@ -1173,7 +1173,7 @@ describe("PackageRegistry connect retry", () => {
   );
 
   it.each(["unhealthy eviction", "restart"] as const)(
-    "rejects terminal drainage after a pre-latch %s discards a queued stdio lease",
+    "rejects a queued stdio call without sending it and drains its lease after a pre-latch %s",
     async (closeRoute) => {
       const packageId = "GoogleWorkspace-acme";
       const registry = createRegistry(packageId);
@@ -1187,6 +1187,7 @@ describe("PackageRegistry connect retry", () => {
       const transportClosedError = new Error("transport closed by pre-latch close");
       let healthCheckCount = 0;
       let queuedCallStatus: "pending" | "fulfilled" | "rejected" = "pending";
+      let queuedCallError: unknown;
       let reentrantShutdown: Promise<void> | undefined;
       let reconciliationCount = 0;
       const reconciliationReached = deferred<void>();
@@ -1242,7 +1243,8 @@ describe("PackageRegistry connect retry", () => {
         () => {
           queuedCallStatus = "fulfilled";
         },
-        () => {
+        (error: unknown) => {
+          queuedCallError = error;
           queuedCallStatus = "rejected";
         },
       );
@@ -1280,9 +1282,12 @@ describe("PackageRegistry connect retry", () => {
         expect(closeSpy).toHaveBeenCalledOnce();
         expect(client.hasPendingRequests()).toBe(false);
         expect(stdioInternals.requestQueue).toMatchObject({ pending: 0, size: 0 });
-        expect(queuedCallStatus).toBe("pending");
-        expect(internals.activeLeases.get(packageId)).toBe(1);
-        expect(internals.activeLeaseClients?.get(packageId)?.get(client)).toBe(1);
+        expect(queuedCallStatus).toBe("rejected");
+        expect(queuedCallError).toMatchObject({ code: -32000, message: "MCP error -32000: Connection closed" });
+        expect(sdkCallTool).toHaveBeenCalledOnce();
+        expect(sdkCallTool.mock.calls[0][0]).toEqual({ name: "running", arguments: {} });
+        expect(internals.activeLeases.has(packageId)).toBe(false);
+        expect(internals.activeLeaseClients?.has(packageId)).toBe(false);
         if (closeRoute === "unhealthy eviction") {
           expect(internals.clients.get(packageId)).toBe(replacement);
           expect(createSpy).toHaveBeenCalledOnce();
@@ -1335,27 +1340,21 @@ describe("PackageRegistry connect retry", () => {
         }).toEqual({
           reconciliationCount: 1,
           clientPendingRequests: false,
-          queuedCallStatus: "pending",
-          shutdownStatus: "rejected",
+          queuedCallStatus: "rejected",
+          shutdownStatus: "fulfilled",
           activeLeases: 0,
           leaseDrainWaiters: 0,
         });
-        expect(firstShutdownError).toBeInstanceOf(AggregateError);
-        expect(secondShutdownError).toBe(firstShutdownError);
-        expect(reentrantShutdownError).toBe(firstShutdownError);
-        expect((firstShutdownError as AggregateError).errors).toEqual([
-          expect.objectContaining({
-            message: `Terminal close discarded ${packageId} work with 1 active lease(s)`,
-          }),
-        ]);
-        expect(loggerMock.error).toHaveBeenCalledWith(
-          "MCP client cleanup failed during registry shutdown",
-          expect.objectContaining({
-            package_id: packageId,
-            phase: "lease_accounting",
-            error: `Terminal close discarded ${packageId} work with 1 active lease(s)`,
-          }),
-        );
+        expect(firstShutdownError).toBeUndefined();
+        expect(secondShutdownError).toBeUndefined();
+        expect(reentrantShutdownError).toBeUndefined();
+        expect(loggerMock.error).toHaveBeenCalledOnce();
+        expect(loggerMock.error).toHaveBeenCalledWith("Tool call failed", {
+          error: transportClosedError.message,
+          package_id: packageId,
+          tool_name: "running",
+        });
+        expect(sdkCallTool).toHaveBeenCalledOnce();
         expect(closeSpy).toHaveBeenCalledOnce();
         expect(reentrantClient.close).toHaveBeenCalledOnce();
         expect(internals.clients.size).toBe(0);
@@ -1382,11 +1381,11 @@ describe("PackageRegistry connect retry", () => {
         }
         await Promise.allSettled([
           runningOutcome,
+          queuedOutcome,
           firstShutdownOutcome,
           secondShutdownOutcome,
           reentrantShutdownOutcome,
         ]);
-        void queuedOutcome;
       }
     },
   );

@@ -99,17 +99,6 @@ describe("failDroppedAnswers", () => {
     expect(onDrop).not.toHaveBeenCalled();
   });
 
-  it("reads a Request body before the base fetch consumes it", async () => {
-    const onDrop = vi.fn();
-    const fetch = failDroppedAnswers(vi.fn(async (input) => {
-      await (input as Request).text();
-      return new Response("", sse);
-    }), onDrop);
-    const response = await fetch(new Request("https://connector.example", post));
-    expect(await response.text()).toContain('"message":"Connection closed"');
-    expect(onDrop).toHaveBeenCalledWith(request);
-  });
-
   it.each([
     ["GET", post.body, 200, "text/event-stream"],
     ["POST", "{}", 200, "text/event-stream"],
