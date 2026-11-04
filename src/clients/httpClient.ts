@@ -1,4 +1,4 @@
-import type { ListResourcesResult } from "@modelcontextprotocol/sdk/types.js";
+import { ErrorCode, McpError, type ListResourcesResult } from "@modelcontextprotocol/sdk/types.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
@@ -7,6 +7,7 @@ import { TemporarilyUnavailableError } from "@modelcontextprotocol/sdk/server/au
 import PQueue from "p-queue";
 import { DEFAULT_TOOL_TIMEOUT_MS, McpClient, PackageConfig, ReadResourceResult } from "../types.js";
 import { getLogger } from "../logging.js";
+import { failDroppedAnswers } from "./failDroppedAnswers.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
 import { SimpleOAuthProvider, RefreshOnlyOAuthProvider } from "../auth/providers/index.js";
 import { OAUTH_REDIRECT_URI_REJECTED_CODE } from "../auth/authorizeProbe.js";
@@ -444,6 +445,7 @@ export class HttpMcpClient implements McpClient {
   private oauthProvider?: OAuthClientProvider;
   private oauthPort: number;
   private requestQueue: PQueue;
+  private queueAbort = new AbortController();
   private externalOAuthProvider?: SimpleOAuthProvider;
   private simpleOAuthProvider?: SimpleOAuthProvider;
   private usedSseFallback: boolean = false;
@@ -671,6 +673,8 @@ export class HttpMcpClient implements McpClient {
     if (this.isConnected) {
       return;
     }
+
+    if (this.queueAbort.signal.aborted) this.queueAbort = new AbortController();
 
     if (!this.config.base_url) {
       throw new Error("Base URL is required for HTTP MCP client");
@@ -968,7 +972,7 @@ export class HttpMcpClient implements McpClient {
     //   "[object Response]" is not valid JSON
     // This wrapper re-creates the Response using globalThis.Response when a mismatch
     // is detected, ensuring the SDK can properly read the response body.
-    options.fetch = createResponseNormalizingFetch(
+    options.fetch = failDroppedAnswers(createResponseNormalizingFetch(
       fetch,
       this.oauthProvider instanceof RefreshOnlyOAuthProvider,
       (error) => {
@@ -978,9 +982,17 @@ export class HttpMcpClient implements McpClient {
       (classification, statusClass) => {
         this.recordOAuthDiscoveryRequest(classification, statusClass);
       },
-    );
+    ), (request) => getLogger().warn("Answer stream ended before the answer", { package_id: this.packageId, method: request.method, tool_name: request.params?.name }));
 
     return options;
+  }
+
+  private enqueue<T>(job: () => Promise<T>): Promise<T> {
+    const signal = this.queueAbort.signal;
+    return this.requestQueue.add(async () => {
+      signal.throwIfAborted();
+      return job();
+    });
   }
 
   async listTools(): Promise<any[]> {
@@ -997,7 +1009,7 @@ export class HttpMcpClient implements McpClient {
       queue_pending: this.requestQueue.pending,
     });
 
-    return this.requestQueue.add(async () => {
+    return this.enqueue(async () => {
       try {
         const response = await this.client.listTools(undefined, { timeout });
         return response.tools || [];
@@ -1030,7 +1042,7 @@ export class HttpMcpClient implements McpClient {
       queue_pending: this.requestQueue.pending,
     });
 
-    return this.requestQueue.add(async () => {
+    return this.enqueue(async () => {
       try {
         const response = await this.client.callTool({
           name,
@@ -1052,6 +1064,7 @@ export class HttpMcpClient implements McpClient {
   }
 
   async close(): Promise<void> {
+    this.queueAbort.abort(new McpError(ErrorCode.ConnectionClosed, "Connection closed"));
     logger.info("Closing HTTP MCP client", {
       package_id: this.packageId,
       queue_size: this.requestQueue.size,
@@ -1059,9 +1072,6 @@ export class HttpMcpClient implements McpClient {
     });
 
     try {
-      // Clear any pending requests in the queue
-      this.requestQueue.clear();
-      
       await this.client.close();
       this.isConnected = false;
     } catch (error) {
@@ -1099,7 +1109,7 @@ export class HttpMcpClient implements McpClient {
   }
 
   async listResources(): Promise<ListResourcesResult> {
-    return this.requestQueue.add(() => this.client.listResources()) as Promise<ListResourcesResult>;
+    return this.enqueue(() => this.client.listResources()) as Promise<ListResourcesResult>;
   }
 
   async readResource(uri: string): Promise<ReadResourceResult> {
@@ -1114,7 +1124,7 @@ export class HttpMcpClient implements McpClient {
       queue_pending: this.requestQueue.pending,
     });
 
-    return this.requestQueue.add(async () => {
+    return this.enqueue(async () => {
       try {
         const response = await this.client.readResource({ uri });
         return response;

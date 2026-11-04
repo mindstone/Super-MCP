@@ -6,6 +6,7 @@ import { DEFAULT_TOOL_TIMEOUT_MS } from "../types.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
 import { collectForwardedFiles, forwardedFilesTooLargeMessage } from "../forwardedFiles.js";
 import { getLogger } from "../logging.js";
+import { failDroppedAnswers } from "./failDroppedAnswers.js";
 
 export class PackageHomeClient implements McpClient {
   private client = new Client(getMcpClientInfo());
@@ -15,6 +16,7 @@ export class PackageHomeClient implements McpClient {
   constructor(private config: PackageConfig, home: PackageHome) {
     this.transport = new StreamableHTTPClientTransport(new URL(home.url), {
       requestInit: { headers: home.headers },
+      fetch: failDroppedAnswers((input, init) => fetch(input, init), (request) => getLogger().warn("Answer stream ended before the answer", { package_id: this.config.id, method: request.method, tool_name: request.params?.name })),
     });
     this.client.onclose = () => { this.connected = false; };
   }

@@ -1,4 +1,4 @@
-import type { ListResourcesResult } from "@modelcontextprotocol/sdk/types.js";
+import { ErrorCode, McpError, type ListResourcesResult } from "@modelcontextprotocol/sdk/types.js";
 import { exec } from "child_process";
 import fs from "node:fs";
 import path from "node:path";
@@ -432,6 +432,7 @@ export class StdioMcpClient implements McpClient {
   private packageId: string;
   private config: PackageConfig;
   private requestQueue: PQueue;
+  private queueAbort = new AbortController();
 
   // --- Per-package connect diagnostics (B1) ---
   // Bounded ring buffer of the connector child's most recent stderr lines.
@@ -639,6 +640,7 @@ export class StdioMcpClient implements McpClient {
   }
 
   async connect(): Promise<void> {
+    if (this.queueAbort.signal.aborted) this.queueAbort = new AbortController();
     // Workspace propagation contract for stdio MCP subprocesses.
     // Super-mcp owns the MCP_WORKSPACE_PATH key on this router boundary, in
     // line with the OSS connector convention (see
@@ -889,6 +891,14 @@ export class StdioMcpClient implements McpClient {
     }
   }
 
+  private enqueue<T>(job: () => Promise<T>): Promise<T> {
+    const signal = this.queueAbort.signal;
+    return this.requestQueue.add(async () => {
+      signal.throwIfAborted();
+      return job();
+    });
+  }
+
   async listTools(): Promise<any[]> {
     const timeout = parseInt(process.env.SUPER_MCP_LIST_TOOLS_TIMEOUT || '10000');
 
@@ -899,7 +909,7 @@ export class StdioMcpClient implements McpClient {
       queue_pending: this.requestQueue.pending,
     });
 
-    return this.requestQueue.add(async () => {
+    return this.enqueue(async () => {
       try {
         const response = await this.client.listTools(undefined, { timeout });
         
@@ -936,7 +946,7 @@ export class StdioMcpClient implements McpClient {
     });
 
     this.servedToolCall = true;
-    return this.requestQueue.add(async () => {
+    return this.enqueue(async () => {
       try {
         const response = await this.client.callTool({
           name,
@@ -966,6 +976,7 @@ export class StdioMcpClient implements McpClient {
   }
 
   async close(): Promise<void> {
+    this.queueAbort.abort(new McpError(ErrorCode.ConnectionClosed, "Connection closed"));
     // Get PID before closing (SDK exposes it via transport.pid)
     const pid = this.transport.pid;
     
@@ -977,9 +988,6 @@ export class StdioMcpClient implements McpClient {
     });
 
     try {
-      // Clear any pending requests in the queue
-      this.requestQueue.clear();
-      
       // Read the tree first: once the connector exits, its children are
       // re-parented and can no longer be found by parent pid.
       const descendants = pid ? await listDescendants(pid) : [];
@@ -1049,7 +1057,7 @@ export class StdioMcpClient implements McpClient {
   }
 
   async listResources(): Promise<ListResourcesResult> {
-    return this.requestQueue.add(() => this.client.listResources()) as Promise<ListResourcesResult>;
+    return this.enqueue(() => this.client.listResources()) as Promise<ListResourcesResult>;
   }
 
   async readResource(uri: string): Promise<ReadResourceResult> {
@@ -1060,7 +1068,7 @@ export class StdioMcpClient implements McpClient {
       queue_pending: this.requestQueue.pending,
     });
 
-    return this.requestQueue.add(async () => {
+    return this.enqueue(async () => {
       try {
         const response = await this.client.readResource({ uri });
         return response;
