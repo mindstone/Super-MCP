@@ -406,13 +406,13 @@ describe('HttpMcpClient cross-realm Response handling', () => {
     it("classifies path-relative and origin authorization-server discovery from pathname only", () => {
       expect(
         classifyOAuthDiscoveryRequest(
-          "https://mcp.swifteq.com/.well-known/oauth-authorization-server/api/mcp/sse?token=secret",
+          "https://mcp.acme-helpdesk.example/.well-known/oauth-authorization-server/api/mcp/sse?token=secret",
         ),
       ).toEqual({
         kind: "authorization-server",
         scope: "path-relative",
       });
-      expect(classifyOAuthDiscoveryRequest("https://mcp.swifteq.com/.well-known/oauth-authorization-server")).toEqual({
+      expect(classifyOAuthDiscoveryRequest("https://mcp.acme-helpdesk.example/.well-known/oauth-authorization-server")).toEqual({
         kind: "authorization-server",
         scope: "origin",
       });
@@ -538,7 +538,7 @@ describe('HttpMcpClient cross-realm Response handling', () => {
           fetch: typeof fetch;
         };
         await options.fetch(
-          "https://mcp.swifteq.com/.well-known/oauth-authorization-server/api/mcp/sse?access_token=secret",
+          "https://mcp.acme-helpdesk.example/.well-known/oauth-authorization-server/api/mcp/sse?access_token=secret",
         );
         throw new Error("fetch failed");
       });
@@ -553,8 +553,8 @@ describe('HttpMcpClient cross-realm Response handling', () => {
       const serialized = JSON.stringify(error.oauthDiscoveryTrace);
 
       expect(error.message).toContain(OAUTH_DISCOVERY_TRACE_ERROR_MARKER);
-      expect(error.message).not.toContain("swifteq");
-      expect(serialized).not.toContain("swifteq");
+      expect(error.message).not.toContain("acme-helpdesk");
+      expect(serialized).not.toContain("acme-helpdesk");
       expect(serialized).not.toContain("access_token");
       expect(serialized).not.toContain("secret");
       expect(serialized).not.toContain("/api/mcp/sse");

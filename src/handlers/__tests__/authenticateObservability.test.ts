@@ -180,7 +180,7 @@ vi.mock("../../clients/httpClient.js", async (importOriginal) => {
   return { ...actual, HttpMcpClient: MockHttpMcpClient };
 });
 
-const PACKAGE_ID = "swifteq-zendesk";
+const PACKAGE_ID = "acme-helpdesk";
 
 function createRegistry(pkgOverrides: Record<string, unknown> = {}): PackageRegistry {
   const registry = {
@@ -188,7 +188,7 @@ function createRegistry(pkgOverrides: Record<string, unknown> = {}): PackageRegi
       id: PACKAGE_ID,
       name: PACKAGE_ID,
       transport: "http",
-      base_url: "https://mcp.swifteq.com/api/mcp/sse",
+      base_url: "https://mcp.acme-helpdesk.example/api/mcp/sse",
       oauth: true,
       ...pkgOverrides,
     }),
