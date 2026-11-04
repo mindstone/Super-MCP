@@ -22,17 +22,17 @@ vi.mock("../../logging.js", () => ({
   }),
 }));
 
-// Verbatim Auth0 403 body captured live from auth.swifteq.com on 2026-08-03
-// (REBEL-7F9; tracking id 24f908f054d9bd449edd). This is the exact page the
-// reported user's browser showed — the classification fixture the whole stage
-// exists to fast-fail on.
+// Auth0-shaped 403 body (REBEL-7F9): the structure of the page a browser shows
+// for a rejected redirect_uri, with every tenant identifier replaced by a
+// fictional value — the classification fixture the whole stage exists to
+// fast-fail on.
 const AUTH0_403_BODY = fs.readFileSync(
   path.join(__dirname, "fixtures", "auth0-403-callback-url-mismatch.html"),
   "utf8",
 );
 
 describe("classifyProbeResponse", () => {
-  it("classifies the verbatim Auth0 403 'Callback URL mismatch' page as a rejection", () => {
+  it("classifies the Auth0-shaped 403 'Callback URL mismatch' page as a rejection", () => {
     const verdict = classifyProbeResponse({ status: 403, body: AUTH0_403_BODY });
     expect(verdict.outcome).toBe("rejected");
     expect(verdict.matchedPhrase).toBeTruthy();
@@ -71,13 +71,14 @@ describe("classifyProbeResponse", () => {
   });
 
   it("accepts Auth0's real /login 302 even though its Location carries redirect_uri (live 8080-accepted shape)", () => {
-    // Verbatim Location captured live from auth.swifteq.com 2026-08-03 for the
-    // ACCEPTED http://localhost:8080/oauth/callback authorize request — the
-    // redirect_uri query param is a continuation parameter, NOT an error.
+    // Location shape Auth0 returns for the ACCEPTED
+    // http://localhost:8080/oauth/callback authorize request, with state and
+    // client replaced by fictional values — the redirect_uri query param is a
+    // continuation parameter, NOT an error.
     const verdict = classifyProbeResponse({
       status: 302,
       location:
-        "/login?state=hKFo2SAzNEFPSE9Qa0FmWnJ0SFU0ak1WTDhqRmxWTEpmYmpSRKFupWxvZ2luo3RpZNk&client=pglNl9dRatAnsoaxZzc76aKwH8NDffAg&protocol=oauth2&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Foauth%2Fcallback&scope=openid%20profile%20email%20offline_access",
+        "/login?state=fictional-state-value&client=fictional-client-id&protocol=oauth2&response_type=code&redirect_uri=http%3A%2F%2Flocalhost%3A8080%2Foauth%2Fcallback&scope=openid%20profile%20email%20offline_access",
     });
     expect(verdict.outcome).toBe("accepted");
   });
@@ -159,7 +160,7 @@ describe("rejection error vocabulary carve-out (recall#2 F2(c))", () => {
     expect(isAuthLikeErrorMessageText(error.message)).toBe(false);
   });
 
-  it("the verbatim Auth0 body WOULD match isAuthLikeErrorMessage — pinning why the body must never become the message", () => {
+  it("the Auth0-shaped body WOULD match isAuthLikeErrorMessage — pinning why the body must never become the message", () => {
     expect(AUTH0_403_BODY).toContain("unauthorized_client");
     expect(isAuthLikeErrorMessageText(AUTH0_403_BODY)).toBe(true);
     expect(buildRedirectUriRejectedError({ outcome: "rejected", status: 403 }).message).toContain(

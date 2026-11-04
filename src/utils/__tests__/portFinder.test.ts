@@ -9,12 +9,12 @@ import {
   OAUTH_CALLBACK_VENDOR_COMMON_PORT,
 } from "../portFinder.js";
 
-// REBEL-7F9 Stage 2b (docs/plans/260803_rebel-7f9-swifteq-oauth-callback):
+// REBEL-7F9 Stage 2b:
 // the OAuth callback port picker moves from a linear 5173+ scan to an ordered
 // candidate SEQUENCE so the authorize-probe retry loop (Stage 3) can advance
 // across ports. Fresh, non-static-credential attempt-1 order is
 // [5173, 8080, 5174, …5182] — attempt 1 byte-identical to today (5173),
-// 8080 at position 2 (the port strict allow-list vendors like swifteq's Auth0
+// 8080 at position 2 (the port strict allow-list vendors' Auth0 tenants
 // pin). Static-credential connectors keep the linear 5173-first order
 // (their redirect_uri is pinned in a vendor dashboard; probing alternates is
 // futile).

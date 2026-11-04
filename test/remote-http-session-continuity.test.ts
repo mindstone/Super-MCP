@@ -402,9 +402,8 @@ describe("remote HTTP MCP session continuity", () => {
   // session is silently invalidated.
   //
   // Field-verified: this probe ran 1:1 before each tool call. No fix is
-  // scheduled. The original Stripe attribution was falsified: `stripe_context`
-  // is a stable account ID that survives session rotation and re-auth. See
-  // docs-private/postmortems/260825_model_authored_bug_report_feedback_loop.md.
+  // scheduled. Stripe's `stripe_context` is not an example of this defect: it is
+  // a stable account ID that survives session rotation and re-auth.
   it.fails("preserves a session-bound handle after a transient health-probe failure", async () => {
     const scenario = await createScenario("session-continuity");
     const lifecycleEvents: RegistryLifecycleEvent[] = [];
@@ -456,10 +455,9 @@ describe("remote HTTP MCP session continuity", () => {
     "under a PERSISTENT (not one-shot) probe failure, every call after the first gets a fresh session — a deterministic, not intermittent, break",
     async () => {
       // This generic lifecycle defect is real and field-verified: the probe ran
-      // 1:1 before each tool call. No fix is scheduled. The original Stripe
-      // attribution was falsified: `stripe_context` is a stable account ID that
-      // survives session rotation and re-auth. See docs-private/postmortems/
-      // 260825_model_authored_bug_report_feedback_loop.md.
+      // 1:1 before each tool call. No fix is scheduled. Stripe's `stripe_context`
+      // is not an example of this defect: it is a stable account ID that survives
+      // session rotation and re-auth.
       const scenario = await createScenario("persistent-probe-failure");
 
       // Call 1: no client exists yet, so no health probe runs. Establishes

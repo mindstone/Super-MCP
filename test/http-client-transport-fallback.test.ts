@@ -19,7 +19,7 @@ vi.mock('../src/logging.js', () => ({
   getLogger: () => mockLogger,
 }));
 
-const MCP_URL = 'https://mcp.swifteq.com/api/mcp/sse';
+const MCP_URL = 'https://mcp.acme-helpdesk.example/api/mcp/sse';
 
 function ssePackage(id: string, opts: Partial<PackageConfig> = {}): PackageConfig {
   return {
@@ -103,7 +103,7 @@ describe('HttpMcpClient SSE -> StreamableHTTP transport fallback', () => {
       .join('\n');
   }
 
-  it('Swifteq shape: explicit-SSE GET 405 falls back to StreamableHTTP POST initialize and connects', async () => {
+  it('POST-only server shape: explicit-SSE GET 405 falls back to StreamableHTTP POST initialize and connects', async () => {
     const calls: FetchCall[] = [];
     globalThis.fetch = vi.fn(async (url: any, init?: RequestInit) => {
       const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url;
@@ -126,7 +126,7 @@ describe('HttpMcpClient SSE -> StreamableHTTP transport fallback', () => {
       return new Response(null, { status: 404 });
     }) as unknown as typeof fetch;
 
-    const client = new HttpMcpClient('swifteq-fallback', ssePackage('swifteq-fallback'));
+    const client = new HttpMcpClient('acme-helpdesk-fallback', ssePackage('acme-helpdesk-fallback'));
     await client.connect();
 
     expect(client.isConnected).toBe(true);
@@ -152,7 +152,7 @@ describe('HttpMcpClient SSE -> StreamableHTTP transport fallback', () => {
       return new Response(null, { status: 404 });
     }) as unknown as typeof fetch;
 
-    const client = new HttpMcpClient('swifteq-500', ssePackage('swifteq-500'));
+    const client = new HttpMcpClient('acme-helpdesk-500', ssePackage('acme-helpdesk-500'));
     await expect(client.connect()).rejects.toThrow();
     expect((client as any).usedStreamableHttpFallback).toBe(false);
     const postInit = calls.find((c) => c.method === 'POST' && c.url === MCP_URL && c.body?.includes('"initialize"'));
@@ -171,7 +171,7 @@ describe('HttpMcpClient SSE -> StreamableHTTP transport fallback', () => {
       return new Response(null, { status: 404 });
     }) as unknown as typeof fetch;
 
-    const client = new HttpMcpClient('swifteq-neterr', ssePackage('swifteq-neterr'));
+    const client = new HttpMcpClient('acme-helpdesk-neterr', ssePackage('acme-helpdesk-neterr'));
     await expect(client.connect()).rejects.toThrow();
     expect((client as any).usedStreamableHttpFallback).toBe(false);
     const postInit = calls.find((c) => c.method === 'POST' && c.url === MCP_URL && c.body?.includes('"initialize"'));
@@ -210,7 +210,7 @@ describe('HttpMcpClient SSE -> StreamableHTTP transport fallback', () => {
       return new Response(null, { status: 404 });
     }) as unknown as typeof fetch;
 
-    const client = new HttpMcpClient('swifteq-sseok', ssePackage('swifteq-sseok'));
+    const client = new HttpMcpClient('acme-helpdesk-sseok', ssePackage('acme-helpdesk-sseok'));
     await client.connect();
 
     expect(client.isConnected).toBe(true);
@@ -247,7 +247,7 @@ describe('HttpMcpClient SSE -> StreamableHTTP transport fallback', () => {
       return new Response(null, { status: 404 });
     }) as unknown as typeof fetch;
 
-    const client = new HttpMcpClient('swifteq-authlike', ssePackage('swifteq-authlike'));
+    const client = new HttpMcpClient('acme-helpdesk-authlike', ssePackage('acme-helpdesk-authlike'));
 
     let caught: unknown;
     await client.connect().catch((e) => { caught = e; });
@@ -294,7 +294,7 @@ describe('HttpMcpClient SSE -> StreamableHTTP transport fallback', () => {
       return new Response(null, { status: 404 });
     }) as unknown as typeof fetch;
 
-    const client = new HttpMcpClient('swifteq-loopfree', ssePackage('swifteq-loopfree'));
+    const client = new HttpMcpClient('acme-helpdesk-loopfree', ssePackage('acme-helpdesk-loopfree'));
     await client.connect();
     expect((client as any).usedStreamableHttpFallback).toBe(true);
     expect(
@@ -331,10 +331,10 @@ describe('HttpMcpClient SSE -> StreamableHTTP transport fallback', () => {
 });
 
 const AS_METADATA = {
-  issuer: 'https://auth.swifteq.com/',
-  authorization_endpoint: 'https://auth.swifteq.com/oauth/authorize',
-  token_endpoint: 'https://auth.swifteq.com/oauth/token',
-  registration_endpoint: 'https://mcp.swifteq.com/api/mcp/register',
+  issuer: 'https://auth.acme-helpdesk.example/',
+  authorization_endpoint: 'https://auth.acme-helpdesk.example/oauth/authorize',
+  token_endpoint: 'https://auth.acme-helpdesk.example/oauth/token',
+  registration_endpoint: 'https://mcp.acme-helpdesk.example/api/mcp/register',
   response_types_supported: ['code'],
   code_challenge_methods_supported: ['S256'],
   scopes_supported: ['read', 'write'],
@@ -383,19 +383,19 @@ describe('HttpMcpClient SSE -> StreamableHTTP fallback with OAuth discovery', ()
   });
 
   it('OAuth variant: SSE 405 -> StreamableHTTP 401 -> discovery + DCR + redirect reached, trace preserved', async () => {
-    const provider = new NoBrowserOAuthProvider('swifteq-oauth', 5199);
+    const provider = new NoBrowserOAuthProvider('acme-helpdesk-oauth', 5199);
     await provider.initialize();
 
     const config: PackageConfig = {
-      id: 'swifteq-oauth',
-      name: 'swifteq-oauth',
+      id: 'acme-helpdesk-oauth',
+      name: 'acme-helpdesk-oauth',
       transport: 'http',
       transportType: 'sse',
       base_url: MCP_URL,
       oauth: true,
       visibility: 'default',
     };
-    const client = new HttpMcpClient('swifteq-oauth', config, { oauthProvider: provider });
+    const client = new HttpMcpClient('acme-helpdesk-oauth', config, { oauthProvider: provider });
 
     globalThis.fetch = vi.fn(async (url: any, init?: RequestInit) => {
       const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url;
@@ -411,7 +411,7 @@ describe('HttpMcpClient SSE -> StreamableHTTP fallback with OAuth discovery', ()
         if (body?.method === 'initialize') {
           return new Response('Unauthorized', {
             status: 401,
-            headers: { 'www-authenticate': 'Bearer realm="https://auth.swifteq.com/"' },
+            headers: { 'www-authenticate': 'Bearer realm="https://auth.acme-helpdesk.example/"' },
           });
         }
         return new Response(null, { status: 202 });
@@ -421,7 +421,7 @@ describe('HttpMcpClient SSE -> StreamableHTTP fallback with OAuth discovery', ()
         return new Response(null, { status: 404 });
       }
       // AS metadata discovery (origin) -> 200 with metadata
-      if (urlStr === 'https://mcp.swifteq.com/.well-known/oauth-authorization-server') {
+      if (urlStr === 'https://mcp.acme-helpdesk.example/.well-known/oauth-authorization-server') {
         return new Response(JSON.stringify(AS_METADATA), { status: 200, headers: { 'content-type': 'application/json' } });
       }
       // OIDC discovery -> 404 (not used)
@@ -429,7 +429,7 @@ describe('HttpMcpClient SSE -> StreamableHTTP fallback with OAuth discovery', ()
         return new Response(null, { status: 404 });
       }
       // DCR registration
-      if (urlStr === 'https://mcp.swifteq.com/api/mcp/register' && method === 'POST') {
+      if (urlStr === 'https://mcp.acme-helpdesk.example/api/mcp/register' && method === 'POST') {
         return new Response(JSON.stringify(DCR_RESPONSE), { status: 201, headers: { 'content-type': 'application/json' } });
       }
       return new Response(null, { status: 404 });
@@ -466,19 +466,19 @@ describe('HttpMcpClient SSE -> StreamableHTTP fallback with OAuth discovery', ()
     // token-exchange internals are short-circuited; assert the recreated
     // transport is a StreamableHTTPClientTransport and that no second SSE GET
     // to the MCP endpoint occurs during finishOAuth's reconnect.
-    const provider = new NoBrowserOAuthProvider('swifteq-finish', 5199);
+    const provider = new NoBrowserOAuthProvider('acme-helpdesk-finish', 5199);
     await provider.initialize();
 
     const config: PackageConfig = {
-      id: 'swifteq-finish',
-      name: 'swifteq-finish',
+      id: 'acme-helpdesk-finish',
+      name: 'acme-helpdesk-finish',
       transport: 'http',
       transportType: 'sse',
       base_url: MCP_URL,
       oauth: true,
       visibility: 'default',
     };
-    const client = new HttpMcpClient('swifteq-finish', config, { oauthProvider: provider });
+    const client = new HttpMcpClient('acme-helpdesk-finish', config, { oauthProvider: provider });
 
     const calls: FetchCall[] = [];
     let postInitializeCount = 0;
@@ -499,7 +499,7 @@ describe('HttpMcpClient SSE -> StreamableHTTP fallback with OAuth discovery', ()
           if (postInitializeCount === 1) {
             return new Response('Unauthorized', {
               status: 401,
-              headers: { 'www-authenticate': 'Bearer realm="https://auth.swifteq.com/"' },
+              headers: { 'www-authenticate': 'Bearer realm="https://auth.acme-helpdesk.example/"' },
             });
           }
           return new Response(makeInitializeResult(body.id), {
@@ -512,13 +512,13 @@ describe('HttpMcpClient SSE -> StreamableHTTP fallback with OAuth discovery', ()
       if (urlStr.includes('/.well-known/oauth-protected-resource')) {
         return new Response(null, { status: 404 });
       }
-      if (urlStr === 'https://mcp.swifteq.com/.well-known/oauth-authorization-server') {
+      if (urlStr === 'https://mcp.acme-helpdesk.example/.well-known/oauth-authorization-server') {
         return new Response(JSON.stringify(AS_METADATA), { status: 200, headers: { 'content-type': 'application/json' } });
       }
       if (urlStr.includes('/.well-known/openid-configuration')) {
         return new Response(null, { status: 404 });
       }
-      if (urlStr === 'https://mcp.swifteq.com/api/mcp/register' && method === 'POST') {
+      if (urlStr === 'https://mcp.acme-helpdesk.example/api/mcp/register' && method === 'POST') {
         return new Response(JSON.stringify(DCR_RESPONSE), { status: 201, headers: { 'content-type': 'application/json' } });
       }
       return new Response(null, { status: 404 });
