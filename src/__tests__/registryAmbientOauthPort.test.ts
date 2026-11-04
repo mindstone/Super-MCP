@@ -3,8 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { PackageRegistry } from "../registry.js";
 import type { PackageConfig, SuperMcpConfig } from "../types.js";
 
-// REBEL-7F9 Stage 2c (docs/plans/260803_rebel-7f9-swifteq-oauth-callback,
-// arbitrator recall#1 F9): ambient HttpMcpClient construction used to default
+// REBEL-7F9 Stage 2c (arbitrator recall#1 F9): ambient HttpMcpClient construction used to default
 // blind to OAuth callback port 5173 even when the connector's persisted DCR
 // client lives on another port (the 8080 population grows with Stage 2b).
 // Inert today (ambient clients are refresh-only and redirect-blocked), but the
@@ -69,11 +68,11 @@ describe("PackageRegistry ambient OAuth port coherence", () => {
   it("ambient HTTP client for an OAuth connector is constructed with the saved callback port", async () => {
     getSavedClientPort.mockResolvedValue(8080);
     const registry = createRegistry();
-    const pkg = httpPackage("Swifteq-test", true);
+    const pkg = httpPackage("Acme-helpdesk-test", true);
 
     await (registry as any).createAndConnectClient(pkg.id, pkg);
 
-    expect(getSavedClientPort).toHaveBeenCalledWith("Swifteq-test");
+    expect(getSavedClientPort).toHaveBeenCalledWith("Acme-helpdesk-test");
     expect(httpClientInstances).toHaveLength(1);
     expect(httpClientInstances[0].options).toEqual({ oauthPort: 8080 });
   });

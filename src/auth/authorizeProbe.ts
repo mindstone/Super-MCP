@@ -53,7 +53,7 @@ const REDIRECT_URI_MISMATCH_PHRASE =
  * login/consent page (Okta / some Keycloak configs — recall#2 F7).
  *
  * Deliberately NARROWER than the plan text's error=/redirect_uri/invalid_request
- * disjunction: live verification against auth.swifteq.com (2026-08-03) showed
+ * disjunction: live verification against an Auth0 tenant (2026-08-03) showed
  * Auth0's ACCEPTED shape — the 302 to /login — carries redirect_uri as an
  * ordinary continuation query parameter, so a bare "redirect_uri" match would
  * classify-reject the WORKING port (false positive on the exact flow this

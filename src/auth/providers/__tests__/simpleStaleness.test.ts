@@ -14,7 +14,7 @@ vi.mock("../../../logging.js", () => ({
   }),
 }));
 
-// REBEL-7F9 Stage 2a (docs/plans/260803_rebel-7f9-swifteq-oauth-callback):
+// REBEL-7F9 Stage 2a:
 // the persisted-DCR-client staleness compare moves from a port-only `[0] ===`
 // check to a FULL-URI comparison: the saved client is stale when its normalized
 // redirect_uris (localhost ≡ 127.0.0.1 ≡ [::1]) does NOT include the current
@@ -23,7 +23,7 @@ vi.mock("../../../logging.js", () => ({
 // registration or static-credential provider — the latter synthesizes
 // redirect_uris in memory and must never have its working tokens invalidated).
 
-const PACKAGE_ID = "Swifteq-test";
+const PACKAGE_ID = "Acme-helpdesk-test";
 
 let tokenDir: string;
 

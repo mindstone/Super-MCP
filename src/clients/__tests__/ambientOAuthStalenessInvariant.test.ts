@@ -16,8 +16,7 @@ vi.mock("../../logging.js", () => ({
   }),
 }));
 
-// REBEL-7F9 Stage 2a INVARIANT (docs/plans/260803_rebel-7f9-swifteq-oauth-callback,
-// arbitrator recall#2 F5): the broadened full-URI staleness comparison must
+// REBEL-7F9 Stage 2a INVARIANT (arbitrator recall#2 F5): the broadened full-URI staleness comparison must
 // fire ONLY on the explicit authenticate path (forceOAuth=true). The
 // ambient/refresh path (initializeOAuthIfNeeded(false) → RefreshOnlyOAuthProvider)
 // must NEVER invalidate — a 5173-defaulted ambient client judging an

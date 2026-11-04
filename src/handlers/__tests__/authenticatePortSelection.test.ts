@@ -4,7 +4,7 @@ import { handleAuthenticate } from "../authenticate.js";
 import type { Catalog } from "../../catalog.js";
 import type { PackageRegistry } from "../../registry.js";
 
-// REBEL-7F9 Stage 2b (docs/plans/260803_rebel-7f9-swifteq-oauth-callback):
+// REBEL-7F9 Stage 2b:
 // handler-level coverage of the Part A port-selection branch
 // (authenticate.ts), previously untested — existing tests mock
 // getSavedClientPort → null. Pins: saved-port available → reused (candidate
@@ -114,7 +114,7 @@ vi.mock("../../clients/httpClient.js", async (importOriginal) => {
   return { ...actual, HttpMcpClient: MockHttpMcpClient };
 });
 
-const PACKAGE_ID = "Swifteq-test";
+const PACKAGE_ID = "Acme-helpdesk-test";
 
 function createRegistry(pkgOverrides: Record<string, unknown> = {}): PackageRegistry {
   const registry = {
