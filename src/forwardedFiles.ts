@@ -1,3 +1,5 @@
+import { replaceReadLocations } from './fileReadInputs.js';
+import type { AllowedRead, ReadOperand } from './fileReadProtocol.js';
 import fs from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
@@ -6,7 +8,7 @@ import { getLogger } from "./logging.js";
 
 export const FORWARDED_FILES_RELATIVE_DIR = ".rebel/forwarded-files";
 export const MAX_FORWARDED_FILE_BYTES = 50 * 1024 * 1024;
-const forwardedFilesSchema = z.array(z.object({ path: z.string(), name: z.string(), contentBase64: z.string() }));
+export const forwardedFilesSchema = z.array(z.object({ path: z.string(), name: z.string(), contentBase64: z.string() }));
 type ForwardedFile = z.infer<typeof forwardedFilesSchema>[number];
 
 /** First non-empty parent workspace wins, including when the host key is blank. */
@@ -26,10 +28,17 @@ function mapStrings(value: unknown, map: (text: string) => unknown): unknown {
   return value;
 }
 
-function visitStrings(value: unknown, visit: (text: string) => void): void {
-  if (typeof value === "string") visit(value);
-  else if (Array.isArray(value)) { for (const item of value) visitStrings(item, visit); }
-  else if (value && typeof value === "object") { for (const item of Object.values(value)) visitStrings(item, visit); }
+function visitStrings(value: unknown, visit: (text: string, location: (string | number)[]) => void, location: (string | number)[] = []): void {
+  if (typeof value === "string") visit(value, location);
+  else if (Array.isArray(value)) { value.forEach((item, index) => visitStrings(item, visit, [...location, index])); }
+  else if (value && typeof value === "object") { for (const [key, item] of Object.entries(value)) visitStrings(item, visit, [...location, key]); }
+}
+
+/** Forwarding never considers relative strings; avoid discovery for no-file calls. */
+export function hasAbsoluteForwardingInput(args: unknown): boolean {
+  let found = false;
+  visitStrings(args, text => { if (path.isAbsolute(text)) found = true; });
+  return found;
 }
 
 function validName(name: string): boolean {
@@ -55,46 +64,79 @@ function warnRead(error: unknown): void {
   if (!["ENOENT", "ENOTDIR", "ENAMETOOLONG"].includes(code ?? "")) getLogger().warn("Forwarded file could not be read safely", { code });
 }
 
-/** Collect exact, absolute workspace-file arguments without changing the arguments. */
-export async function collectForwardedFiles(args: unknown, workspacePath = getWorkspacePath()) {
-  const candidates = new Set<string>();
-  visitStrings(args, text => { if (text.length <= 4096 && path.isAbsolute(text) && validName(path.basename(text))) candidates.add(text); });
+export interface ForwardingOptions {
+  /** Present only for a matched declaration and a capable receiver. */
+  operands?: ReadOperand[];
+  authorize?: (operands: ReadOperand[]) => Promise<AllowedRead[]>;
+  signal?: AbortSignal;
+}
+
+/** Select source-owned files first, authorize the batch, then open bytes. */
+export async function collectForwardedFiles(args: unknown, workspacePath = getWorkspacePath(), options: ForwardingOptions = {}) {
+  const allowLinked = options.operands !== undefined && options.authorize !== undefined;
+  const operands: ReadOperand[] = options.operands ?? [];
+  if (!options.operands) visitStrings(args, (rawPath, location) => {
+    if (rawPath.length <= 4096 && path.isAbsolute(rawPath) && validName(path.basename(rawPath))) operands.push({ location, rawPath, resolvedPath: path.resolve(rawPath) });
+  });
   const files: ForwardedFile[] = [];
   let bytes = 0;
-  if (!workspacePath || candidates.size === 0) return { files, bytes };
+  if (!workspacePath || operands.length === 0) return { files, bytes };
   let root: string;
   try { root = await fs.realpath(workspacePath); }
   catch (error) { warnRead(error); return { files, bytes }; }
   const configuredRoot = path.resolve(workspacePath);
-  for (const source of candidates) {
+  const candidates = new Map<string, { target: string; operands: ReadOperand[] }>();
+  for (const operand of operands) {
+    const source = operand.rawPath;
+    if (source.length > 4096 || !path.isAbsolute(source) || !validName(path.basename(source))) continue;
     const lexical = path.resolve(source);
     const sourceRoot = within(configuredRoot, lexical) ? configuredRoot : within(root, lexical) ? root : undefined;
     if (!sourceRoot) continue;
     const target = path.join(root, path.relative(sourceRoot, lexical));
     try {
-      const leaf = await checkedStat(root, target);
+      // Legacy discovery retains its old no-symlink candidate set. Only exact
+      // declarations add lexical aliases through linked directories.
+      const leaf = allowLinked ? await fs.stat(target) : await checkedStat(root, target);
       if (!leaf.isFile()) continue;
+      const candidate = candidates.get(source) ?? { target, operands: [] };
+      candidate.operands.push({ ...operand, resolvedPath: target });
+      candidates.set(source, candidate);
+    } catch (error) { warnRead(error); }
+  }
+  options.signal?.throwIfAborted();
+  const batch = [...candidates.values()].flatMap(candidate => candidate.operands);
+  const reads = options.authorize && batch.length ? await options.authorize(batch) : undefined;
+  options.signal?.throwIfAborted();
+  const approved = new Map(reads?.map(read => [read.rawPath, read.canonicalPath]));
+  for (const [source, candidate] of candidates) {
+    const target = reads ? approved.get(source) : candidate.target;
+    if (!target) throw new Error("File read authority omitted a forwarding candidate");
+    try {
+      options.signal?.throwIfAborted();
+      const leaf = await fs.lstat(target);
+      if (!leaf.isFile() || leaf.isSymbolicLink()) continue;
       const handle = await fs.open(target, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
       try {
         const stat = await handle.stat();
-        const recheck = await checkedStat(root, target);
-        if (!stat.isFile() || stat.dev !== leaf.dev || stat.ino !== leaf.ino || stat.dev !== recheck.dev || stat.ino !== recheck.ino) continue;
+        const recheck = allowLinked ? await fs.lstat(target) : await checkedStat(root, candidate.target);
+        if (!stat.isFile() || stat.dev !== leaf.dev || stat.ino !== leaf.ino || stat.dev !== recheck.dev || stat.ino !== recheck.ino || recheck.isSymbolicLink()) continue;
         const remaining = MAX_FORWARDED_FILE_BYTES - bytes;
         if (stat.size > remaining) return { files, bytes: bytes + stat.size, tooLarge: true };
         const chunks: Buffer[] = [];
         let total = 0;
         const scratch = Buffer.allocUnsafe(Math.min(1024 * 1024, remaining + 1));
         while (true) {
+          options.signal?.throwIfAborted();
           const { bytesRead } = await handle.read(scratch, 0, Math.min(scratch.length, remaining - total + 1), null);
           if (bytesRead === 0) break;
           total += bytesRead;
           if (total > remaining) return { files, bytes: bytes + total, tooLarge: true };
           chunks.push(Buffer.from(scratch.subarray(0, bytesRead)));
         }
-        files.push({ path: source, name: path.basename(lexical), contentBase64: Buffer.concat(chunks).toString("base64") });
+        files.push({ path: source, name: path.basename(source), contentBase64: Buffer.concat(chunks).toString("base64") });
         bytes += total;
       } finally { await handle.close(); }
-    } catch (error) { warnRead(error); }
+    } catch (error) { options.signal?.throwIfAborted(); warnRead(error); }
   }
   return { files, bytes };
 }
@@ -104,7 +146,7 @@ export function forwardedFilesTooLargeMessage(bytes: number, name: string): stri
 }
 
 /** Run against private per-call copies; callers turn thrown errors into tool errors. */
-export async function runWithForwardedFiles<T>(args: unknown, meta: unknown, run: (args: unknown) => Promise<T>, workspacePath = getWorkspacePath(), connectorName = "this connector"): Promise<T> {
+export async function runWithForwardedFiles<T>(args: unknown, meta: unknown, run: (args: unknown) => Promise<T>, workspacePath = getWorkspacePath(), connectorName = "this connector", operands?: ReadOperand[]): Promise<T> {
   if (meta === undefined) return run(args);
   const parsed = forwardedFilesSchema.safeParse(meta);
   if (!parsed.success) throw new Error("Invalid forwarded files");
@@ -140,7 +182,7 @@ export async function runWithForwardedFiles<T>(args: unknown, meta: unknown, run
       await fs.writeFile(target, file.buffer, { flag: "wx", mode: 0o600 });
       replacements.set(file.path, target);
     }
-    return await run(mapStrings(args, text => replacements.get(text) ?? text));
+    return await run(operands ? replaceReadLocations(args, operands, replacements) : mapStrings(args, text => replacements.get(text) ?? text));
   } finally {
     try { await fs.rm(call, { recursive: true, force: true }); }
     catch (error) { getLogger().warn("Forwarded file cleanup failed", { code: (error as NodeJS.ErrnoException).code }); }

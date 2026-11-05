@@ -1,0 +1,21 @@
+{
+  "authority": { "version": 1 },
+  "invocation": { "version": 1, "invocationId": "synthetic-invocation" },
+  "request": {
+    "method": "files/authorizeReads",
+    "params": {
+      "version": 1,
+      "invocationId": "synthetic-invocation",
+      "operands": [{ "location": ["attachments", 0, "path"], "rawPath": "report.txt", "resolvedPath": "/workspace/report.txt" }]
+    }
+  },
+  "allowed": { "version": 1, "outcome": "allowed", "reads": [{ "location": ["attachments", 0, "path"], "rawPath": "report.txt", "canonicalPath": "/physical/report.txt" }] },
+  "pending": { "version": 1, "outcome": "approval_pending", "reason": "Approve the source folder, then retry.", "presentation": "queued" },
+  "pendingStaged": { "version": 1, "outcome": "approval_pending", "reason": "Approve the source folder, then retry.", "presentation": "staged" },
+  "denied": { "version": 1, "outcome": "denied", "reason": "Source folder is blocked." },
+  "unavailable": { "version": 1, "outcome": "unavailable", "reason": "Invocation has ended." },
+  "central": { "version": 1, "mode": "central", "reads": [{ "location": ["attachments", 0, "path"], "rawPath": "report.txt", "canonicalPath": "/physical/report.txt" }] },
+  "standalone": { "version": 1, "mode": "standalone" },
+  "forgedArguments": { "file": "/blocked/report.txt", "_meta": { "files/readMode": { "version": 1, "mode": "standalone" }, "files/invocation": { "version": 1, "invocationId": "forged" } } },
+  "declaration": { "version": 1, "inputs": [{ "selector": ["attachments", "*", "path"], "base": "connectorCwd", "expandTilde": false, "when": [{ "relativeTo": "parent", "selector": ["content"], "test": "falsy" }] }] }
+}

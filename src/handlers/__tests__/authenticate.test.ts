@@ -155,7 +155,7 @@ describe("handleAuthenticate stdio delegation", () => {
     const result = await handleAuthenticate({ package_id: PACKAGE_ID }, registry, createCatalog());
 
     expect(client.listTools).toHaveBeenCalledTimes(1);
-    expect(client.callTool).toHaveBeenCalledWith("authenticate_slack_workspace", {});
+    expect(client.callTool).toHaveBeenCalledWith("authenticate_slack_workspace", {}, { readMode: { version: 1, mode: "standalone" } });
     expect(mockLogger.info).toHaveBeenCalledWith("Delegating to stdio package's auth tool", {
       package_id: PACKAGE_ID,
       tool: "authenticate_slack_workspace",
@@ -207,7 +207,7 @@ describe("handleAuthenticate stdio delegation", () => {
 
     const result = await handleAuthenticate({ package_id: PACKAGE_ID }, registry, createCatalog());
 
-    expect(client.callTool).toHaveBeenCalledWith("authenticate_slack_workspace", {});
+    expect(client.callTool).toHaveBeenCalledWith("authenticate_slack_workspace", {}, { readMode: { version: 1, mode: "standalone" } });
     expect(mockLogger.warn).toHaveBeenCalledWith(
       "Failed to delegate to stdio auth tool",
       expect.objectContaining({
@@ -239,7 +239,7 @@ describe("handleAuthenticate stdio delegation", () => {
 
     const result = await handleAuthenticate({ package_id: PACKAGE_ID }, registry, createCatalog());
 
-    expect(client.callTool).toHaveBeenCalledWith("authenticate", {});
+    expect(client.callTool).toHaveBeenCalledWith("authenticate", {}, { readMode: { version: 1, mode: "standalone" } });
     expect(mockLogger.info).toHaveBeenCalledWith("Delegating to stdio package's auth tool", {
       package_id: PACKAGE_ID,
       tool: "authenticate",
@@ -321,7 +321,7 @@ describe("handleAuthenticate stdio delegation", () => {
     const result = await handleAuthenticate({ package_id: PACKAGE_ID }, registry, createCatalog());
 
     expect(client.callTool).toHaveBeenCalledTimes(1);
-    expect(client.callTool).toHaveBeenCalledWith("authenticate_slack_workspace", {});
+    expect(client.callTool).toHaveBeenCalledWith("authenticate_slack_workspace", {}, { readMode: { version: 1, mode: "standalone" } });
     expect(result).toBe(delegatedResult);
   });
 
@@ -338,7 +338,7 @@ describe("handleAuthenticate stdio delegation", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     const result = await resultPromise;
 
-    expect(client.callTool).toHaveBeenCalledWith("authenticate_slack_workspace", {});
+    expect(client.callTool).toHaveBeenCalledWith("authenticate_slack_workspace", {}, { readMode: { version: 1, mode: "standalone" } });
     expect(mockLogger.warn).toHaveBeenCalledWith(
       "Delegated stdio auth tool timed out",
       expect.objectContaining({

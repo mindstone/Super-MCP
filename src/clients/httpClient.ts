@@ -1,3 +1,4 @@
+import type { ChildToolCallContext } from '../fileReadProtocol.js';
 import { ErrorCode, McpError, type ListResourcesResult } from "@modelcontextprotocol/sdk/types.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -5,7 +6,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
 import { TemporarilyUnavailableError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import PQueue from "p-queue";
-import { DEFAULT_TOOL_TIMEOUT_MS, McpClient, PackageConfig, ReadResourceResult } from "../types.js";
+import { getToolTimeout, McpClient, PackageConfig, ReadResourceResult } from "../types.js";
 import { getLogger } from "../logging.js";
 import { failDroppedAnswers } from "./failDroppedAnswers.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
@@ -1023,7 +1024,7 @@ export class HttpMcpClient implements McpClient {
     }) as Promise<any[]>;
   }
 
-  async callTool(name: string, args: any): Promise<any> {
+  async callTool(name: string, args: any, context: ChildToolCallContext = { readMode: "unnegotiated" }): Promise<any> {
     if (!this.isConnected) {
       throw new Error(`Package '${this.packageId}' is not connected`);
     }
@@ -1031,8 +1032,7 @@ export class HttpMcpClient implements McpClient {
     // Matches Rebel Core's 90-minute TOOL_CALL_TIMEOUT in src/core/rebelCore/mcpClient.ts
     // so a call Rebel has given up on frees its connector slot at about the same time.
     // The env var overrides the default.
-    const timeout = this.config.timeout ||
-                    parseInt(process.env.SUPER_MCP_TOOL_TIMEOUT || String(DEFAULT_TOOL_TIMEOUT_MS));
+    const timeout = getToolTimeout(this.config);
 
     logger.info("Calling tool on HTTP MCP", {
       package_id: this.packageId,
@@ -1043,6 +1043,7 @@ export class HttpMcpClient implements McpClient {
     });
 
     return this.enqueue(async () => {
+      context.signal?.throwIfAborted();
       try {
         const response = await this.client.callTool({
           name,

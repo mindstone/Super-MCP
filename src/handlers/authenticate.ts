@@ -227,7 +227,7 @@ async function handleAuthenticateCore(
 
         try {
           return await Promise.race([
-            client.callTool(authTool.name, {}),
+            client.callTool(authTool.name, {}, { readMode: { version: 1, mode: "standalone" } }),
             timeoutPromise,
           ]);
         } catch (err) {

@@ -100,7 +100,7 @@ describe('PackageRegistry Stage 6 reaper-race fix', () => {
     (registry as any).lastActivity.set('leased-pkg', Date.now() - 400_000);
 
     // Start the call but do NOT await yet — the lease is acquired synchronously.
-    const callPromise = registry.callTool('leased-pkg', 'do_thing', {});
+    const callPromise = registry.callTool('leased-pkg', 'do_thing', {}, { kind: 'standalone' });
 
     // While the call is pending, run a sweep with the client well past idle.
     (registry as any).sweepIdleClients();
@@ -138,7 +138,7 @@ describe('PackageRegistry Stage 6 reaper-race fix', () => {
       .spyOn(registry as any, 'createAndConnectClient')
       .mockResolvedValue(freshClient);
 
-    const result = await registry.callTool('stale-pkg', 'do_thing', {});
+    const result = await registry.callTool('stale-pkg', 'do_thing', {}, { kind: 'standalone' });
 
     // Stale client deleted, fresh one created and used.
     expect(staleClient.callTool).not.toHaveBeenCalled();
@@ -172,7 +172,7 @@ describe('PackageRegistry Stage 6 reaper-race fix', () => {
 
     const createSpy = vi.spyOn(registry as any, 'createAndConnectClient');
 
-    await expect(registry.callTool('midcall-pkg', 'do_thing', {})).rejects.toThrow(
+    await expect(registry.callTool('midcall-pkg', 'do_thing', {}, { kind: 'standalone' })).rejects.toThrow(
       /-32000|Connection closed/,
     );
 
