@@ -70,8 +70,8 @@ function createMockRegistry(overrides: {
 describe('readResource Strategy 0: _meta.rebel_packageId routing', () => {
   it('routes to hinted package when valid', async () => {
     const hintedPkg: PackageConfig = {
-      id: 'GoogleWorkspace-greg',
-      name: 'Google Workspace (Greg)',
+      id: 'GoogleWorkspace-sam',
+      name: 'Google Workspace (Sam)',
       transport: 'http',
       base_url: 'http://localhost:4000',
       visibility: 'default',
@@ -79,19 +79,19 @@ describe('readResource Strategy 0: _meta.rebel_packageId routing', () => {
 
     const client = createMockClient();
     const getClient = vi.fn().mockResolvedValue(client);
-    const getPackage = vi.fn((id: string) => (id === 'GoogleWorkspace-greg' ? hintedPkg : undefined));
+    const getPackage = vi.fn((id: string) => (id === 'GoogleWorkspace-sam' ? hintedPkg : undefined));
 
     const registry = createMockRegistry({ getClient, getPackage });
     const catalog = createMockCatalog();
 
     await handleReadResource(
-      { uri: 'ui://google-workspace/compose-email', _meta: { rebel_packageId: 'GoogleWorkspace-greg' } },
+      { uri: 'ui://google-workspace/compose-email', _meta: { rebel_packageId: 'GoogleWorkspace-sam' } },
       registry,
       catalog,
     );
 
     // Should route via Strategy 0 hint
-    expect(getClient).toHaveBeenCalledWith('GoogleWorkspace-greg');
+    expect(getClient).toHaveBeenCalledWith('GoogleWorkspace-sam');
     // Strategy 1 should NOT be consulted
     expect(catalog.getPackageForResourceUri).not.toHaveBeenCalled();
   });

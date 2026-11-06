@@ -1636,7 +1636,7 @@ export async function handleUseTool(
 
   // R2 — shared package-alias resolver. When the agent passes the base server
   // name (e.g. "GoogleWorkspace") instead of a multi-instance package id
-  // (e.g. "GoogleWorkspace-greg-work-com"), recover by querying the registry
+  // (e.g. "GoogleWorkspace-sam-work-com"), recover by querying the registry
   // for every package whose id starts with `${alias}-`. Unique match wins
   // (breadcrumb); ambiguous match surfaces ACCOUNT_SELECTION_REQUIRED with
   // the candidate list so the agent can ask the user which account to use.

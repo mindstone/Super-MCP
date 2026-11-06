@@ -67,7 +67,7 @@ export interface SuperMcpConfig {
   // Example: { "filesystem": ["delete_file"], "gmail": ["send_email"] }
   userDisabledToolsByServer?: Record<string, string[]>;
   // Disabled servers - these servers are completely excluded from routing
-  // Server IDs are the keys in mcpServers (e.g., "GoogleWorkspace-greg-work-com", "Slack-mindstone")
+  // Server IDs are the keys in mcpServers (e.g., "GoogleWorkspace-sam-work-com", "Slack-mindstone")
   // Example: ["Slack-mindstone", "HubSpot"]
   disabledServers?: string[];
   // Admin-disabled tools by catalog ID (set by organization administrators)

@@ -68,8 +68,8 @@ function createMocks(opts: {
 describe("useTool R5 — bare tool-name resolver", () => {
   it("resolves a bare tool to its single owning package and emits a breadcrumb", async () => {
     const { mockRegistry, mockCatalog, mockValidator } = createMocks({
-      packages: [makePackageConfig("GoogleWorkspace-greg-work-com")],
-      toolMatches: [{ packageId: "GoogleWorkspace-greg-work-com", toolId: "search_workspace_emails" }],
+      packages: [makePackageConfig("GoogleWorkspace-sam-work-com")],
+      toolMatches: [{ packageId: "GoogleWorkspace-sam-work-com", toolId: "search_workspace_emails" }],
     });
 
     const response = await handleUseTool(
@@ -87,24 +87,24 @@ describe("useTool R5 — bare tool-name resolver", () => {
     expect(response.isError).toBe(false);
     const meta = (response as { _meta?: Record<string, unknown> })._meta;
     const superMcp = meta?.superMcp as Record<string, unknown> | undefined;
-    expect(superMcp?.packageId).toBe("GoogleWorkspace-greg-work-com");
+    expect(superMcp?.packageId).toBe("GoogleWorkspace-sam-work-com");
     expect(superMcp?.toolResolution).toEqual({
       from: "search_workspace_emails",
       to: "search_workspace_emails",
-      packageId: "GoogleWorkspace-greg-work-com",
+      packageId: "GoogleWorkspace-sam-work-com",
     });
   });
 
   it("ignores R5 when tool_id contains a `Package__` prefix", async () => {
     const { mockRegistry, mockCatalog, mockValidator } = createMocks({
-      packages: [makePackageConfig("GoogleWorkspace-greg-work-com")],
+      packages: [makePackageConfig("GoogleWorkspace-sam-work-com")],
       toolMatches: [],
     });
 
     const response = await handleUseTool(
       {
         package_id: "",
-        tool_id: "GoogleWorkspace-greg-work-com__search_workspace_emails",
+        tool_id: "GoogleWorkspace-sam-work-com__search_workspace_emails",
         args: {},
         max_output_chars: null,
       },
@@ -117,7 +117,7 @@ describe("useTool R5 — bare tool-name resolver", () => {
     expect(response.isError).toBe(false);
     const meta = (response as { _meta?: Record<string, unknown> })._meta;
     const superMcp = meta?.superMcp as Record<string, unknown> | undefined;
-    expect(superMcp?.packageId).toBe("GoogleWorkspace-greg-work-com");
+    expect(superMcp?.packageId).toBe("GoogleWorkspace-sam-work-com");
     expect(superMcp).not.toHaveProperty("toolResolution");
   });
 
