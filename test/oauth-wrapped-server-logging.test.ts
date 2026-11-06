@@ -26,6 +26,7 @@ vi.mock("@modelcontextprotocol/sdk/server/index.js", () => ({
       handlers.set(schema, handler);
     }
     async connect() {}
+    getClientCapabilities() { return {}; }
   },
 }));
 vi.mock("@modelcontextprotocol/sdk/server/stdio.js", () => ({
@@ -137,7 +138,10 @@ describe("wrapped OAuth errors at the server logging boundary", () => {
     expectPrivateCause(wrapped);
 
     const callTool = handlers.get(CallToolRequestSchema)!;
-    await expect(callTool({ params: { name: "use_tool", arguments: input } })).rejects.toMatchObject({
+    await expect(callTool(
+      { params: { name: "use_tool", arguments: input } },
+      { signal: new AbortController().signal, sendRequest: vi.fn() },
+    )).rejects.toMatchObject({
       message: expect.stringContaining(SENTINEL), data: { original_error: SENTINEL },
     });
     expect(logger.error).toHaveBeenCalledWith("Tool execution failed", {

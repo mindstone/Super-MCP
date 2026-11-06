@@ -67,7 +67,7 @@ describe("bulk_export result payloads", () => {
     expect(await run({ pagination: { token_field: "nextCursor", input_param: "cursor" } }))
       .toMatchObject({ status: "complete", pages: 2, lines: 3 });
     expect(callTool).toHaveBeenCalledTimes(2);
-    expect(callTool).toHaveBeenNthCalledWith(2, "example", "list_attendees", { limit: 2, cursor: "page-2" });
+    expect(callTool).toHaveBeenNthCalledWith(2, "example", "list_attendees", { limit: 2, cursor: "page-2" }, { kind: "standalone", signal: expect.any(AbortSignal) });
     expect(await readOutput()).toBe('{"id":1}\n{"id":2}\n{"id":3}\n');
   }, 15_000);
 

@@ -169,7 +169,7 @@ it('delegates homed stdio authentication locally and closes that temporary clien
   const close = vi.spyOn(StdioMcpClient.prototype, 'close').mockResolvedValue(undefined);
   expect(await handleAuthenticate({ package_id: 'notebook' }, registry, new Catalog(registry))).toMatchObject({ content: [{ text: 'started fresh' }] });
   expect(connect).toHaveBeenCalledOnce();
-  expect(call).toHaveBeenCalledWith('authenticate', {});
+  expect(call).toHaveBeenCalledWith('authenticate', {}, { readMode: { version: 1, mode: 'standalone' } });
   expect(close).toHaveBeenCalledOnce();
   expect((registry as any).clients.has('notebook')).toBe(false);
 });

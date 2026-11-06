@@ -42,7 +42,8 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
   },
 }));
 
-vi.mock('@modelcontextprotocol/sdk/client/stdio.js', () => ({
+vi.mock('@modelcontextprotocol/sdk/client/stdio.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@modelcontextprotocol/sdk/client/stdio.js')>()),
   StdioClientTransport: class MockStdioClientTransport {
     pid = 4321;
     onerror: ((error: Error) => void) | undefined;
