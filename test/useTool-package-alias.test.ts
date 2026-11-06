@@ -1,5 +1,5 @@
 // R2 regression: super-mcp resolves bare package aliases (e.g. "GoogleWorkspace")
-// to the unique active instance ("GoogleWorkspace-greg-work-com") and emits a
+// to the unique active instance ("GoogleWorkspace-sam-work-com") and emits a
 // telemetry breadcrumb. Ambiguous aliases throw a structured ACCOUNT_SELECTION
 // error so the agent can re-prompt the user.
 //
@@ -71,7 +71,7 @@ function createMocks(opts: { packages: PackageConfig[] }) {
 describe("useTool R2 — bare package alias resolver", () => {
   it("resolves a bare base name to a single active instance and emits a breadcrumb", async () => {
     const { mockRegistry, mockCatalog, mockValidator } = createMocks({
-      packages: [makePackageConfig("GoogleWorkspace-greg-work-com")],
+      packages: [makePackageConfig("GoogleWorkspace-sam-work-com")],
     });
 
     const response = await handleUseTool(
@@ -89,21 +89,21 @@ describe("useTool R2 — bare package alias resolver", () => {
     expect(response.isError).toBe(false);
     const meta = (response as { _meta?: Record<string, unknown> })._meta;
     const superMcp = meta?.superMcp as Record<string, unknown> | undefined;
-    expect(superMcp?.packageId).toBe("GoogleWorkspace-greg-work-com");
+    expect(superMcp?.packageId).toBe("GoogleWorkspace-sam-work-com");
     expect(superMcp?.packageResolution).toEqual({
       from: "GoogleWorkspace",
-      to: "GoogleWorkspace-greg-work-com",
+      to: "GoogleWorkspace-sam-work-com",
     });
   });
 
   it("leaves a resolved package_id unchanged", async () => {
     const { mockRegistry, mockCatalog, mockValidator } = createMocks({
-      packages: [makePackageConfig("GoogleWorkspace-greg-work-com")],
+      packages: [makePackageConfig("GoogleWorkspace-sam-work-com")],
     });
 
     const response = await handleUseTool(
       {
-        package_id: "GoogleWorkspace-greg-work-com",
+        package_id: "GoogleWorkspace-sam-work-com",
         tool_id: "list_workspace_accounts",
         args: {},
         max_output_chars: null,
@@ -122,8 +122,8 @@ describe("useTool R2 — bare package alias resolver", () => {
   it("throws ACCOUNT_SELECTION-style error on ambiguous alias", async () => {
     const { mockRegistry, mockCatalog, mockValidator } = createMocks({
       packages: [
-        makePackageConfig("GoogleWorkspace-greg-work-com"),
-        makePackageConfig("GoogleWorkspace-greg-personal-com"),
+        makePackageConfig("GoogleWorkspace-sam-work-com"),
+        makePackageConfig("GoogleWorkspace-sam-personal-com"),
       ],
     });
 
@@ -142,8 +142,8 @@ describe("useTool R2 — bare package alias resolver", () => {
       data: expect.objectContaining({
         ambiguous: true,
         candidates: expect.arrayContaining([
-          expect.objectContaining({ package_id: "GoogleWorkspace-greg-work-com" }),
-          expect.objectContaining({ package_id: "GoogleWorkspace-greg-personal-com" }),
+          expect.objectContaining({ package_id: "GoogleWorkspace-sam-work-com" }),
+          expect.objectContaining({ package_id: "GoogleWorkspace-sam-personal-com" }),
         ]),
       }),
     });
