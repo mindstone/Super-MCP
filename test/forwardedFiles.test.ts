@@ -184,7 +184,12 @@ describe('forwarded workspace files', () => {
     let totalRead = 0;
     vi.spyOn(fs, 'open').mockImplementationOnce(async (...args) => {
       const handle = await realOpen(...args);
-      vi.spyOn(handle, 'read').mockImplementation(async (buffer: Buffer, offset: number, length: number) => {
+      vi.spyOn(handle, 'read').mockImplementation(async (...readArgs: unknown[]) => {
+        const [buffer, offset, length] = readArgs;
+        // This sink uses the positional Buffer overload; fail if that changes.
+        if (!Buffer.isBuffer(buffer) || typeof offset !== 'number' || typeof length !== 'number') {
+          throw new Error('Expected a positional Buffer read');
+        }
         totalRead += length;
         buffer.fill(0, offset, offset + length);
         return { bytesRead: length, buffer };
@@ -311,6 +316,7 @@ describe('forwarded workspace files', () => {
     const source = await write('report.txt', 'desktop-only bytes');
     const { files } = await collectForwardedFiles({ file_path: source });
     const registry = new PackageRegistry({ mcpServers: { notebook: { command: 'unused' } } });
+    vi.spyOn(registry, 'getClient').mockResolvedValue({ getToolMetadata: async () => undefined } as any);
     vi.spyOn(registry, 'callTool').mockImplementation(async (_package, _tool, args) => {
       const target = (args as { file_path: string }).file_path;
       expect(target).not.toBe(source);
@@ -324,5 +330,149 @@ describe('forwarded workspace files', () => {
     await Promise.all([server.connect(left), client.connect(right)]);
     expect(await client.callTool({ name: 'upload_file', arguments: { file_path: source }, _meta: { 'rebel/forwardedFiles': files } })).toMatchObject({ content: [{ text: 'desktop-only bytes' }] });
     expect(await fs.readdir(path.join(cloud, FORWARDED_FILES_RELATIVE_DIR))).toEqual([]);
+  });
+});
+
+import { expandReadInputs, readInputsSchema } from '../src/fileReadInputs.js';
+import { authorizeReads, DECLARED_FORWARDING, type ToolDispatchContext } from '../src/fileReadProtocol.js';
+
+const declaredInput = readInputsSchema.parse({ version: 1, inputs: [{ selector: ['file'], base: 'connectorCwd', expandTilde: false }] });
+const sourceOperands = (args: unknown) => expandReadInputs(args, declaredInput, { connectorCwd: process.cwd() });
+function sourceOrigin(outcome: 'allowed' | 'denied' | 'approval_pending' = 'allowed') {
+  const sendRequest = vi.fn().mockImplementation(async request => ({ version: 1, outcome, ...(outcome === 'allowed'
+    ? { reads: await Promise.all(request.params.operands.map(async (operand: any) => ({ location: operand.location, rawPath: operand.rawPath, canonicalPath: await fs.realpath(operand.resolvedPath) }))) }
+    : { reason: 'Source folder is held', ...(outcome === 'approval_pending' ? { presentation: 'queued' } : {}) }) }));
+  const context: ToolDispatchContext = { kind: 'origin', authority: { version: 1 }, signal: new AbortController().signal, sendRequest, metadata: { 'files/invocation': { version: 1, invocationId: 'active' } } };
+  return { context, sendRequest, authorize: (operands: any) => authorizeReads(operands, context, 1000) };
+}
+
+describe('central source preflight and declared forwarding compatibility', () => {
+  it.each([false, true])('refuses a real forwarding candidate without binding before bytes or dispatch (declared=%s)', async exact => {
+    const file = await write('report.txt');
+    const source = sourceOrigin(); source.context.metadata = undefined;
+    const { client, dispatch } = homeClient();
+    vi.spyOn(Client.prototype, 'getServerCapabilities').mockReturnValue(exact ? { experimental: { [DECLARED_FORWARDING]: { version: 1 } } } : {});
+    vi.spyOn(Client.prototype, 'listTools').mockResolvedValue({ tools: [{ name: 'upload', inputSchema: { type: 'object' }, _meta: { 'files/readInputs': declaredInput } }] });
+    const open = vi.spyOn(fs, 'open');
+    await expect(client.callToolFromOrigin('upload', { file }, source.context)).rejects.toThrow('requires an active invocation binding');
+    expect(source.sendRequest).not.toHaveBeenCalled();
+    expect(open).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it('dispatches home no-file calls without binding and carries no upstream metadata or cancellation', async () => {
+    const source = sourceOrigin(); source.context.metadata = { trace: 'private', progressToken: 'host-progress', 'host/private': 'host-only' };
+    const { client, dispatch } = homeClient();
+    await client.callToolFromOrigin('write_note', { text: 'hello' }, source.context);
+    expect(source.sendRequest).not.toHaveBeenCalled();
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(dispatch.mock.calls[0][0]).toEqual({ name: 'write_note', arguments: { text: 'hello' } });
+    expect(dispatch.mock.calls[0][2]).not.toHaveProperty('signal');
+  });
+
+  it.each(['denied', 'approval_pending'] as const)('checks legacy candidates centrally before opening bytes on %s', async outcome => {
+    const file = await write('report.txt'); const source = sourceOrigin(outcome);
+    const open = vi.spyOn(fs, 'open');
+    await expect(collectForwardedFiles({ attachment: file }, desktop, source)).rejects.toThrow('Source folder is held');
+    expect(source.sendRequest).toHaveBeenCalledTimes(1); expect(open).not.toHaveBeenCalled();
+  });
+
+  it('preflights the whole legacy batch once before the first byte read', async () => {
+    const first = await write('one.txt'), second = await write('two.txt'); const source = sourceOrigin();
+    const realOpen = fs.open.bind(fs);
+    vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      expect(source.sendRequest).toHaveBeenCalledTimes(1);
+      expect(source.sendRequest.mock.calls[0][0].params.operands).toHaveLength(2);
+      return realOpen(...args);
+    });
+    expect((await collectForwardedFiles({ first, second }, desktop, source)).files).toHaveLength(2);
+  });
+
+  it('adds linked Library aliases only on the declared route and leaves unrelated paths alone', async () => {
+    const outside = path.join(root, 'space'); await fs.mkdir(outside); await fs.writeFile(path.join(outside, 'report.txt'), 'linked bytes');
+    await fs.symlink(outside, path.join(desktop, 'space'));
+    const file = path.join(desktop, 'space', 'report.txt'); const source = sourceOrigin();
+    expect((await collectForwardedFiles({ file, literal: file }, desktop, source)).files).toEqual([]);
+    expect(source.sendRequest).not.toHaveBeenCalled();
+    const result = await collectForwardedFiles({ file, literal: file }, desktop, { ...source, operands: await sourceOperands({ file }) });
+    expect(result.files).toEqual([{ path: file, name: 'report.txt', contentBase64: Buffer.from('linked bytes').toString('base64') }]);
+    expect(source.sendRequest).toHaveBeenCalledTimes(1);
+    expect((await collectForwardedFiles({ file: path.join(outside, 'report.txt') }, desktop, { ...source, operands: await sourceOperands({ file: path.join(outside, 'report.txt') }) })).files).toEqual([]);
+  });
+
+  it('accepts the old envelope but replaces only local declared locations on a new home', async () => {
+    const args = { file: entry().path, literal: entry().path, output: entry().path };
+    await runWithForwardedFiles(args, [entry()], async cloned => {
+      const actual = cloned as typeof args;
+      expect(actual.file).not.toBe(args.file); expect(actual.literal).toBe(args.literal); expect(actual.output).toBe(args.output);
+      expect(await fs.readFile(actual.file, 'utf8')).toBe('fictional bytes');
+    }, cloud, 'Fixture', await sourceOperands(args));
+    expect(args.file).toBe(entry().path);
+    expect(await fs.readdir(path.join(cloud, FORWARDED_FILES_RELATIVE_DIR))).toEqual([]);
+  });
+
+  it('keeps remote-only operands unchanged and the new home dispatch explicitly standalone', async () => {
+    const remote = path.join(cloud, 'remote.txt'); await fs.writeFile(remote, 'remote bytes');
+    const source = sourceOrigin();
+    expect((await collectForwardedFiles({ file: remote }, desktop, { ...source, operands: await sourceOperands({ file: remote }) })).files).toEqual([]);
+    expect(source.sendRequest).not.toHaveBeenCalled();
+    const registry = new PackageRegistry({ mcpServers: { notebook: { command: 'unused' } } });
+    const child = { getToolMetadata: async () => ({ 'files/readInputs': declaredInput }), callTool: vi.fn().mockImplementation(async (_name, args, context) => {
+      expect(context.metadata['files/readMode']).toEqual({ version: 1, mode: 'standalone' });
+      expect(args.file).toBe(remote);
+      return { content: [{ type: 'text', text: 'strict child read' }] };
+    }) };
+    vi.spyOn(registry, 'getClient').mockResolvedValue(child as any);
+    const server = createPackageServer(registry, 'notebook', cloud); const client = new Client({ name: 'fixture', version: '1' });
+    const [left, right] = InMemoryTransport.createLinkedPair(); cleanup.push(() => registry.closeAll(), () => server.close(), () => client.close());
+    await Promise.all([server.connect(left), client.connect(right)]);
+    expect(await client.callTool({ name: 'upload', arguments: { file: remote } })).toMatchObject({ content: [{ text: 'strict child read' }] });
+    expect(child.callTool).toHaveBeenCalledTimes(1);
+  });
+
+  it('negotiates the exact route before execution and keeps the old envelope for old receiver schemas', async () => {
+    const sourceFile = await write('report.txt', 'abc'); const source = sourceOrigin();
+    source.context.metadata = { ...source.context.metadata, trace: 'private', progressToken: 'host-progress', 'host/private': 'host-only' };
+    const { client, dispatch } = homeClient();
+    const capability = vi.spyOn(Client.prototype, 'getServerCapabilities').mockReturnValue({ experimental: { [DECLARED_FORWARDING]: { version: 1 } } });
+    vi.spyOn(Client.prototype, 'listTools').mockResolvedValue({ tools: [{ name: 'upload', inputSchema: { type: 'object' }, _meta: { 'files/readInputs': declaredInput } }] });
+    await client.callToolFromOrigin('upload', { file: sourceFile, literal: sourceFile }, source.context);
+    expect(source.sendRequest.mock.calls[0][0].params.operands).toHaveLength(1);
+    const envelope = dispatch.mock.calls[0][0]._meta!['rebel/forwardedFiles'];
+    expect(dispatch.mock.calls[0][0]._meta).toEqual({ 'rebel/forwardedFiles': envelope });
+    expect(dispatch.mock.calls[0][2]).not.toHaveProperty('signal');
+    expect(envelope).toEqual([{ path: sourceFile, name: 'report.txt', contentBase64: 'YWJj' }]);
+    expect(Object.keys((envelope as any)[0]).sort()).toEqual(['contentBase64', 'name', 'path']);
+    capability.mockReturnValue({}); source.sendRequest.mockClear();
+    await client.callToolFromOrigin('upload', { file: sourceFile, literal: sourceFile }, source.context);
+    // Old receiver selected legacy before execution; both equal strings remain its known limitation.
+    expect(source.sendRequest.mock.calls[0][0].params.operands).toHaveLength(2);
+    expect(dispatch.mock.calls[1][0]._meta!['rebel/forwardedFiles']).toEqual(envelope);
+  });
+});
+
+describe('new package endpoint declaration lookup', () => {
+  it('uses the local declaration for an old envelope and preserves literal/output fields', async () => {
+    const args = { file: entry().path, literal: entry().path, output: entry().path };
+    const registry = new PackageRegistry({ mcpServers: { notebook: { command: 'unused' } } });
+    const child = { getToolMetadata: async () => ({ 'files/readInputs': declaredInput }), callTool: vi.fn().mockImplementation(async (_name, execution, context) => {
+      expect(context.readMode).toEqual({ version: 1, mode: 'standalone' });
+      expect(execution.literal).toBe(args.literal); expect(execution.output).toBe(args.output);
+      expect(execution.file).not.toBe(args.file);
+      return { content: [{ type: 'text', text: await fs.readFile(execution.file, 'utf8') }] };
+    }) };
+    vi.spyOn(registry, 'getClient').mockResolvedValue(child as any);
+    const server = createPackageServer(registry, 'notebook', cloud); const client = new Client({ name: 'fixture', version: '1' });
+    const [left, right] = InMemoryTransport.createLinkedPair(); cleanup.push(() => registry.closeAll(), () => server.close(), () => client.close());
+    await Promise.all([server.connect(left), client.connect(right)]);
+    expect(await client.callTool({ name: 'upload', arguments: args, _meta: { 'rebel/forwardedFiles': [entry()] } })).toMatchObject({ content: [{ text: 'fictional bytes' }] });
+    expect(child.callTool).toHaveBeenCalledTimes(1); expect(args.file).toBe(entry().path);
+    expect(await fs.readdir(path.join(cloud, FORWARDED_FILES_RELATIVE_DIR))).toEqual([]);
+  });
+
+  it('retains strict source containment for standalone declared forwarding', async () => {
+    const outside = path.join(root, 'outside.txt'); await fs.writeFile(outside, 'private');
+    const file = path.join(desktop, 'alias.txt'); await fs.symlink(outside, file);
+    expect((await collectForwardedFiles({ file }, desktop, { operands: await sourceOperands({ file }) })).files).toEqual([]);
   });
 });

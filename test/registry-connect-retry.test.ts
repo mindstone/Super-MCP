@@ -1199,7 +1199,7 @@ describe("PackageRegistry connect retry", () => {
           close: () => Promise<void>;
         };
         transport: { pid: number | null };
-        requestQueue: { pending: number; size: number };
+        requestQueue: { pending: number; size: number; once: (event: "add", listener: () => void) => void };
       };
       const sdkCallTool = vi.fn().mockImplementation(() => {
         runningStarted.resolve(undefined);
@@ -1239,6 +1239,8 @@ describe("PackageRegistry connect retry", () => {
         (error: unknown) => error,
       );
       await runningStarted.promise;
+      const queuedEntered = deferred<void>();
+      stdioInternals.requestQueue.once("add", () => queuedEntered.resolve(undefined));
       const queuedOutcome = registry.callTool(packageId, "queued", {}).then(
         () => {
           queuedCallStatus = "fulfilled";
@@ -1249,9 +1251,8 @@ describe("PackageRegistry connect retry", () => {
         },
       );
       await secondHealthChecked.promise;
-      await Promise.resolve();
-      await Promise.resolve();
-      expect(stdioInternals.requestQueue).toMatchObject({ pending: 1, size: 1 });
+      await queuedEntered.promise;
+      expect({ pending: stdioInternals.requestQueue.pending, size: stdioInternals.requestQueue.size }).toEqual({ pending: 1, size: 1 });
       expect(internals.activeLeases.get(packageId)).toBe(2);
       expect(internals.activeLeaseClients?.get(packageId)?.get(client)).toBe(2);
 
@@ -1281,11 +1282,11 @@ describe("PackageRegistry connect retry", () => {
         expect(internals.terminal).toBe(false);
         expect(closeSpy).toHaveBeenCalledOnce();
         expect(client.hasPendingRequests()).toBe(false);
-        expect(stdioInternals.requestQueue).toMatchObject({ pending: 0, size: 0 });
+        expect({ pending: stdioInternals.requestQueue.pending, size: stdioInternals.requestQueue.size }).toEqual({ pending: 0, size: 0 });
         expect(queuedCallStatus).toBe("rejected");
         expect(queuedCallError).toMatchObject({ code: -32000, message: "MCP error -32000: Connection closed" });
         expect(sdkCallTool).toHaveBeenCalledOnce();
-        expect(sdkCallTool.mock.calls[0][0]).toEqual({ name: "running", arguments: {} });
+        expect(sdkCallTool.mock.calls[0][0]).toEqual({ name: "running", arguments: {}, _meta: { "files/readMode": { version: 1, mode: "standalone" } } });
         expect(internals.activeLeases.has(packageId)).toBe(false);
         expect(internals.activeLeaseClients?.has(packageId)).toBe(false);
         if (closeRoute === "unhealthy eviction") {

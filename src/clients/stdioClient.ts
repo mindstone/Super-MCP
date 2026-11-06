@@ -1,3 +1,6 @@
+import type { InputBases } from '../fileReadInputs.js';
+import { effectiveInputBases } from '../fileReadPreflight.js';
+import { FILE_READ_MODES, type ChildToolCallContext } from '../fileReadProtocol.js';
 import { ErrorCode, McpError, type ListResourcesResult } from "@modelcontextprotocol/sdk/types.js";
 import { exec } from "child_process";
 import fs from "node:fs";
@@ -6,7 +9,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { getWorkspacePath } from "../forwardedFiles.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import PQueue from "p-queue";
-import { DEFAULT_TOOL_TIMEOUT_MS, McpClient, PackageConfig, ReadResourceResult } from "../types.js";
+import { getToolTimeout, McpClient, PackageConfig, ReadResourceResult } from "../types.js";
 import { getLogger } from "../logging.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
 
@@ -460,6 +463,11 @@ export class StdioMcpClient implements McpClient {
   private warnedAboutAmbiguousFilesystemInvocation = false;
   // Set once the connector has been asked to run a tool (see holdsLiveState).
   private servedToolCall = false;
+  private fileInputBases?: InputBases;
+
+  getFileInputBases(): InputBases {
+    return this.fileInputBases ?? effectiveInputBases(this.config);
+  }
 
   constructor(packageId: string, config: PackageConfig) {
     this.packageId = packageId;
@@ -476,7 +484,7 @@ export class StdioMcpClient implements McpClient {
     // We'll initialize the client and transport in connect()
     this.client = new Client(
       getMcpClientInfo(),
-      { capabilities: {} }
+      { capabilities: FILE_READ_MODES }
     );
     
     // Placeholder transport - will be replaced in connect()
@@ -740,6 +748,7 @@ export class StdioMcpClient implements McpClient {
         workspacePath,
         rebelRootsTrimmed,
       );
+      this.fileInputBases = effectiveInputBases({ ...this.config, env: mergedEnv });
       this.transport = new StdioClientTransport({
         command: this.config.command || "echo",
         args: spawnArgs,
@@ -899,6 +908,13 @@ export class StdioMcpClient implements McpClient {
     });
   }
 
+  private toolMetadata = new Map<string, Record<string, unknown> | undefined>();
+
+  async getToolMetadata(name: string): Promise<Record<string, unknown> | undefined> {
+    if (!this.toolMetadata.has(name)) await this.listTools();
+    return this.toolMetadata.get(name);
+  }
+
   async listTools(): Promise<any[]> {
     const timeout = parseInt(process.env.SUPER_MCP_LIST_TOOLS_TIMEOUT || '10000');
 
@@ -912,6 +928,7 @@ export class StdioMcpClient implements McpClient {
     return this.enqueue(async () => {
       try {
         const response = await this.client.listTools(undefined, { timeout });
+        this.toolMetadata = new Map(response.tools.map(tool => [tool.name, tool._meta]));
         
         logger.info("Retrieved tools from stdio MCP", {
           package_id: this.packageId,
@@ -929,12 +946,11 @@ export class StdioMcpClient implements McpClient {
     }) as Promise<any[]>;
   }
 
-  async callTool(name: string, args: any): Promise<any> {
+  async callTool(name: string, args: any, context: ChildToolCallContext = { readMode: { version: 1, mode: "standalone" } }): Promise<any> {
     // Matches Rebel Core's 90-minute TOOL_CALL_TIMEOUT in src/core/rebelCore/mcpClient.ts
     // so a call Rebel has given up on frees its connector slot at about the same time.
     // Stdio connectors run one call at a time. The env var overrides the default.
-    const timeout = this.config.timeout ||
-                    parseInt(process.env.SUPER_MCP_TOOL_TIMEOUT || String(DEFAULT_TOOL_TIMEOUT_MS));
+    const timeout = getToolTimeout(this.config);
 
     logger.info("Calling tool on stdio MCP", {
       package_id: this.packageId,
@@ -945,12 +961,16 @@ export class StdioMcpClient implements McpClient {
       queue_pending: this.requestQueue.pending,
     });
 
+    if (context.readMode === "unnegotiated") throw new Error("Local file read mode is required");
+    const readMode = context.readMode;
     this.servedToolCall = true;
     return this.enqueue(async () => {
+      context.signal?.throwIfAborted();
       try {
         const response = await this.client.callTool({
           name,
           arguments: args || {},
+          _meta: { "files/readMode": readMode },
         }, undefined, {
           timeout,
           resetTimeoutOnProgress: true, // Reset timeout when progress notifications are received

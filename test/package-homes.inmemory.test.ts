@@ -203,7 +203,11 @@ describe('package homes over in-memory streamable HTTP', () => {
     adapter.dropSessions();
     expect(await registry.callTool('notebook', 'write_note', { text: 'second' })).toMatchObject({ content: [{ text: 'second' }] });
     expect(dispatched).toHaveBeenCalledOnce();
-    expect(dispatched).toHaveBeenCalledWith('write_note', { text: 'second' });
+    expect(dispatched).toHaveBeenCalledWith('write_note', { text: 'second' }, {
+      readMode: { version: 1, mode: 'standalone' },
+      metadata: { 'files/readMode': { version: 1, mode: 'standalone' } },
+      signal: expect.any(AbortSignal),
+    });
     const bodies = await Promise.all(adapter.requests.filter(req => req.method === 'POST').map(req => req.json()));
     expect(bodies.filter(body => body.method === 'initialize')).toHaveLength(2);
     expect(bodies.filter(body => body.method === 'tools/call')).toHaveLength(3);
@@ -511,7 +515,7 @@ describe('package homes over in-memory streamable HTTP', () => {
     await client.callTool('write_note', { text: 'validated', extra: 'preserved' });
     expect(StdioMcpClient.prototype.listTools).not.toHaveBeenCalled();
     expect(StdioMcpClient.prototype.callTool).toHaveBeenCalledOnce();
-    expect(StdioMcpClient.prototype.callTool).toHaveBeenCalledWith('write_note', { text: 'validated', extra: 'preserved' });
+    expect(StdioMcpClient.prototype.callTool).toHaveBeenCalledWith('write_note', { text: 'validated', extra: 'preserved' }, expect.objectContaining({ readMode: { version: 1, mode: 'standalone' } }));
   });
 
   it('changes only the selected package on home add, header change and removal', async () => {

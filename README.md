@@ -339,6 +339,62 @@ Tool discovery, calls and resources use the home. An unreachable home pauses the
 
 In HTTP mode, `/mcp/packages/:id` exposes one local package with its original tool names, schemas, annotations, metadata and resources. Calls share the router's security, administrator and user restrictions. Sessions belong to one endpoint, and unknown or homed IDs return 404. These routes use the same loopback listener and request guards as `/mcp`.
 
+### File-read preflight (experimental v1)
+
+This is a Super MCP experimental extension, not part of the MCP standard. It lets a host (the app running the router) apply its file permissions before a local connector reads an input file. The router starts each local connector as a child process. The host and router reuse their MCP connection; the connector still opens and uploads the bytes itself. The following sections are for host and connector authors; users do not put these permission fields in tool arguments.
+
+**Host to router.** During MCP initialization, the host advertises the Client capability `experimental["files/readAuthority"]: {"version":1}`. The router reads that capability; a connector does not need to inspect it. For an executable call, the host supplies request-level `_meta["files/invocation"]: {"version":1,"invocationId":"…"}`. The ID refers to a host-owned record for this exact active call, including its admitted arguments. It expires when the call ends and is not a session-wide permission.
+
+For each dispatch attempt, the router sends a `files/authorizeReads` batch containing `version`, `invocationId` and `operands`. Each operand has a concrete `location`, its original `rawPath` and its absolute `resolvedPath`. An `allowed` result returns exactly one `{location,rawPath,canonicalPath}` per operand. `approval_pending` returns `presentation` (`"queued"` or `"staged"`) and `reason`; `denied` and `unavailable` return `reason`. Every result has `version:1` and `outcome`; only `allowed` returns paths. A missing or expired invocation record for an actual read, an invalid reply, a pending decision, a denial, a transport failure or cancellation stops that call before file bytes are opened. Calls with no file inputs skip this authorization request. Pagination or replaying an expired package-home session can repeat a batch for the same invocation; the host must answer each batch while that invocation remains active.
+
+**Declaring a connector's inputs.** The connector author adds `_meta["files/readInputs"]` to each local stdio tool definition. The router does not infer file fields from their names. This declaration describes the tool's existing input semantics:
+
+```json
+{
+  "version": 1,
+  "inputs": [{
+    "selector": ["attachments", "*", "path"],
+    "base": "connectorCwd",
+    "expandTilde": false,
+    "nonLocalPrefixes": ["https://"],
+    "when": [{ "relativeTo": "parent", "selector": ["content"], "test": "falsy" }]
+  }]
+}
+```
+
+The declaration requires `version` and `inputs`; each input requires `selector`, `base` and `expandTilde`. `when` and `nonLocalPrefixes` are optional. Here the router selects each attachment's `path` only when that attachment's `content` is falsy. Selectors use property names, numeric indices and `"*"` for array elements. Conditions are combined with AND and use concrete selectors relative to the operand's parent object or the argument root. Supported tests are scalar `equals` (with `value`), `undefined` (including absent) and JavaScript `falsy`. Empty/non-string values are skipped. `nonLocalPrefixes` matches the **raw input string**, case-sensitively and before path resolution; the connector keeps handling those URL or inline branches itself.
+
+Describe the path handling your tool already uses; do not change its accepted inputs through the declaration:
+
+Choose a base by tracing the reader's existing path operations. Here, **lexical** means normalizing `.` and `..` in the path string before the filesystem follows links. **Native** means passing the spelling to the filesystem as the reader does. For example, on POSIX, if `/a/link` points to `/x/y`, `/a/link/../file` means `/a/file` lexically and `/x/file` natively.
+
+| Base | Readers | Root used for relative inputs |
+| --- | --- | --- |
+| `connectorCwd` | 13 reader families | The working directory the child actually reports (physical on POSIX, its normalized spelling on Windows), or the router's when none is configured. The operand resolves lexically from it. |
+| `connectorCwdNative` | Canvas | The same directory, for a tool that opens the input as spelled. A `..` segment is left for the filesystem to walk, so a symlink before it counts; a target that cannot be resolved is an error. Other inputs behave like `connectorCwd`. |
+| `workspace` | OpenAI Image | Trim the child's effective `MCP_WORKSPACE_PATH`; blank gives no operand. Resolve a relative workspace from child cwd, then resolve the operand lexically. |
+| `workspaceRealpath` | Computers | Trim the workspace; blank or non-absolute gives no operand. After that guard, resolve the workspace as spelled, so a symlink before `..` counts, with a driveless Windows root on the child's drive, before the operand. ENOENT/ENOTDIR gives no operand; other errors surface. |
+| `workspaceRealpathOrTmp` | Browser automation | Trim workspace or use the child's temp when unset or blank. Anchor from child cwd, realpath that root, then resolve the operand lexically. An unresolvable workspace or temp is an error; an unavailable workspace never selects temp. |
+
+On Windows, child temp is `TEMP || TMP || effectiveSystemRoot + '\\temp'`, recognizing `SYSTEMROOT`, `SystemRoot` and `windir`; it does not use the router's temp as a fallback.
+
+A missing workspace does not create a new allowed root. Required-workspace reads still fail closed; negotiated calls may report a missing approved input rather than the standalone reader's missing-workspace error. Set `expandTilde:true` only if the tool already replaces a leading `~` with its home directory; false leaves it literal.
+
+**Router to connector.** The router advertises Client capability `experimental["files/readModes"]: {"version":1}` when initializing a stdio child. With the TypeScript MCP SDK, the child reads that capability after initialization through `McpServer.server.getClientCapabilities()?.experimental`. Version 1 is negotiated only when the advertised `version` equals `1`; unknown versions retain the older strict behavior. A malformed version-1 declaration fails explicitly when a hosted or forwarded call uses it, rather than silently reverting to that older behavior.
+
+On a version-1 connection, the router sends request-level `_meta["files/readMode"]` on every dispatched call. A TypeScript MCP SDK tool handler receives it in `extra._meta`. Pending, denied and unavailable preflight results do not dispatch the connector at all:
+
+- `{version:1,mode:"central",reads:[…]}`: open only the supplied `canonicalPath` for each exact declared operand. Do not apply another workspace-containment or raw-symlink refusal to a centrally allowed path. Keep regular-file, descriptor/stream, size and media checks. An empty `reads` list permits no file input, and a required operand missing from the list refuses the call.
+- `{version:1,mode:"standalone"}`: apply the connector's existing strict read rules, typically canonical containment within `MCP_WORKSPACE_PATH` or its existing temporary-directory fallback. A symlink pointing outside those roots remains refused under those rules. This mode is selected when the upstream host has not advertised version-1 authority.
+
+A child that negotiated version 1 rejects missing or malformed per-call modes. A host, router or child that never negotiated it keeps the existing standalone behavior. The connector consumes the router's request metadata; model arguments such as `arguments._meta` never select a mode or grant a path. The host owns `files/invocation` on the host-to-router hop, and the router owns `files/readMode` on the router-to-child hop. Do not put either key in tool arguments or forward arbitrary upstream `files/*` request keys. Declarations from a remote HTTP server do not request permission to read the router machine's files: that server runs on another filesystem and retains its own file handling.
+
+**Forwarding to a package home.** A package home is another router's `/mcp/packages/:id` endpoint, configured through `packageHomes` above. Endpoints advertise Server capability `experimental["files/forwardedInputs"]: {"version":1}`. When sender and receiver both support version 1 and the tool declares its inputs, the source router authorizes existing absolute source-workspace inputs before opening them. This includes a path spelled inside the workspace that passes through a directory symlink to a physical file elsewhere, if the host permits that target. Copies keep the existing `{path,name,contentBase64}` envelope, size limit and cleanup. Replacement changes only declared input locations in a cloned execution view; literal text, output paths and the original arguments stay intact.
+
+With older receivers or undeclared tools, the router retains the older discovery and replacement route, adding central source checks when authority is available. That older replacement recursively changes **every string equal to a forwarded source path**, so an unrelated literal or output field with the same string can also change. This is an existing mixed-version limitation; use compatible declarations and version-1 endpoints for location-only replacement. A new home accepts old envelopes and uses its child's declaration to restrict replacement when available. Connector authors do not parse this forwarding envelope; the routers handle copying and replacement before calling the connector's usual path reader. An authorization failure never selects the older route as a fallback.
+
+A path that exists only at the package home keeps that home's existing standalone restrictions; it is not authorized using the source host's filesystem context. Forwarded source bytes are authorized before leaving the source when authority is available. A host running beside the remote connector can use its own central authority and originating session. No additional byte transport or permission store is introduced. Compatibility tests use [wire-v1.json](test/fixtures/file-read/wire-v1.json) to pin the version-1 message shapes across implementations.
+
 ## Using Multiple Configuration Files
 
 > **See also**: [Multi-Config Best Practices](docs/MULTI_CONFIG_BEST_PRACTICES.md) for organization strategies.

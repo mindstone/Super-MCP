@@ -1,3 +1,4 @@
+import { captureToolDispatch } from './fileReadProtocol.js';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -1028,11 +1029,12 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
 
           case "use_tool":
             return await handleUseTool(args as any, registry, catalog, validator,
-              request.params._meta?.['rebel/captureProgressDigest'] === true
-                ? { captureProgressDigest: true } : undefined);
+              { ...(request.params._meta?.['rebel/captureProgressDigest'] === true ? { captureProgressDigest: true as const } : {}),
+                dispatch: captureToolDispatch(server.getClientCapabilities()?.experimental?.['files/readAuthority'], request.params._meta, extra) });
 
           case "bulk_export":
-            return await handleBulkExport(args as any, registry, catalog, extra?.signal);
+            return await handleBulkExport(args as any, registry, catalog, extra?.signal,
+              captureToolDispatch(server.getClientCapabilities()?.experimental?.['files/readAuthority'], request.params._meta, extra));
 
           case "health_check_all":
             return await handleHealthCheckAll(args as any, registry, catalog);

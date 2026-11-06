@@ -1,3 +1,5 @@
+import type { InputBases } from './fileReadInputs.js';
+import type { ChildToolCallContext } from './fileReadProtocol.js';
 import type { ListResourcesResult } from "@modelcontextprotocol/sdk/types.js";
 
 // Standard MCP config format
@@ -18,6 +20,10 @@ export interface PackageSetupStatus {
 export type CatalogStatus = 'connecting' | 'ready' | 'auth_required' | 'setup_incomplete' | 'error';
 
 export const DEFAULT_TOOL_TIMEOUT_MS = 90 * 60 * 1000;
+
+export function getToolTimeout(config: Pick<PackageConfig, 'timeout'>): number {
+  return config.timeout || parseInt(process.env.SUPER_MCP_TOOL_TIMEOUT || String(DEFAULT_TOOL_TIMEOUT_MS));
+}
 
 export interface StandardServerConfig {
   command?: string;
@@ -382,7 +388,9 @@ export interface ReadResourceResult {
 export interface McpClient {
   connect(): Promise<void>;
   listTools(): Promise<any[]>;
-  callTool(name: string, args: any): Promise<any>;
+  callTool(name: string, args: any, context: ChildToolCallContext): Promise<any>;
+  getToolMetadata?(name: string): Promise<Record<string, unknown> | undefined>;
+  getFileInputBases?(): InputBases;
   close(): Promise<void>;
   healthCheck?(): Promise<'ok' | 'error' | 'needs_auth'>;
   requiresAuth?(): Promise<boolean>;

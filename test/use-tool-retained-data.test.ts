@@ -130,6 +130,6 @@ describe("use_tool retained-data execution guard", () => {
       isError: false,
     });
     expect(callTool).toHaveBeenCalledOnce();
-    expect(callTool).toHaveBeenCalledWith(PACKAGE.id, TOOL.name, INPUT.args);
+    expect(callTool).toHaveBeenCalledWith(PACKAGE.id, TOOL.name, INPUT.args, { kind: "standalone" });
   });
 });

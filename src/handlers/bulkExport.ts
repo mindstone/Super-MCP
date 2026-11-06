@@ -1,3 +1,4 @@
+import type { ToolDispatchContext } from '../fileReadProtocol.js';
 import { setupIncompleteMessage } from "../utils/setupIncompleteMessage.js";
 import { once } from "node:events";
 import { createWriteStream } from "node:fs";
@@ -837,6 +838,7 @@ export async function handleBulkExport(
   registry: PackageRegistry,
   catalog: Catalog,
   externalSignal?: AbortSignal,
+  dispatchContext: ToolDispatchContext = { kind: "standalone" },
 ): Promise<any> {
   let parsedInput: ParsedBulkExportInput;
   try {
@@ -908,12 +910,9 @@ export async function handleBulkExport(
           // (long-lived, paginated, multi-call) stdio dispatch is bracketed by
           // the active-use lease and gets the atomic pre-send liveness
           // re-establish — closing the idle-reaper -32000 race for bulk_export.
-          // Abort/cancellation parity is preserved by the existing external
-          // `Promise.race` against the abort signal below; `registry.callTool`
-          // takes no signal (the underlying `client.callTool` doesn't either),
-          // so no signal threading is needed.
+          // Propagate this page's originating authority and cancellation.
           const toolResult = await Promise.race([
-            registry.callTool(parsedInput.packageId, toolName, args),
+            registry.callTool(parsedInput.packageId, toolName, args, { ...dispatchContext, signal }),
             new Promise<never>((_resolve, reject) => {
               if (signal.aborted) {
                 reject(new Error(getAbortMessage(signal)));

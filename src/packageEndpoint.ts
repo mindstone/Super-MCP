@@ -1,13 +1,16 @@
+import { expandReadInputs, getReadInputs } from './fileReadInputs.js';
+import { effectiveInputBases } from './fileReadPreflight.js';
+import { assertDispatchActive, captureToolDispatch, DECLARED_FORWARDING, FileReadAdmissionError } from './fileReadProtocol.js';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema, McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import type { PackageRegistry } from "./registry.js";
 import { assertToolAccess } from "./toolAccess.js";
 import { getSecurityPolicy } from "./security.js";
-import { getWorkspacePath, runWithForwardedFiles } from "./forwardedFiles.js";
+import { forwardedFilesSchema, getWorkspacePath, runWithForwardedFiles } from "./forwardedFiles.js";
 import { ERROR_CODES } from "./types.js";
 
 export function createPackageServer(registry: PackageRegistry, packageId: string, workspacePath = getWorkspacePath()): Server {
-  const server = new Server({ name: "super-mcp-package", version: "1.0.0" }, { capabilities: { tools: {}, resources: {} } });
+  const server = new Server({ name: "super-mcp-package", version: "1.0.0" }, { capabilities: { tools: {}, resources: {}, ...(registry.getPackage(packageId)?.transport === 'stdio' ? { experimental: { [DECLARED_FORWARDING]: { version: 1 } } } : {}) } });
   const allowed = (name: string) => {
     const policy = getSecurityPolicy();
     return !policy.isToolBlocked(packageId, name, false).blocked && !policy.isAdminDisabled(registry.getPackage(packageId)?.catalogId, name) && !policy.isUserDisabled(packageId, name);
@@ -30,15 +33,30 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
     assertToolAccess(registry, packageId);
     return { tools: (await tools()).filter(tool => allowed(tool.name)) };
   });
-  server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
+  server.setRequestHandler(CallToolRequestSchema, async ({ params }, extra) => {
     try {
       assertToolAccess(registry, packageId, params.name);
     } catch (error) {
       return { isError: true, content: [{ type: "text", text: errorText(error) }] };
     }
     try {
-      return await runWithForwardedFiles(params.arguments ?? {}, params._meta?.["rebel/forwardedFiles"], args => registry.callTool(packageId, params.name, args), workspacePath, registry.getPackage(packageId)?.name ?? packageId);
+      const context = captureToolDispatch(server.getClientCapabilities()?.experimental?.['files/readAuthority'], params._meta, extra);
+      assertDispatchActive(context);
+      const forwarded = params._meta?.["rebel/forwardedFiles"];
+      if (forwarded !== undefined && !forwardedFilesSchema.safeParse(forwarded).success) throw new Error('Invalid forwarded files');
+      const config = registry.getPackage(packageId);
+      let operands;
+      if (forwarded !== undefined && config?.transport === 'stdio') {
+        const client = await registry.getClient(packageId);
+        const declaration = getReadInputs(await client.getToolMetadata?.(params.name));
+        if (declaration) operands = await expandReadInputs(params.arguments ?? {}, declaration, effectiveInputBases(config, client));
+      }
+      // Package-home senders have no originating home authority. Their child
+      // receives explicit standalone, preserving strict remote-only reads.
+      return await runWithForwardedFiles(params.arguments ?? {}, forwarded,
+        args => registry.callTool(packageId, params.name, args, context), workspacePath, config?.name ?? packageId, operands);
     } catch (error) {
+      if (error instanceof FileReadAdmissionError) return { isError: true, content: [{ type: 'text', text: error.message }] };
       const typed = await withSignInState(error);
       if (typed !== error) throw typed;
       return { isError: true, content: [{ type: "text", text: errorText(error) }] };

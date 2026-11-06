@@ -1,3 +1,4 @@
+import { FileReadAdmissionError, type ToolDispatchContext } from '../fileReadProtocol.js';
 import { setupIncompleteMessage } from "../utils/setupIncompleteMessage.js";
 import { randomUUID } from "crypto";
 import { computeProgressDigest, type ProgressDigestV1 } from './progressDigest.js';
@@ -461,7 +462,7 @@ interface SuperMcpProducerMeta extends SuperMcpTelemetryMeta {
   progressDigestV1?: ProgressDigestV1;
 }
 
-export interface UseToolCallContext { captureProgressDigest?: true }
+export interface UseToolCallContext { captureProgressDigest?: true; dispatch?: ToolDispatchContext }
 
 interface MaterializationMeta {
   status: "materialized" | "oversized_output";
@@ -2103,7 +2104,7 @@ export async function handleUseTool(
       typeof _rebel_meeting_dispatch_capability === 'string' && _rebel_meeting_dispatch_capability.length > 0
       ? { ...args, _rebelMeetingDispatchCapability: _rebel_meeting_dispatch_capability }
       : args;
-    let toolResult = await registry.callTool(package_id, tool_id, connectorArgs);
+    let toolResult = await registry.callTool(package_id, tool_id, connectorArgs, context?.dispatch ?? { kind: "standalone" });
     const downstreamIsError = isRecord(toolResult) && toolResult.isError === true;
     const recoveryEvidenceV1 = extractRecoveryEvidenceV1(toolResult);
     toolResult = stripConnectorRecoveryEvidence(toolResult);
@@ -2389,6 +2390,17 @@ export async function handleUseTool(
     });
   } catch (error) {
     registry.notifyActivity(package_id);
+    if (error instanceof FileReadAdmissionError) {
+      return buildOuter({
+        content: [{ type: "text", text: error.message }],
+        isError: true,
+        superMcp: {
+          packageId: package_id,
+          toolId: tool_id,
+          durationMs: Date.now() - startTime,
+        },
+      });
+    }
     const duration = Date.now() - startTime;
     const errorMessage = error instanceof Error ? error.message : String(error);
     const connectDiagnostics = deriveAllowlistedConnectDiagnostics(

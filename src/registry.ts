@@ -1,3 +1,5 @@
+import { preflightLocalTool } from './fileReadPreflight.js';
+import { assertDispatchActive, type ToolDispatchContext } from './fileReadProtocol.js';
 import { getRefreshRefusalCount } from "./auth/refreshRefusals.js";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -857,6 +859,7 @@ export class PackageRegistry {
           oauthClientSecret: extConfig.oauthClientSecret,
           catalogId: extConfig.catalogId,
           setupStatus: extConfig.setupStatus,
+          timeout: extConfig.timeout,
         };
         
         packages.push(pkg);
@@ -2037,7 +2040,10 @@ export class PackageRegistry {
    * invoked. An in-flight close propagates unchanged; only a home's session
    * 404 is retried once, because the home refused it before dispatch.
   */
-  async callTool(packageId: string, toolId: string, args: any): Promise<any> {
+  async callTool(packageId: string, toolId: string, args: any, context: ToolDispatchContext): Promise<any> {
+    // Runtime compatibility for existing embedders; typed callers must select a mode.
+    context ??= { kind: "standalone" };
+    assertDispatchActive(context);
     let leaseClient = await this.acquireLease(packageId);
     try {
       let client = await this.getClient(packageId);
@@ -2056,14 +2062,20 @@ export class PackageRegistry {
         client = await this.getClient(packageId);
         leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
       }
+      const dispatch = async () => {
+        assertDispatchActive(context);
+        if (client instanceof PackageHomeClient) return client.callToolFromOrigin(toolId, args, context);
+        const config = this.getPackage(packageId)!;
+        return client.callTool(toolId, args, await preflightLocalTool(client, config, toolId, args, context));
+      };
       try {
-        return await client.callTool(toolId, args);
+        return await dispatch();
       } catch (error) {
         // A home session 404 is returned before dispatch, so one replay is safe.
         if (!(client instanceof PackageHomeClient && error instanceof StreamableHTTPError && error.code === 404)) throw error;
         client = await this.getClient(packageId);
         leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
-        return await client.callTool(toolId, args);
+        return await dispatch();
       }
     } finally {
       if (leaseClient) {
@@ -2488,6 +2500,7 @@ export class PackageRegistry {
       oauthClientSecret: extConfig.oauthClientSecret,
       catalogId: extConfig.catalogId,
       setupStatus: extConfig.setupStatus,
+      timeout: extConfig.timeout,
     };
   }
 

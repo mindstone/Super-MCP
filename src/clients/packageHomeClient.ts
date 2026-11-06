@@ -1,10 +1,13 @@
+import { expandReadInputs, getReadInputs } from '../fileReadInputs.js';
+import { assertDispatchActive, authorizeReads, DECLARED_FORWARDING, hasReadAuthority, matchesFileVersion, standaloneDispatch, type ChildToolCallContext, type ToolDispatchContext } from '../fileReadProtocol.js';
+import { effectiveInputBases } from '../fileReadPreflight.js';
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import type { McpClient, PackageConfig, PackageHome } from "../types.js";
-import { DEFAULT_TOOL_TIMEOUT_MS } from "../types.js";
+import { getToolTimeout } from "../types.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
-import { collectForwardedFiles, forwardedFilesTooLargeMessage } from "../forwardedFiles.js";
+import { collectForwardedFiles, forwardedFilesTooLargeMessage, getWorkspacePath, hasAbsoluteForwardingInput } from "../forwardedFiles.js";
 import { getLogger } from "../logging.js";
 import { failDroppedAnswers } from "./failDroppedAnswers.js";
 
@@ -58,20 +61,38 @@ export class PackageHomeClient implements McpClient {
     await this.request(() => this.client.connect(this.transport, { timeout: 30_000 }));
     this.connected = true;
   }
+  private toolMetadata = new Map<string, Record<string, unknown> | undefined>();
   async listTools() {
-    return this.request(async () => (await this.client.listTools()).tools);
+    return this.request(async () => {
+      const tools = (await this.client.listTools()).tools;
+      this.toolMetadata = new Map(tools.map(tool => [tool.name, tool._meta]));
+      return tools;
+    });
   }
-  async callTool(name: string, args: unknown) {
-    const { files, bytes, tooLarge } = await collectForwardedFiles(args);
+  async callTool(name: string, args: unknown, context: ChildToolCallContext = { readMode: "unnegotiated" }) {
+    return this.callToolFromOrigin(name, args, { kind: 'standalone', signal: context.signal, metadata: context.metadata });
+  }
+  async callToolFromOrigin(name: string, args: unknown, context: ToolDispatchContext = standaloneDispatch) {
+    assertDispatchActive(context);
+    const timeout = getToolTimeout(this.config);
+    const exact = matchesFileVersion(this.client.getServerCapabilities()?.experimental?.[DECLARED_FORWARDING]);
+    if (exact && !this.toolMetadata.has(name) && hasAbsoluteForwardingInput(args)) await this.listTools();
+    const declaration = exact ? getReadInputs(this.toolMetadata.get(name)) : undefined;
+    const operands = declaration ? await expandReadInputs(args, declaration, effectiveInputBases(this.config)) : undefined;
+    const { files, bytes, tooLarge } = await collectForwardedFiles(args, getWorkspacePath(), {
+      operands, signal: context.signal,
+      ...(hasReadAuthority(context) ? { authorize: batch => authorizeReads(batch, context, timeout) } : {}),
+    });
     if (files.length || tooLarge) getLogger().info("Forwarded connector files", {
       package_id: this.config.id, tool_id: name, files: files.length + (tooLarge ? 1 : 0), bytes, outcome: tooLarge ? "too_large" : "attached",
     });
     if (tooLarge) return { isError: true, content: [{ type: "text" as const, text: forwardedFilesTooLargeMessage(bytes, this.config.name) }] };
+    assertDispatchActive(context);
     // No replay after dispatch, even if the response is lost.
     return this.request(() => this.client.callTool({ name, arguments: args as Record<string, unknown>,
       ...(files.length ? { _meta: { "rebel/forwardedFiles": files } } : {}),
     }, undefined, {
-      timeout: this.config.timeout ?? Number(process.env.SUPER_MCP_TOOL_TIMEOUT || DEFAULT_TOOL_TIMEOUT_MS),
+      timeout,
     }));
   }
   async listResources() {

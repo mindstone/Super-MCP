@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## Unreleased
 
 ### Added
+- Compatible hosts can now check file permissions before a local connector reads a tool input, including files reached through a symlink. Connectors must declare their file inputs to use this experimental protocol; older clients keep their existing file restrictions. Files that exist only on a remote connector machine keep that machine's existing restrictions. See [file-read preflight](README.md#file-read-preflight-experimental-v1) for connector setup and forwarding compatibility.
 - `/stats` exposes per-package `refresh_refused_count` for confirmed dead OAuth grants and a stable `router.started_at`, so hosts can count refused renewals across snapshots.
 - **`POST /api/shutdown`** starts the same clean shutdown as SIGTERM, for a host that cannot send a catchable SIGTERM (on Windows, Node's `kill()` ends the process at once, so connectors got no clean stop). Local only; refused when the request carries an `Origin` header, and, when the router was started with `--rebel-owner-id`, unless the `x-super-mcp-owner-id` header matches it.
 - **Connectors can ask to stay running.** A server that declares the experimental capability `super-mcp/keep-alive` in its initialize result is not stopped for being idle once it has run a tool; it runs until the router stops or restarts it. Use it for a connector that holds live state, such as a browser it opened.
@@ -21,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SDK OAuth errors log bounded error codes, and SDK HTTP/SSE transport errors log a positive numeric HTTP status or the fixed label `http_no_status`/`sse_no_status`. The authentication-required log uses the error's bounded name for other errors; other callers still log an ordinary error's text. Token fingerprints have been removed from refresh logs, and the refresh log field `server_error` is now `error`.
 
 ### Fixed
+- Per-server `timeout` settings are now honored; initialization and restart previously discarded them.
 - **A dropped connector answer fails the call at once.** Both HTTP routes now report `Connection closed` when an answer stream ends before its answer and cannot resume, while other calls keep running. Closing an HTTP or stdio connector also rejects its queued calls without sending them.
 - **New sign-ins can renew themselves.** OAuth client registrations now declare both `authorization_code` and `refresh_token` grants, so a provider that enforces registered grants can issue refresh tokens. A forced sign-in replaces the saved registration; background connects keep it.
 - **A package endpoint reports when a connector needs signing in.** Catalog requests and tool calls now carry the typed `AUTH_REQUIRED` error when the connector at its home needs sign-in, preserving the existing error words so older callers still work. A connected connector's tool failure stays a plain tool result.
