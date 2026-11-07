@@ -1,5 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { readFile } from 'node:fs/promises';
+import { z } from 'zod';
 
 const server = new McpServer({
   name: 'workspace-env-fixture',
@@ -25,5 +27,18 @@ server.registerTool(
     };
   },
 );
+
+let reads = 0;
+server.registerTool('read-file', {
+  inputSchema: { file: z.string(), literal: z.string().optional() },
+  _meta: { 'files/readInputs': { version: 1, inputs: [
+    { selector: ['file'], base: 'connectorCwd', expandTilde: false },
+  ] } },
+}, async ({ file, literal }) => ({
+  content: [{ type: 'text', text: JSON.stringify({
+    bytes: await readFile(file, 'utf8'), cwd: process.cwd(), pid: process.pid,
+    file, literal, reads: ++reads,
+  }) }],
+}));
 
 await server.connect(new StdioServerTransport());

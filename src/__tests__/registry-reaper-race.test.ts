@@ -44,6 +44,8 @@ function createFakeStdioClient(
 ): McpClient & { isTransportClosed: () => boolean } {
   const base = {
     ...createMockClient(),
+    // No explicit cwd or workspace: the fake child inherits the router cwd.
+    getFileInputBases: () => ({ connectorCwd: process.cwd() }),
     // Default: transport reports alive so the pre-send re-establish does NOT fire.
     isTransportClosed: overrides.isTransportClosed ?? (() => false),
     ...overrides,

@@ -202,6 +202,32 @@ describe('plain JSON file input semantics', () => {
     expect(replaceReadLocations(args, operands, new Map([['/source', '/copy']]))).toEqual({ ...args, file: '/copy' });
     expect(args.file).toBe('/source');
   });
+
+  it('replaces equal strings by concrete location with independent bases and tilde rules', async () => {
+    const rawPath = '~/General/report.txt';
+    const args = { file: rawPath, nested: { files: [rawPath] }, workspaceFile: rawPath, literal: rawPath, output: rawPath };
+    const original = structuredClone(args);
+    const operands = await expandReadInputs(args, declaration([
+      { ...input, expandTilde: true },
+      { ...input, selector: ['nested', 'files', '*'] },
+      { ...input, selector: ['workspaceFile'], base: 'workspace' },
+    ]), { ...bases, workspace: 'library' }, '/selected-workspace');
+    expect(operands.map(operand => operand.resolvedPath)).toEqual([
+      path.resolve('/home/synthetic/General/report.txt'),
+      path.resolve('/selected-workspace', rawPath),
+      path.resolve('/connector/library', rawPath),
+    ]);
+    expect(replaceReadLocations(args, operands, operand => operand.resolvedPath)).toEqual({
+      ...args, file: operands[0].resolvedPath, nested: { files: [operands[1].resolvedPath] }, workspaceFile: operands[2].resolvedPath,
+    });
+    expect(args).toEqual(original);
+  });
+
+  it('supports a scalar root operand through the location callback', async () => {
+    const operands = await expandReadInputs('General/report.txt', declaration([{ ...input, selector: [] }]), bases, '/selected-workspace');
+    expect(replaceReadLocations('General/report.txt', operands, operand => operand.resolvedPath))
+      .toBe(path.resolve('/selected-workspace/General/report.txt'));
+  });
 });
 
 describe('native symlink-then-parent path semantics', () => {
@@ -279,6 +305,24 @@ describe('native symlink-then-parent path semantics', () => {
     expect(childSpelling(target, cwd, paths)).toBe(expected);
   });
 
+  it.each([
+    { name: 'Windows rooted path keeps the child drive (DA205140)', target: '\\General\\report.txt', cwd: 'D:\\install', inputBase: 'C:\\workspace', paths: path.win32, expected: 'D:\\General\\report.txt' },
+    { name: 'Windows drive-relative path keeps the child cwd', target: 'D:report.txt', cwd: 'D:\\install', inputBase: 'C:\\workspace', paths: path.win32, expected: 'D:\\install\\report.txt' },
+    { name: 'Windows rootless path uses the workspace', target: 'General\\report.txt', cwd: 'D:\\install', inputBase: 'C:\\workspace', paths: path.win32, expected: 'C:\\workspace\\General\\report.txt' },
+    { name: 'Windows absolute path keeps its own drive', target: 'E:\\General\\report.txt', cwd: 'D:\\install', inputBase: 'C:\\workspace', paths: path.win32, expected: 'E:\\General\\report.txt' },
+    { name: 'Windows UNC path keeps its root', target: '\\\\server\\share\\report.txt', cwd: 'D:\\install', inputBase: 'C:\\workspace', paths: path.win32, expected: '\\\\server\\share\\report.txt' },
+    { name: 'POSIX absolute path stays absolute', target: '/abs/report.txt', cwd: '/installation', inputBase: '/workspace', paths: path.posix, expected: '/abs/report.txt' },
+    { name: 'POSIX rootless path uses the workspace', target: 'General/report.txt', cwd: '/installation', inputBase: '/workspace', paths: path.posix, expected: '/workspace/General/report.txt' },
+  ])('connectorOperandBase: $name', ({ target, cwd, inputBase, paths, expected }) => {
+    const connectorOperandBase: unknown = Reflect.get(fileReadInputs, 'connectorOperandBase');
+    const childSpelling: unknown = Reflect.get(fileReadInputs, 'childSpelling');
+    if (typeof connectorOperandBase !== 'function' || typeof childSpelling !== 'function') throw new TypeError('Missing operand helper');
+    const base = connectorOperandBase(target, cwd, inputBase, paths);
+    expect(base).toBe(paths.parse(target).root ? cwd : inputBase);
+    expect(paths.resolve(base, target)).toBe(expected);
+    expect(paths.resolve(childSpelling(target, base, paths))).toBe(expected);
+  });
+
   it.each(['symlink', 'symlink then parent'] as const)("matches the spawned child's physical cwd: %s", async kind => {
     const spelled = kind === 'symlink' ? path.join(a, 'link') : spelledLibrary;
     const childCwd = execFileSync(process.execPath, ['-e', 'process.stdout.write(process.cwd())'], { cwd: spelled, encoding: 'utf8' });
@@ -304,6 +348,16 @@ describe('native symlink-then-parent path semantics', () => {
     const [operand] = await expandReadInputs({ file }, declaration([input]), { connectorCwd: root });
     expect(operand.resolvedPath).toBe(path.join(a, 'lib', 'source.html'));
     expect(await readFile(operand.resolvedPath, 'utf8')).toBe('lexical-A');
+  });
+
+  it('uses the selected connector input base for native parents without changing actual bases', async () => {
+    const childBases = { connectorCwd: a, workspace: physicalCwd };
+    const [operand] = await expandReadInputs({ file: '../lib/source.html' }, declaration([
+      { ...input, base: 'connectorCwdNative' },
+    ]), childBases, physicalCwd);
+    expect(operand.resolvedPath).toBe(path.join(root, 'x', 'lib', 'source.html'));
+    expect(await readFile(operand.resolvedPath, 'utf8')).toBe('physical-B');
+    expect(childBases).toEqual({ connectorCwd: a, workspace: physicalCwd });
   });
 
   it('workspace retains lexical workspace resolution', async () => {

@@ -47,8 +47,13 @@ export function childSpelling(target: string, connectorCwd: string, paths: typeo
   return paths.isAbsolute(target) ? target : paths.resolve(connectorCwd, target);
 }
 
-async function selectInputRoot(base: ReadInputs['inputs'][number]['base'], bases: InputBases): Promise<string | undefined> {
-  if (base === 'connectorCwd' || base === 'connectorCwdNative') return bases.connectorCwd;
+/** Only rootless spellings use the input default; rooted and drive-relative ones keep the child's cwd and drive. */
+export function connectorOperandBase(spelling: string, connectorCwd: string, inputBase: string, paths: typeof path = path): string {
+  return paths.parse(spelling).root ? connectorCwd : inputBase;
+}
+
+async function selectInputRoot(base: ReadInputs['inputs'][number]['base'], bases: InputBases, connectorInputBase: string): Promise<string | undefined> {
+  if (base === 'connectorCwd' || base === 'connectorCwdNative') return connectorInputBase;
   const workspace = bases.workspace?.trim();
   if (base === 'workspaceRealpathOrTmp') {
     // Canonicalize before resolving '..'; an unavailable configured root must not select temp.
@@ -63,7 +68,7 @@ async function selectInputRoot(base: ReadInputs['inputs'][number]['base'], bases
   }
 }
 
-export async function expandReadInputs(args: unknown, declaration: ReadInputs, bases: InputBases): Promise<ReadOperand[]> {
+export async function expandReadInputs(args: unknown, declaration: ReadInputs, bases: InputBases, connectorInputBase = bases.connectorCwd, walkNativeParents = true): Promise<ReadOperand[]> {
   const operands = new Map<string, ReadOperand>();
   for (const input of declaration.inputs) {
     for (const location of expand(args, input.selector)) {
@@ -75,13 +80,13 @@ export async function expandReadInputs(args: unknown, declaration: ReadInputs, b
         if (condition.test === 'falsy') return !value;
         return condition.test === 'equals' && value === condition.value;
       })) continue;
-      const base = await selectInputRoot(input.base, bases);
+      const expanded = input.expandTilde && rawPath.startsWith('~') ? path.join(bases.home ?? os.homedir(), rawPath.slice(1)) : rawPath;
+      const base = await selectInputRoot(input.base, bases, connectorOperandBase(expanded, bases.connectorCwd, connectorInputBase));
       // Missing roots fail closed with a missing approved operand, not the standalone missing-base error.
       if (!base) continue;
-      const expanded = input.expandTilde && rawPath.startsWith('~') ? path.join(bases.home ?? os.homedir(), rawPath.slice(1)) : rawPath;
-      // Only this base's reader opens the spelling itself, and the host would collapse `..` lexically.
+      // Central nomination needs the physical target; standalone leaves the walk to the child.
       const resolvedPath = input.base === 'connectorCwdNative' && expanded.split(/[\\/]/).includes('..')
-        ? await fs.realpath(childSpelling(expanded, bases.connectorCwd))
+        ? walkNativeParents ? await fs.realpath(childSpelling(expanded, base)) : childSpelling(expanded, base)
         : path.resolve(base, expanded);
       const key = JSON.stringify(location);
       if (operands.has(key) && operands.get(key)!.resolvedPath !== resolvedPath) throw new Error('Conflicting file input bases');
@@ -92,10 +97,11 @@ export async function expandReadInputs(args: unknown, declaration: ReadInputs, b
 }
 
 /** Clone the execution view; equal literal strings at other locations stay intact. */
-export function replaceReadLocations(args: unknown, operands: ReadOperand[], replacements: Map<string, string>): unknown {
+export function replaceReadLocations(args: unknown, operands: ReadOperand[], replacements: Map<string, string> | ((operand: ReadOperand) => string | undefined)): unknown {
   let cloned = structuredClone(args);
-  for (const { location, rawPath } of operands) {
-    const replacement = replacements.get(rawPath);
+  for (const operand of operands) {
+    const { location, rawPath } = operand;
+    const replacement = typeof replacements === 'function' ? replacements(operand) : replacements.get(rawPath);
     if (!replacement) continue;
     if (!location.length) { if (cloned === rawPath) cloned = replacement; continue; }
     const parent = at(cloned, location.slice(0, -1));
