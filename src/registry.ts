@@ -2066,7 +2066,8 @@ export class PackageRegistry {
         assertDispatchActive(context);
         if (client instanceof PackageHomeClient) return client.callToolFromOrigin(toolId, args, context);
         const config = this.getPackage(packageId)!;
-        return client.callTool(toolId, args, await preflightLocalTool(client, config, toolId, args, context));
+        const prepared = await preflightLocalTool(client, config, toolId, args, context);
+        return client.callTool(toolId, prepared.args, prepared.context);
       };
       try {
         return await dispatch();

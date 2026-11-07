@@ -14,6 +14,8 @@ import { calculateInputBases, effectiveInputBases, preflightLocalTool } from '..
 import { handleUseTool } from '../src/handlers/useTool.js';
 import { Catalog } from '../src/catalog.js';
 import { Validator } from '../src/validator.js';
+import type { McpClient } from '../src/types.js';
+import type { InputBases } from '../src/fileReadInputs.js';
 
 vi.mock('../src/logging.js', () => ({ getLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }) }));
 
@@ -228,7 +230,7 @@ describe('preflight failure and negotiation boundaries', () => {
     const metadata = vi.fn().mockResolvedValue({ 'files/readInputs': declaration });
     const context = origin(vi.fn()); context.metadata = { trace: 'private', progressToken: 'host-progress', 'host/private': 'host-only' };
     const result = await preflightLocalTool({ getToolMetadata: metadata } as any, { ...config, transport: 'http' }, 'upload', { file: '/x' }, context);
-    expect(metadata).not.toHaveBeenCalled(); expect(result.metadata).toBeUndefined();
+    expect(metadata).not.toHaveBeenCalled(); expect(result.context.metadata).toBeUndefined();
     expect(context.kind === 'origin' && context.sendRequest).not.toHaveBeenCalled();
   });
 
@@ -254,9 +256,116 @@ describe('preflight failure and negotiation boundaries', () => {
   it('sends an empty central list for no-file tools and carries only router metadata', async () => {
     const context = origin(vi.fn()); context.metadata = { 'files/other': 'untrusted', trace: 'private', progressToken: 'host-progress' };
     const result = await preflightLocalTool({ getToolMetadata: async () => undefined } as any, config, 'plain', {}, context);
-    expect(result.metadata).toEqual({ 'files/readMode': { version: 1, mode: 'central', reads: [] } });
+    expect(result.context.metadata).toEqual({ 'files/readMode': { version: 1, mode: 'central', reads: [] } });
     expect(childCallContext(context).metadata).toBeUndefined();
     expect(context.kind === 'origin' && context.sendRequest).not.toHaveBeenCalled();
+  });
+});
+
+describe('workspace operand preparation at local dispatch', () => {
+  const captured = { connectorCwd: '/installation', workspace: '/workspace', home: '/synthetic-home', temp: '/synthetic-temp' };
+  function harness(meta: Record<string, unknown> | undefined = { 'files/readInputs': declaration }, bases: InputBases = captured, cwd?: string) {
+    const dispatch = vi.fn().mockResolvedValue({ content: [] });
+    const metadata = vi.fn().mockResolvedValue(meta);
+    const client: McpClient = { connect: vi.fn(), close: vi.fn(), listTools: async () => [], callTool: dispatch,
+      getToolMetadata: metadata, getFileInputBases: () => bases };
+    const registry = new PackageRegistry({ mcpServers: { fixture: { command: 'unused', cwd } } });
+    vi.spyOn(registry, 'getClient').mockResolvedValue(client);
+    cleanup.push(() => registry.closeAll());
+    return { registry, client, dispatch, metadata };
+  }
+  const origin = (sendRequest: OriginExtra['sendRequest']): ToolDispatchContext => ({
+    kind: 'origin', authority: { version: 1 }, signal: new AbortController().signal, sendRequest,
+    metadata: { 'files/invocation': { version: 1, invocationId: 'approved' } },
+  });
+
+  it('prepares only active connector-cwd relative locations in a separate standalone execution view', async () => {
+    const inputs = [
+      { selector: ['data', 'attachments', '*', 'path'], base: 'connectorCwd', expandTilde: false,
+        nonLocalPrefixes: ['https://'], when: [{ relativeTo: 'parent', selector: ['content'], test: 'falsy' }] },
+      { selector: ['tilde'], base: 'connectorCwd', expandTilde: true },
+      { selector: ['literalTilde'], base: 'connectorCwd', expandTilde: false },
+      { selector: ['workspaceFile'], base: 'workspaceRealpathOrTmp', expandTilde: false },
+    ];
+    const fixture = harness({ 'files/readInputs': { version: 1, inputs } });
+    const rawPath = 'General/report.txt';
+    const args = { data: { attachments: [
+      { path: rawPath }, { path: rawPath, content: 'inline' }, { path: 'https://example.test/report.txt' }, { path: '/absolute/../report.txt' },
+    ] }, tilde: '~/report.txt', literalTilde: '~/report.txt', workspaceFile: rawPath, literal: rawPath, output: rawPath,
+    _meta: { 'files/readMode': { mode: 'central', reads: [] } } };
+    const original = structuredClone(args);
+    await fixture.registry.callTool('fixture', 'upload', args, { kind: 'standalone' });
+    expect(fixture.dispatch).toHaveBeenCalledTimes(1);
+    expect(fixture.dispatch).toHaveBeenCalledWith('upload', {
+      ...args, data: { attachments: [{ path: path.resolve('/workspace', rawPath) }, ...args.data.attachments.slice(1)] },
+      tilde: path.resolve('/synthetic-home/report.txt'), literalTilde: path.resolve('/workspace/~/report.txt'),
+    }, expect.objectContaining({ readMode: { version: 1, mode: 'standalone' } }));
+    expect(args).toEqual(original);
+    expect(fixture.dispatch.mock.calls[0][1]).not.toBe(args);
+    expect(fixture.client.getFileInputBases?.()).toBe(captured);
+  });
+
+  it('leaves standalone native parents for the child filesystem to walk', async () => {
+    const fixture = harness({ 'files/readInputs': { version: 1, inputs: [
+      { selector: ['file'], base: 'connectorCwdNative', expandTilde: false },
+    ] } });
+    const args = Object.freeze({ file: 'link/../report.txt' });
+    await fixture.registry.callTool('fixture', 'upload', args, { kind: 'standalone' });
+    expect(fixture.dispatch).toHaveBeenCalledTimes(1);
+    expect(fixture.dispatch).toHaveBeenCalledWith('upload', {
+      file: path.resolve('/workspace') + path.sep + args.file,
+    }, expect.objectContaining({ readMode: { version: 1, mode: 'standalone' } }));
+    expect(args).toEqual({ file: 'link/../report.txt' });
+  });
+
+  it.each([undefined, { version: 2, invalid: true }])('leaves undeclared and future-version arguments intact: %s', async value => {
+    const fixture = harness(value ? { 'files/readInputs': value } : {});
+    const args = { file: 'General/report.txt' };
+    await fixture.registry.callTool('fixture', 'plain', args, { kind: 'standalone' });
+    expect(fixture.metadata).toHaveBeenCalledOnce();
+    expect(fixture.dispatch.mock.calls[0][1]).toBe(args);
+  });
+
+  it.each([
+    { cwd: '/explicit', workspace: '/workspace' }, { cwd: 'relative-cwd', workspace: '/workspace' },
+    { cwd: undefined, workspace: undefined }, { cwd: undefined, workspace: ' ' },
+    { cwd: undefined, workspace: '/installation' },
+  ])('retains the standalone fast path with cwd=$cwd workspace=$workspace', async ({ cwd, workspace }) => {
+    const fixture = harness(undefined, { ...captured, workspace }, cwd);
+    const args = { file: 'General/report.txt' };
+    await fixture.registry.callTool('fixture', 'upload', args, { kind: 'standalone' });
+    expect(fixture.metadata).not.toHaveBeenCalled();
+    expect(fixture.dispatch.mock.calls[0][1]).toBe(args);
+  });
+
+  it.each(['malformed', 'discovery failure'])('stops affected standalone dispatch on %s', async kind => {
+    const fixture = harness({ 'files/readInputs': { version: 1, inputs: 'invalid' } });
+    if (kind === 'discovery failure') fixture.metadata.mockRejectedValue(new Error('Discovery failed'));
+    await expect(fixture.registry.callTool('fixture', 'upload', { file: 'General/report.txt' }, { kind: 'standalone' })).rejects.toThrow();
+    expect(fixture.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('nominates workspace bytes centrally while preserving exact original bindings and an outside grant', async () => {
+    const fixture = harness();
+    const args = Object.freeze({ file: 'General/report.txt', literal: 'General/report.txt' });
+    const reads = [{ location: ['file'], rawPath: args.file, canonicalPath: '/granted-outside/report.txt' }];
+    const send = vi.fn().mockResolvedValue({ version: 1, outcome: 'allowed', reads });
+    await fixture.registry.callTool('fixture', 'upload', args, origin(send));
+    expect(send.mock.calls[0][0]).toEqual({ method: 'files/authorizeReads', params: {
+      version: 1, invocationId: 'approved', operands: [{ location: ['file'], rawPath: args.file, resolvedPath: path.resolve('/workspace', args.file) }],
+    } });
+    expect(fixture.dispatch.mock.calls[0][1]).toBe(args);
+    expect(fixture.dispatch.mock.calls[0][2].metadata).toEqual({ 'files/readMode': { version: 1, mode: 'central', reads } });
+  });
+
+  it.each(['denied', 'approval_pending', 'unavailable', 'malformed batch'])('keeps central %s from dispatching workspace operands', async outcome => {
+    const fixture = harness();
+    const reply = outcome === 'malformed batch' ? { version: 1, outcome: 'allowed', reads: [] }
+      : { version: 1, outcome, reason: 'Source read held', ...(outcome === 'approval_pending' ? { presentation: 'queued' } : {}) };
+    const send = vi.fn().mockResolvedValue(reply);
+    await expect(fixture.registry.callTool('fixture', 'upload', { file: 'General/report.txt' }, origin(send))).rejects.toThrow();
+    expect(send.mock.calls[0][0].params.operands[0]).toEqual({ location: ['file'], rawPath: 'General/report.txt', resolvedPath: path.resolve('/workspace/General/report.txt') });
+    expect(fixture.dispatch).not.toHaveBeenCalled();
   });
 });
 

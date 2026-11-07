@@ -2,6 +2,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { StdioMcpClient } from '../src/clients/stdioClient.js';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { mkdtemp, mkdir, writeFile, realpath, rm } from 'node:fs/promises';
+import os from 'node:os';
 
 type EnvSnapshot = {
   version: string;
@@ -168,4 +172,102 @@ describe('StdioMcpClient real-subprocess workspace env integration', () => {
       }
     },
   );
+});
+
+describe('PackageRegistry workspace file execution in a real subprocess', () => {
+  it.each(['absolute cwd', 'relative cwd', 'no workspace', 'absolute input', 'missing workspace unrelated call'])('preserves launch and input behavior: %s', async scenario => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'registry-launch-'));
+    const install = path.join(root, 'install');
+    const explicit = path.join(install, 'connector');
+    const workspace = path.join(root, 'workspace');
+    const hasCwd = scenario.endsWith('cwd');
+    const childCwd = hasCwd ? explicit : install;
+    const rawPath = 'General/report.txt';
+    for (const [dir, bytes] of [[install, 'installation bytes'], [explicit, 'explicit bytes'], [workspace, 'workspace bytes']]) {
+      await mkdir(path.join(dir, 'General'), { recursive: true });
+      await writeFile(path.join(dir, rawPath), bytes);
+    }
+    // A relative launch script must still be found from the original child cwd.
+    await writeFile(path.join(childCwd, 'launch.mjs'), `import ${JSON.stringify(new URL('./fixtures/workspace-env-mcp-server.mjs', import.meta.url).href)};`);
+    const file = scenario === 'absolute input' ? `${install}${path.sep}General${path.sep}..${path.sep}General${path.sep}report.txt` : rawPath;
+    const cwd = scenario === 'absolute cwd' ? explicit : scenario === 'relative cwd' ? 'connector' : undefined;
+    const unrelated = scenario === 'missing workspace unrelated call';
+    const script = `
+      import { PackageRegistry } from ${JSON.stringify(new URL('../dist/registry.js', import.meta.url).href)};
+      import assert from 'node:assert/strict';
+      const registry = new PackageRegistry({ mcpServers: { fixture: {
+        command: process.execPath, args: ['./launch.mjs'], cwd: ${JSON.stringify(cwd)},
+      } } });
+      const args = Object.freeze(${JSON.stringify(unrelated ? {} : { file })});
+      const original = structuredClone(args);
+      try {
+        const result = await registry.callTool('fixture', ${JSON.stringify(unrelated ? 'get-env-snapshot' : 'read-file')}, args, { kind: 'standalone' });
+        assert.deepStrictEqual(args, original);
+        process.stdout.write(JSON.stringify({ result, original: args, routerPid: process.pid }));
+      } finally { await registry.closeAll(); }
+    `;
+    const env: NodeJS.ProcessEnv = { ...process.env, HOME: root, USERPROFILE: root };
+    delete env.REBEL_WORKSPACE_PATH; delete env.MCP_WORKSPACE_PATH;
+    if (scenario !== 'no workspace') env.MCP_WORKSPACE_PATH = unrelated ? path.join(root, 'missing') : workspace;
+    try {
+      const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script], { cwd: install, env, timeout: 10000 });
+      const { result, original, routerPid } = JSON.parse(stdout);
+      expect(result.isError).not.toBe(true);
+      const receipt = JSON.parse(result.content[0].text);
+      if (unrelated) {
+        expect(receipt.version).toBe('d17-fixture-v1');
+        return;
+      }
+      expect(receipt.cwd).toBe(await realpath(childCwd));
+      expect(receipt.pid).toEqual(expect.any(Number));
+      expect(receipt.pid).not.toBe(routerPid);
+      expect(receipt.reads).toBe(1);
+      expect(receipt.file).toBe(file);
+      expect(original).toEqual({ file });
+      expect(receipt.bytes).toBe(hasCwd ? 'explicit bytes' : 'installation bytes');
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 15000);
+
+  it('reads workspace bytes on the first relative call without changing child cwd or original arguments', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'registry-workspace-'));
+    const install = path.join(root, 'install');
+    const workspace = path.join(root, 'workspace');
+    const rawPath = 'General/report.txt';
+    for (const [dir, bytes] of [[install, 'installation bytes'], [workspace, 'workspace bytes']]) {
+      await mkdir(path.join(dir, 'General'), { recursive: true });
+      await writeFile(path.join(dir, rawPath), bytes);
+    }
+    // A separate router process supplies a distinct installation cwd without process.chdir().
+    const script = `
+      import { PackageRegistry } from ${JSON.stringify(new URL('../dist/registry.js', import.meta.url).href)};
+      import assert from 'node:assert/strict';
+      const registry = new PackageRegistry({ mcpServers: { fixture: {
+        command: process.execPath, args: [${JSON.stringify(fixturePath)}],
+      } } });
+      const args = Object.freeze({ file: 'General/report.txt', literal: 'General/report.txt' });
+      const original = structuredClone(args);
+      try {
+        const result = await registry.callTool('fixture', 'read-file', args, { kind: 'standalone' });
+        assert.deepStrictEqual(args, original);
+        process.stdout.write(JSON.stringify({ result, original: args, routerPid: process.pid }));
+      } finally { await registry.closeAll(); }
+    `;
+    try {
+      const { stdout } = await promisify(execFile)(process.execPath, ['--input-type=module', '-e', script], {
+        cwd: install, timeout: 10000,
+        env: { ...process.env, HOME: root, USERPROFILE: root, REBEL_WORKSPACE_PATH: workspace, MCP_WORKSPACE_PATH: workspace },
+      });
+      const { result, original, routerPid } = JSON.parse(stdout);
+      expect(result.isError).not.toBe(true);
+      const receipt = JSON.parse(result.content[0].text);
+      expect(receipt.cwd).toBe(await realpath(install));
+      expect(receipt.pid).toEqual(expect.any(Number));
+      expect(receipt.pid).not.toBe(routerPid);
+      expect(receipt.reads).toBe(1);
+      expect(original).toEqual({ file: rawPath, literal: rawPath });
+      expect(receipt.literal).toBe(rawPath);
+      expect(receipt.bytes).toBe('workspace bytes');
+      expect(receipt.file).toBe(path.join(workspace, rawPath));
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }, 15000);
 });
