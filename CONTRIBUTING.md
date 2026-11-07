@@ -2,6 +2,9 @@
 
 Thank you for your interest in contributing to Super MCP Router! This document provides guidelines for contributing to the project.
 
+For shared-initializer worktrees, see the
+[contributor worktree configuration](docs/project/PROJECT_OVERRIDES.md).
+
 ## Development Setup
 
 1. **Clone and install dependencies:**
