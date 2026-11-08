@@ -43,7 +43,7 @@ afterEach(async () => {
   setSecurityPolicy(new SecurityPolicy({}));
 });
 const entry = { command: process.execPath, args: [path.resolve('test/fixtures/package-home/server.mjs')], catalogId: 'fictional-notebook' };
-const paused = "Your cloud isn't reachable, so Fictional Notes is paused for now. It'll pick up again when the cloud's back.";
+const paused = "Your cloud isn't reachable, so Fictional Notes is paused for now. An action that was in progress may already have happened; check its outcome before trying again.";
 function keep(registry: PackageRegistry) { cleanup.push(() => registry.closeAll()); return registry; }
 function harness(cloud: PackageRegistry) {
   const requests: Request[] = [];
