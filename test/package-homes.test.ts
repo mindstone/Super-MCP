@@ -72,7 +72,7 @@ async function rawClient(url: string) {
   cleanup.push(() => client.close());
   return { client, transport };
 }
-const paused = "Your cloud isn't reachable, so Fictional Notes is paused for now. It'll pick up again when the cloud's back.";
+const paused = "Your cloud isn't reachable, so Fictional Notes is paused for now. An action that was in progress may already have happened; check its outcome before trying again.";
 
 
 // fetch() drops a caller-set Host header, so the rebinding check needs a raw request.

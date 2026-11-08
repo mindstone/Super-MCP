@@ -54,7 +54,7 @@ export class PackageHomeClient implements McpClient {
   }
 
   unreachableError(cause: unknown): Error {
-    return new Error(`Your cloud isn't reachable, so ${this.config.name} is paused for now. It'll pick up again when the cloud's back.`, { cause });
+    return new Error(`Your cloud isn't reachable, so ${this.config.name} is paused for now. An action that was in progress may already have happened; check its outcome before trying again.`, { cause });
   }
 
   async connect(): Promise<void> {
