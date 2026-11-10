@@ -695,6 +695,10 @@ npm run dev -- --config ./super-mcp-config.json
 npm run build
 ```
 
+## Contributing
+
+This repository is exported from Mindstone's private main codebase, the Mindstone Rebel repo, one commit per change. Pull requests here can't be merged directly, but they're welcome: a maintainer carries them into the main codebase. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## The Mindstone open-source family
 
 This repo is one of several open-source projects from Mindstone:

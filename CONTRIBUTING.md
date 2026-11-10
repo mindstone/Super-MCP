@@ -2,15 +2,18 @@
 
 Thank you for your interest in contributing to Super MCP Router! This document provides guidelines for contributing to the project.
 
-For shared-initializer worktrees, see the
-[contributor worktree configuration](docs/project/PROJECT_OVERRIDES.md).
+## How Changes Are Published
+
+This repository is published from Mindstone's private main codebase, the Mindstone Rebel repo. Changes land there first and are exported here as one commit each.
+
+Pull requests on this repository can't be merged here directly, but they're still welcome: a maintainer will carry the change into the main codebase, where it can be reviewed and exported back here.
 
 ## Development Setup
 
 1. **Clone and install dependencies:**
    ```bash
-   git clone https://github.com/your-username/super-mcp-router.git
-   cd super-mcp-router
+   git clone https://github.com/your-username/Super-MCP.git
+   cd Super-MCP
    npm install
    ```
 
@@ -25,6 +28,8 @@ For shared-initializer worktrees, see the
    npm run build
    npm run dev
    ```
+
+For maintainers: For shared-initializer worktrees, see the [contributor worktree configuration](docs/project/PROJECT_OVERRIDES.md).
 
 ## Project Structure
 
@@ -103,7 +108,7 @@ When adding new features:
 ## Submitting Changes
 
 1. Push your branch to GitHub
-2. Create a Pull Request with:
+2. Open a Pull Request for a maintainer to carry into the main codebase, with:
    - Clear description of changes
    - Any breaking changes noted
    - Test instructions if applicable
