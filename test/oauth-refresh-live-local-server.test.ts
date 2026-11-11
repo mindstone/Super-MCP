@@ -373,7 +373,12 @@ describe("OAuth refresh over a real local authorization server", () => {
     const message = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
     const sentence = "This connector's service didn't respond just now. It'll retry automatically.";
     expect(message).toContain(sentence);
-    expect(isAuthLikeErrorMessageText(message)).toBe(false);
+    // The registry's wrapper adds the server URL, whose random local port can
+    // contain "401", so check the client's own error: the text it classifies.
+    const clientError = outcome.error instanceof Error ? outcome.error.cause : undefined;
+    expect(clientError).toBeInstanceOf(Error);
+    expect((clientError as Error).message).toBe(sentence);
+    expect(isAuthLikeErrorMessageText((clientError as Error).message)).toBe(false);
     expect(sentence.toLowerCase()).not.toMatch(/authentication required|unauthorized|401|invalid_token|oauth|authorization/);
     expect(await readDiskTokens(tempDir, packageId)).toMatchObject({ refresh_token: "fictional-old-refresh" });
     expect(await SimpleOAuthProvider.readNeedsReconnectMarkerState(packageId)).toEqual({ state: "absent" });
@@ -460,9 +465,13 @@ describe("OAuth refresh over a real local authorization server", () => {
     if (outcome.kind !== "transient_failure") throw new Error("Expected a temporary connection failure");
     expect(outcome.error).toHaveProperty("cause", expect.any(TemporarilyUnavailableError));
     const message = outcome.error instanceof Error ? outcome.error.message : String(outcome.error);
-    expect(message).toContain("This connector's service didn't respond just now. It'll retry automatically.");
-    expect(isAuthLikeErrorMessageText(message)).toBe(false);
-    expect(message.toLowerCase()).not.toMatch(/authentication required|unauthorized|401|invalid_token|oauth|authorization/);
+    const sentence = "This connector's service didn't respond just now. It'll retry automatically.";
+    expect(message).toContain(sentence);
+    // Check the client's own error, not the wrapper, whose URL has a random port.
+    const clientError = (outcome.error as Error).cause as Error;
+    expect(clientError.message).toBe(sentence);
+    expect(isAuthLikeErrorMessageText(clientError.message)).toBe(false);
+    expect(sentence.toLowerCase()).not.toMatch(/authentication required|unauthorized|401|invalid_token|oauth|authorization/);
     expect(server.refreshRequests()).toBeGreaterThan(0);
     expect(await readDiskTokens(tempDir, packageId)).toMatchObject({ refresh_token: "fictional-old-refresh" });
     expect(await SimpleOAuthProvider.readNeedsReconnectMarkerState(packageId)).toEqual({ state: "absent" });
