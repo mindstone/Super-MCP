@@ -16,6 +16,7 @@ import type { ValidationResult } from "../validator.js";
 import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { getLogger } from "../logging.js";
 import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
+import { mentionsStatus401 } from "../auth/authLikeVocabulary.js";
 import { assertToolAccess } from "../toolAccess.js";
 import { findBestMatch } from "../utils/fuzzyMatch.js";
 import { projectUnionErrors } from "./unionErrorProjection.js";
@@ -2506,7 +2507,7 @@ export async function handleUseTool(
       diagnosticMessage += `\n  1. Insufficient permissions for the requested operation`;
       diagnosticMessage += `\n  2. API key/token lacks required scopes`;
       diagnosticMessage += `\n  3. File system permissions (for filesystem MCPs)`;
-    } else if (errorMessage.includes("auth") || errorMessage.includes("401") || errorMessage.includes("403")) {
+    } else if (errorMessage.includes("auth") || mentionsStatus401(errorMessage) || errorMessage.includes("403")) {
       diagnosticMessage += `\n❌ Authentication/Authorization error`;
       diagnosticMessage += `\nTroubleshooting:`;
       diagnosticMessage += `\n  1. Check if API keys/tokens are valid`;

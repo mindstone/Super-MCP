@@ -13,7 +13,6 @@
 const AUTH_LIKE_MESSAGE_TOKENS = [
   "redirect initiated",
   "unauthorized",
-  "401",
   "invalid_token",
   "missing authorization",
   "authentication required",
@@ -28,5 +27,14 @@ const AUTH_LIKE_MESSAGE_TOKENS = [
  */
 export function isAuthLikeErrorMessageText(message: string): boolean {
   const normalized = message.toLowerCase();
-  return AUTH_LIKE_MESSAGE_TOKENS.some((token) => normalized.includes(token));
+  return mentionsStatus401(message) || AUTH_LIKE_MESSAGE_TOKENS.some((token) => normalized.includes(token));
+}
+
+/**
+ * True when the text carries 401 as a status code: the whole number, not
+ * digits inside a port (127.0.0.1:40123), a duration (1401ms) or an id. Every
+ * "401" check on error text goes through here.
+ */
+export function mentionsStatus401(text: string): boolean {
+  return /\b401\b/.test(text);
 }

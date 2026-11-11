@@ -12,7 +12,7 @@ import { failDroppedAnswers } from "./failDroppedAnswers.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
 import { SimpleOAuthProvider, RefreshOnlyOAuthProvider } from "../auth/providers/index.js";
 import { OAUTH_REDIRECT_URI_REJECTED_CODE } from "../auth/authorizeProbe.js";
-import { isAuthLikeErrorMessageText } from "../auth/authLikeVocabulary.js";
+import { isAuthLikeErrorMessageText, mentionsStatus401 } from "../auth/authLikeVocabulary.js";
 import type { OAuthErrorSummary, StaticOAuthCredentials } from "../auth/providers/simple.js";
 import { runRefreshTransaction } from "../auth/refreshTransaction.js";
 import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
@@ -1094,7 +1094,7 @@ export class HttpMcpClient implements McpClient {
       return "ok";
     } catch (error) {
       if (error instanceof Error && 
-          (error.message.includes("Unauthorized") || error.message.includes("401"))) {
+          (error.message.includes("Unauthorized") || mentionsStatus401(error.message))) {
         return "needs_auth";
       }
       return "error";

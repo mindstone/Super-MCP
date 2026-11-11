@@ -9,6 +9,7 @@ import { PackageRegistry } from "./registry.js";
 import { argsSkeleton, createSchemaHash } from "./summarize.js";
 import { getLogger } from "./logging.js";
 import { oauthErrorLogText } from "./auth/oauthErrorLogging.js";
+import { mentionsStatus401 } from "./auth/authLikeVocabulary.js";
 import { ERROR_CODES } from "./types.js";
 
 const logger = getLogger();
@@ -904,7 +905,7 @@ export class Catalog implements CatalogView {
       (error as { code?: unknown }).code === ERROR_CODES.AUTH_REQUIRED ||
       error.name === "UnauthorizedError" ||
       message.includes("oauth") ||
-      message.includes("401") ||
+      mentionsStatus401(message) ||
       message.includes("unauthorized") ||
       message.includes("invalid_token") ||
       message.includes("authorization")

@@ -24,6 +24,7 @@ import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamable
 import { HttpMcpClient } from "./clients/httpClient.js";
 import { SimpleOAuthProvider } from "./auth/providers/simple.js";
 import { oauthErrorLogText } from "./auth/oauthErrorLogging.js";
+import { mentionsStatus401 } from "./auth/authLikeVocabulary.js";
 import { getLogger } from "./logging.js";
 import { SecurityPolicy, SecurityConfig, setSecurityPolicy } from "./security.js";
 
@@ -165,7 +166,7 @@ function classifyTransientConnectFailure(error: unknown): TransientConnectFailur
 function isAuthConnectFailure(config: PackageConfig, error: unknown): boolean {
   return config.transport === "http" && error instanceof Error && (
     error.message.includes("Unauthorized") ||
-    error.message.includes("401") ||
+    mentionsStatus401(error.message) ||
     error.message.includes("invalid_token") ||
     error.message.includes("authorization") ||
     error.name === "UnauthorizedError"
