@@ -27,6 +27,7 @@ import {
   formatKeyAliasBreadcrumb,
   canonicalKey,
   canonicalKeyNormalize,
+  unwrapEchoedEnvelope,
   coerceArgsToSchema,
   formatAutoRepairBreadcrumb,
   requirePackageId,
@@ -1847,6 +1848,11 @@ export async function handleUseTool(
   if ((!isValid || strippedArgs.length > 0) && preValidationSnapshot) {
     const repaired = structuredClone(preValidationSnapshot) as Record<string, unknown>;
     const repairCrumbs: AutoRepairBreadcrumb[] = [];
+    const { breadcrumbs: echoCrumbs } = unwrapEchoedEnvelope(repaired, schema, {
+      packageId: package_id,
+      toolId: tool_id,
+    });
+    repairCrumbs.push(...echoCrumbs);
     const { breadcrumbs: keyCrumbs } = canonicalKeyNormalize(repaired, schema);
     repairCrumbs.push(...keyCrumbs);
     const { breadcrumbs: coerceCrumbs } = coerceArgsToSchema(repaired, schema);

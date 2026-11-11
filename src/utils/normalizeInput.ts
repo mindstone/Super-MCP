@@ -444,12 +444,79 @@ function schemaProperties(schema: unknown): Record<string, unknown> {
  */
 export type AutoRepairBreadcrumb =
   | { kind: "key"; from: string; to: string }
-  | { kind: "coerce"; field: string };
+  | { kind: "coerce"; field: string }
+  | { kind: "envelope_echo" };
 
 /** Format an auto-repair breadcrumb into the `normalisations` string shape. */
 export function formatAutoRepairBreadcrumb(entry: AutoRepairBreadcrumb): string {
   if (entry.kind === "key") return `auto_repair_key:${entry.from}→${entry.to}`;
+  if (entry.kind === "envelope_echo") return "auto_repair_envelope_echo";
   return `auto_repair_coerce:${entry.field}`;
+}
+
+/**
+ * Undo an echoed `use_tool` envelope inside `args` (FOX-9491).
+ *
+ * The model sometimes repeats the call's own envelope in the tool arguments:
+ * `args: { package_id, tool_id, args: {...} }`, or `package_id` / `tool_id` beside
+ * the real arguments. When the tool's schema could not possibly mean those keys,
+ * and every one present names this very call, they carry no information: drop
+ * them, and if what is left is exactly one `args` object, use it as the arguments.
+ *
+ * "Could not possibly mean" is strict, so a real argument is never dropped:
+ * - the schema is closed: `additionalProperties` is `false` or absent, and there
+ *   is no composition or `patternProperties` that could accept the key (stricter
+ *   than the validator's own unknown-field test in `validator.ts`);
+ * - no declared property shares an envelope key's canonical form (a schema with
+ *   `toolId` or `Args` keeps the key for the canonical-key repair to map).
+ *
+ * Mutates `args` in place, like the other Stage 0 repairs; the caller adopts the
+ * result only if it then validates cleanly.
+ */
+const ENVELOPE_KEYS = ["package_id", "tool_id", "args"] as const;
+
+function isClosedSchema(schema: unknown): boolean {
+  if (!schema || typeof schema !== "object") return false;
+  const s = schema as Record<string, unknown>;
+  if (!s.properties || typeof s.properties !== "object") return false;
+  if ("additionalProperties" in s && s.additionalProperties !== false) return false;
+  return !s.oneOf && !s.allOf && !s.anyOf && !s.patternProperties;
+}
+
+export function unwrapEchoedEnvelope(
+  args: Record<string, unknown>,
+  schema: unknown,
+  call: { packageId: string; toolId: string },
+): { breadcrumbs: AutoRepairBreadcrumb[] } {
+  const none = { breadcrumbs: [] };
+  if (!isClosedSchema(schema)) return none;
+  const declared = Object.keys(schemaProperties(schema)).map(canonicalKey);
+  if (ENVELOPE_KEYS.some((key) => declared.includes(canonicalKey(key)))) return none;
+
+  const hasPackage = Object.prototype.hasOwnProperty.call(args, "package_id");
+  const hasTool = Object.prototype.hasOwnProperty.call(args, "tool_id");
+  if (!hasPackage && !hasTool) return none;
+  const packageAgrees =
+    typeof args.package_id === "string" &&
+    args.package_id.toLowerCase() === call.packageId.toLowerCase();
+  const toolAgrees =
+    args.tool_id === call.toolId || args.tool_id === `${call.packageId}__${call.toolId}`;
+  if ((hasPackage && !packageAgrees) || (hasTool && !toolAgrees)) return none;
+
+  delete args.package_id;
+  delete args.tool_id;
+  const inner = args.args;
+  if (
+    Object.keys(args).length === 1 &&
+    inner !== null &&
+    typeof inner === "object" &&
+    !Array.isArray(inner)
+  ) {
+    delete args.args;
+    // Copy own properties without setters: an inner `__proto__` key must stay data.
+    Object.defineProperties(args, Object.getOwnPropertyDescriptors(inner));
+  }
+  return { breadcrumbs: [{ kind: "envelope_echo" }] };
 }
 
 /**

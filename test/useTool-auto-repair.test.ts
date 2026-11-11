@@ -369,3 +369,156 @@ describe("useTool — Stage 0 schema-driven auto-repair", () => {
     expect(mockClient.callTool).not.toHaveBeenCalled();
   });
 });
+
+// FOX-9491 — the model sometimes echoes the use_tool envelope inside `args`:
+// `args: { package_id, tool_id, args: {...} }`, or `package_id`/`tool_id` beside the
+// real arguments. Seen across Rebel's own and third-party tools (Sentry REBEL-61R,
+// "Unknown fields: package_id, tool_id[, args]"). The echo names this very call, so
+// it is repaired deterministically, and only when the repaired call validates.
+describe("useTool — echoed use_tool envelope inside args (FOX-9491)", () => {
+  const MEETINGS_SCHEMA = {
+    type: "object",
+    properties: {
+      startDate: { type: "string" },
+      endDate: { type: "string" },
+    },
+    required: ["startDate"],
+    additionalProperties: false,
+  };
+  const target = { packageId: "RebelMeetings", toolIds: ["rebel_meetings_history"] };
+
+  async function call(args: Record<string, unknown>, schema: unknown = MEETINGS_SCHEMA) {
+    const mocks = createMocks(schema, target);
+    const run = handleUseTool(
+      { package_id: "RebelMeetings", tool_id: "rebel_meetings_history", args },
+      mocks.mockRegistry,
+      mocks.mockCatalog,
+      mocks.validator,
+    );
+    return { run, mockClient: mocks.mockClient };
+  }
+
+  it("unwraps a nested envelope that names this call", async () => {
+    const { run, mockClient } = await call({
+      package_id: "RebelMeetings",
+      tool_id: "rebel_meetings_history",
+      args: { startDate: "2026-11-01" },
+    });
+    const response = await run;
+    expect(response.isError).toBe(false);
+    expect(mockClient.callTool).toHaveBeenCalledWith("rebel_meetings_history", {
+      startDate: "2026-11-01",
+    });
+    expect(response._meta?.superMcp?.normalisations).toEqual(["auto_repair_envelope_echo"]);
+  });
+
+  it("drops a flat envelope echo beside the real arguments (namespaced tool_id too)", async () => {
+    const { run, mockClient } = await call({
+      package_id: "RebelMeetings",
+      tool_id: "RebelMeetings__rebel_meetings_history",
+      startDate: "2026-11-01",
+    });
+    await run;
+    expect(mockClient.callTool).toHaveBeenCalledWith("rebel_meetings_history", {
+      startDate: "2026-11-01",
+    });
+  });
+
+  it("leaves the refusal alone when the nested tool_id names a different tool", async () => {
+    const { run, mockClient } = await call({
+      tool_id: "rebel_meetings_today",
+      args: { startDate: "2026-11-01" },
+    });
+    await expect(run).rejects.toMatchObject({ code: -33003 });
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it("leaves the refusal alone when the unwrapped arguments have an unknown field", async () => {
+    const { run, mockClient } = await call({
+      tool_id: "rebel_meetings_history",
+      args: { startDate: "2026-11-01", fromDate: "2026-11-01" },
+    });
+    await expect(run).rejects.toMatchObject({ code: -33003 });
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it("leaves the refusal alone when the unwrapped arguments miss a required field", async () => {
+    const { run, mockClient } = await call({
+      tool_id: "rebel_meetings_history",
+      args: { endDate: "2026-11-01" },
+    });
+    await expect(run).rejects.toMatchObject({ code: -33003 });
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it("leaves the refusal alone when one present envelope key disagrees with the call", async () => {
+    const { run, mockClient } = await call({
+      package_id: "GoogleWorkspace",
+      tool_id: "rebel_meetings_history",
+      args: { startDate: "2026-11-01" },
+    });
+    await expect(run).rejects.toMatchObject({ code: -33003 });
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it("keeps an inner __proto__ key as data, never as the arguments' prototype", async () => {
+    const inner = JSON.parse('{"__proto__": {"startDate": "2026-11-01"}}');
+    const { run, mockClient } = await call({ tool_id: "rebel_meetings_history", args: inner });
+    await expect(run).rejects.toMatchObject({ code: -33003 });
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+
+  // Each veto case sends `count` as a string so the call fails first validation and
+  // reaches the Stage 0 repairs; without the veto, the repair would drop the key.
+  const withCount = (properties: Record<string, unknown>, extra: Record<string, unknown> = {}) => ({
+    type: "object",
+    properties: { ...properties, count: { type: "integer" } },
+    ...extra,
+  });
+
+  it("never drops a tool_id the tool's own schema declares", async () => {
+    const schema = withCount({ tool_id: { type: "string" } }, { additionalProperties: false });
+    const { run, mockClient } = await call({ tool_id: "rebel_meetings_history", count: "1" }, schema);
+    await run;
+    expect(mockClient.callTool).toHaveBeenCalledWith("rebel_meetings_history", {
+      tool_id: "rebel_meetings_history",
+      count: 1,
+    });
+  });
+
+  it("never drops an envelope key whose canonical twin the schema declares", async () => {
+    const schema = withCount({ toolId: { type: "string" } }, { additionalProperties: false });
+    const { run, mockClient } = await call({ tool_id: "rebel_meetings_history", count: "1" }, schema);
+    await run;
+    // The canonical-key repair maps it onto the declared property instead.
+    expect(mockClient.callTool).toHaveBeenCalledWith("rebel_meetings_history", {
+      toolId: "rebel_meetings_history",
+      count: 1,
+    });
+  });
+
+  it.each([
+    ["additionalProperties: true", { additionalProperties: true }],
+    ["anyOf composition", { anyOf: [{ required: ["count"] }] }],
+  ])("never touches a schema that could accept the key (%s)", async (_label, extra) => {
+    const schema = withCount({}, extra);
+    const { run, mockClient } = await call({ package_id: "RebelMeetings", count: "1" }, schema);
+    await run;
+    expect(mockClient.callTool).toHaveBeenCalledWith("rebel_meetings_history", {
+      package_id: "RebelMeetings",
+      count: 1,
+    });
+  });
+
+  it("never drops a key that patternProperties accepts, even beside additionalProperties: false", async () => {
+    // The validator itself refuses this key today (it strips by `properties` only);
+    // the repair must not turn that refusal into a call without the key.
+    const schema = withCount({}, {
+      additionalProperties: false,
+      patternProperties: { "^package_id$": { type: "string" } },
+    });
+    const { run, mockClient } = await call({ package_id: "RebelMeetings", count: "1" }, schema);
+    await expect(run).rejects.toMatchObject({ code: -33003 });
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+});
