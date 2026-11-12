@@ -2500,8 +2500,12 @@ export async function handleUseTool(
     // failure (FOX-9088).
     const underlying = (error as { originalError?: unknown } | null)?.originalError ?? error;
     const diagnosedText = underlying instanceof Error ? underlying.message : String(underlying);
-    
-    if (diagnosedText.includes("not found") || diagnosedText.includes("undefined")) {
+    const diagnosedCode = typeof underlying === "object" && underlying !== null ? (underlying as { code?: unknown }).code : undefined;
+
+    // A missing file or folder is decided by its filesystem code, never by words in its path (FOX-8286).
+    if (diagnosedCode === "ENOENT" || diagnosedCode === "ENOTDIR") {
+      diagnosticMessage += `\n❌ ${errorMessage}`;
+    } else if (diagnosedText.includes("not found") || diagnosedText.includes("undefined")) {
       diagnosticMessage += `\n❌ Tool might not exist or package not properly connected`;
       diagnosticMessage += `\nTroubleshooting:`;
       diagnosticMessage += `\n  1. Run 'health_check_all()' to verify package status`;
