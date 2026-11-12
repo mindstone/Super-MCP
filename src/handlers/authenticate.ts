@@ -546,8 +546,28 @@ async function handleAuthenticateCore(
 
       // Hoisted so both the success path and the catch can suppress the
       // losing promise after the race settles (d).
-      let callbackPromise: Promise<string> | undefined;
+      let callbackPromise: Promise<string | typeof PEER_SIGNED_IN> | undefined;
       let fatalConnectErrorPromise: Promise<string | undefined> | undefined;
+      // Another authenticate call for this package (e.g. the sign-in card
+      // while an agent's call waits) uses its own state, so this attempt's
+      // callback never arrives. Its completed sign-in ends this wait too
+      // (FOX-9399). Only a completed sign-in counts, not a connection that
+      // merely turns healthy, so a forced re-auth still needs a new sign-in.
+      let peerWaiters = signInWaiters.get(package_id);
+      if (!peerWaiters) signInWaiters.set(package_id, peerWaiters = new Set());
+      const waiters = peerWaiters;
+      let settleOnPeer = () => {};
+      const peerSignedIn = new Promise<typeof PEER_SIGNED_IN>((resolve) => {
+        settleOnPeer = () => resolve(PEER_SIGNED_IN);
+      });
+      waiters.add(settleOnPeer);
+      // Set once this attempt exchanged its own code; a bootstrap that just
+      // connected is not a sign-in for the other waiters.
+      let signedIn = false;
+      const stopWaitingForPeer = () => {
+        waiters.delete(settleOnPeer);
+        if (waiters.size === 0 && signInWaiters.get(package_id) === waiters) signInWaiters.delete(package_id);
+      };
       const discardAttemptClient = async () => {
         if (clients.get(package_id) === attemptHttpClient) clients.delete(package_id);
         try {
@@ -567,6 +587,7 @@ async function handleAuthenticateCore(
         callbackPromise = Promise.race([
           callbackServer.waitForCallback(OAUTH_CALLBACK_TIMEOUT_MS, oauthState),
           oauthProvider.browserUnavailable().then((error) => { throw error; }),
+          peerSignedIn,
         ]);
 
         // Bootstrap can connect without a browser, start a redirect, or fail.
@@ -618,10 +639,15 @@ async function handleAuthenticateCore(
         // Suppress unhandled rejection from the losing promise after the race settles (d)
         callbackPromise.catch(() => {});
         fatalConnectErrorPromise.catch(() => {});
+        if (authCode === PEER_SIGNED_IN) {
+          await discardAttemptClient();
+          return peerSignedInOutcome(package_id, catalog);
+        }
         if (authCode !== undefined) {
           logger.info("OAuth callback received", { package_id, has_code: !!authCode });
           logger.info("Exchanging authorization code for tokens", { package_id });
           await attemptHttpClient.finishOAuth(authCode);
+          signedIn = true;
         }
 
         logger.info("OAuth flow completed, verifying connection", { package_id });
@@ -649,7 +675,13 @@ async function handleAuthenticateCore(
             throw buildRedirectUriRejectedError(probeVerdict);
           }
           try {
-            await attemptHttpClient.finishOAuth(await callbackPromise);
+            const lateCode = await callbackPromise;
+            if (lateCode === PEER_SIGNED_IN) {
+              await discardAttemptClient();
+              return peerSignedInOutcome(package_id, catalog);
+            }
+            await attemptHttpClient.finishOAuth(lateCode);
+            signedIn = true;
             health = await attemptHttpClient.healthCheck();
           } catch (error) {
             await discardAttemptClient();
@@ -660,6 +692,7 @@ async function handleAuthenticateCore(
         if (health === "ok") {
           logger.info("Authentication verified successfully", { package_id });
           catalog.clearPackage(package_id);
+          if (signedIn) announceSignIn(package_id, settleOnPeer);
           return {
             kind: "response",
             response: {
@@ -679,6 +712,7 @@ async function handleAuthenticateCore(
         } else if (health === "timeout") {
           logger.info("Authentication completed, verification pending (slow server)", { package_id });
           catalog.clearPackage(package_id);
+          if (signedIn) announceSignIn(package_id, settleOnPeer);
           return {
             kind: "response",
             response: {
@@ -899,6 +933,7 @@ async function handleAuthenticateCore(
         });
         return { kind: "pending", httpClient: attemptHttpClient, diagnosticsSuffix };
       } finally {
+        stopWaitingForPeer();
         // (b) stop+await the attempt's callback server — no leaked listeners
         try {
           await callbackServer.stop();
@@ -1197,6 +1232,38 @@ async function handleAuthenticateCore(
   } finally {
     if (homed) await Promise.all([...clients.values()].map(client => client.close()));
   }
+}
+
+const PEER_SIGNED_IN = Symbol("peer-signed-in");
+
+/** Authenticate calls still waiting for a browser sign-in, by package. */
+const signInWaiters = new Map<string, Set<() => void>>();
+
+function announceSignIn(package_id: string, own: () => void): void {
+  for (const settle of signInWaiters.get(package_id) ?? []) {
+    if (settle !== own) settle();
+  }
+}
+
+function peerSignedInOutcome(package_id: string, catalog: Catalog) {
+  logger.info("Another sign-in for this package succeeded; ending this wait", { package_id });
+  catalog.clearPackage(package_id);
+  return {
+    kind: "response" as const,
+    response: {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            package_id,
+            status: "authenticated",
+            message: "Successfully authenticated. Ready to use.",
+          }, null, 2),
+        },
+      ],
+      isError: false,
+    },
+  };
 }
 
 function isSuccessfulAuthenticationResult(result: unknown): boolean {
