@@ -322,6 +322,75 @@ describe("/api/tools package filtering", () => {
     }
   });
 
+  it("selects a package whose id contains a comma when it is requested on its own", async () => {
+    const commaId = "Chat (Alpha, Beta & more)";
+    const packages = [
+      { id: "alpha", name: "Alpha", transport: "stdio", visibility: "default" },
+      { id: commaId, name: commaId, transport: "stdio", visibility: "default" },
+    ] satisfies PackageConfig[];
+    const registry = createMockRegistry(packages);
+    const catalog = createRouteCatalog();
+    const server = await startApiServer(registry, catalog);
+
+    try {
+      const query = new URLSearchParams({ packages: commaId });
+      const response = await fetch(`${server.baseUrl}/api/tools?${query.toString()}`);
+      const body = await response.json();
+
+      expect(response.ok).toBe(true);
+      expect(body.package_count).toBe(1);
+      expect(body.tools.map((tool: { package_id: string }) => tool.package_id)).toEqual([commaId]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("selects every package when ids, one with a comma, are sent as repeated parameters", async () => {
+    const commaId = "Chat (Alpha, Beta & more)";
+    const packages = [
+      { id: "alpha", name: "Alpha", transport: "stdio", visibility: "default" },
+      { id: commaId, name: commaId, transport: "stdio", visibility: "default" },
+      { id: "gamma", name: "Gamma", transport: "stdio", visibility: "default" },
+    ] satisfies PackageConfig[];
+    const registry = createMockRegistry(packages);
+    const catalog = createRouteCatalog();
+    const server = await startApiServer(registry, catalog);
+
+    try {
+      const query = new URLSearchParams();
+      query.append("packages", "alpha");
+      query.append("packages", commaId);
+      const response = await fetch(`${server.baseUrl}/api/tools?${query.toString()}`);
+      const body = await response.json();
+
+      expect(response.ok).toBe(true);
+      expect(body.tools.map((tool: { package_id: string }) => tool.package_id)).toEqual(["alpha", commaId]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("never selects a package from a fragment of a comma id that was not itself requested", async () => {
+    const commaId = "Chat (Alpha, Beta & more)";
+    const packages = [
+      { id: "Chat (Alpha", name: "Fragment", transport: "stdio", visibility: "default" },
+      { id: commaId, name: commaId, transport: "stdio", visibility: "default" },
+    ] satisfies PackageConfig[];
+    const registry = createMockRegistry(packages);
+    const catalog = createRouteCatalog();
+    const server = await startApiServer(registry, catalog);
+
+    try {
+      const query = new URLSearchParams({ packages: commaId });
+      const response = await fetch(`${server.baseUrl}/api/tools?${query.toString()}`);
+      const body = await response.json();
+
+      expect(body.tools.map((tool: { package_id: string }) => tool.package_id)).toEqual([commaId]);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("returns all packages when no filter is provided", async () => {
     const packages = [
       { id: "alpha", name: "Alpha", transport: "stdio", visibility: "default" },

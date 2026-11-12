@@ -167,12 +167,25 @@ export function appendErrorAdvice(code: unknown, message: string, data?: unknown
   }
 }
 
-function parseRequestedPackageIds(queryValue: unknown): string[] | null {
+/**
+ * Read `?packages=`: one id per repeated parameter, or the older comma-joined
+ * list. A value that is exactly a registered package id is that id, so an id
+ * containing a comma (a display-style name such as "Chat (A, B & more)") is
+ * never split into fragments that miss it or match a different package.
+ */
+function parseRequestedPackageIds(
+  queryValue: unknown,
+  registeredPackageIds: ReadonlySet<string>,
+): string[] | null {
   const rawValues = Array.isArray(queryValue) ? queryValue : [queryValue];
-  const packageIds = rawValues
-    .flatMap((value) => (typeof value === "string" ? value.split(",") : []))
-    .map((value) => value.trim())
-    .filter(Boolean);
+  const packageIds = rawValues.flatMap((value) => {
+    if (typeof value !== "string") return [];
+    if (registeredPackageIds.has(value)) return [value];
+    return value
+      .split(",")
+      .map((part) => part.trim())
+      .filter(Boolean);
+  });
 
   return packageIds.length > 0 ? packageIds : null;
 }
@@ -370,7 +383,10 @@ export function registerHttpApiRoutes(
   app.get("/api/tools", async (req, res) => {
     const stopWatchdog = startDiscoveryWatchdog("GET /api/tools");
     try {
-      const requestedPackageIds = parseRequestedPackageIds(req.query.packages);
+      const requestedPackageIds = parseRequestedPackageIds(
+        req.query.packages,
+        new Set(registry.getPackages().map((pkg) => pkg.id)),
+      );
       const packages = selectPackages(registry, requestedPackageIds);
       for (const pkg of packages) catalogRefresher?.scheduleRefresh(pkg.id);
       await waitForCurrentSnapshot(
