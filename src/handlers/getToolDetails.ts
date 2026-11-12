@@ -268,7 +268,12 @@ export async function handleGetToolDetails(
           tool_id: req.responseToolId,
           name: req.responseToolId,
           description: cachedTool.tool.description,
-          summary: cachedTool.summary,
+          // The catalog derives summary from the description, so it is
+          // usually an exact copy. Send it only when it adds something.
+          ...(cachedTool.summary !== undefined &&
+          cachedTool.summary !== cachedTool.tool.description
+            ? { summary: cachedTool.summary }
+            : {}),
           ...(matchingNote
             ? {
                 notes: {
@@ -347,7 +352,8 @@ export async function handleGetToolDetails(
     content: [
       {
         type: "text",
-        text: JSON.stringify({ tools: results }, null, 2),
+        // Compact JSON: indentation costs tokens on every call and no reader needs it.
+        text: JSON.stringify({ tools: results }),
       },
     ],
     structuredContent: { tools: results },

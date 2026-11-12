@@ -517,8 +517,54 @@ describe('handleGetToolDetails', () => {
           properties: { to: { type: 'string' } },
         },
       }],
-    }, null, 2));
+    }));
     expect(mockToolNotesStore.readSnapshot).toHaveBeenCalledTimes(1);
+  });
+
+  it('omits summary when it repeats the description, keeping every other field', async () => {
+    const catalog = createMockCatalog({
+      'gmail': [makeToolDef('send_email', {
+        description: 'Send an email',
+        summary: 'Send an email',
+        schemaHash: 'sha256:abc123',
+      })],
+    });
+
+    const result = await handleGetToolDetails(
+      { tool_ids: ['gmail__send_email'] },
+      catalog,
+      registry,
+    );
+
+    const tool = parseResult(result).tools[0];
+    expect(tool.description).toBe('Send an email');
+    expect('summary' in tool).toBe(false);
+    expect(tool.schema_hash).toBe('sha256:abc123');
+    expect(tool.schema).toEqual({ type: 'object', properties: { arg1: { type: 'string' } } });
+    expect(tool.args_skeleton).toEqual({ arg1: '<string>' });
+    expect('summary' in result.structuredContent.tools[0]).toBe(false);
+  });
+
+  it('places a note right after the description when summary is omitted', async () => {
+    mockToolNotesStore.readSnapshot.mockResolvedValue([
+      makeLiveNote('gmail', 'send_email', 'Check recipients first.', 'sha256:abc123'),
+    ]);
+    const catalog = createMockCatalog({
+      'gmail': [makeToolDef('send_email', {
+        description: 'Send an email',
+        summary: 'Send an email',
+        schemaHash: 'sha256:abc123',
+      })],
+    });
+
+    const result = await handleGetToolDetails(
+      { tool_ids: ['gmail__send_email'] },
+      catalog,
+      registry,
+    );
+
+    const keys = Object.keys(parseResult(result).tools[0]);
+    expect(keys.indexOf('notes')).toBe(keys.indexOf('description') + 1);
   });
 
   it('uses one notes snapshot for multiple requested tools', async () => {
