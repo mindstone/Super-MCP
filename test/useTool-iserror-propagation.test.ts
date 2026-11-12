@@ -167,6 +167,44 @@ describe("useTool isError propagation", () => {
 });
 
 describe("useTool connect diagnostics", () => {
+  // The registry wraps a raw connect failure in advice that ends "Verify any
+  // required authentication"; the diagnosis comes from the original error, so
+  // that advice never turns a dropped connection into a sign-in failure, and a
+  // real 401 underneath is still one (FOX-9088).
+  it.each([
+    ["fetch failed", false],
+    ["HTTP 401 Unauthorized", true],
+  ])("diagnoses a registry-wrapped %s from the original error", async (originalText, isAuth) => {
+    const original = new Error(originalText);
+    const wrapped = Object.assign(
+      new Error(
+        "Failed to connect to MCP package 'pkg1'.\nTransport: http\nURL: https://connector.example.com/mcp\n"
+          + `\nOriginal error: ${originalText}\n\nTroubleshooting:`
+          + "\n  1. Run 'health_check_all(detailed: true)' for diagnostics"
+          + "\n  2. Check the package configuration"
+          + "\n  3. Verify any required authentication",
+        { cause: original },
+      ),
+      { originalError: original },
+    );
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks({ content: [] });
+    vi.spyOn(mockRegistry, "callTool").mockRejectedValue(wrapped);
+
+    const thrown = await handleUseTool(
+      { package_id: "pkg1", tool_id: "tool1", args: {} },
+      mockRegistry,
+      mockCatalog,
+      mockValidator,
+    ).catch((error: unknown) => error);
+
+    expect(thrown).toMatchObject({
+      code: ERROR_CODES.DOWNSTREAM_ERROR,
+      data: { original_error: wrapped.message },
+    });
+    const message = (thrown as { message: string }).message;
+    expect(message.includes("Authentication/Authorization error")).toBe(isAuth);
+  });
+
   it("forwards only allowlisted connect diagnostics and never the stderr tail", async () => {
     const sensitiveStderr = "synthetic connector output must not cross the boundary";
     const connectError = Object.assign(

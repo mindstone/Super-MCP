@@ -2494,26 +2494,32 @@ export async function handleUseTool(
       throw error;
     }
     let diagnosticMessage = `Tool execution failed in package '${package_id}', tool '${tool_id}'.\n`;
+    // Diagnose from the underlying failure: the registry wraps a raw connect
+    // error in advice (its URL, "Verify any required authentication") that must
+    // not decide what went wrong, or an unreachable service reads as a sign-in
+    // failure (FOX-9088).
+    const underlying = (error as { originalError?: unknown } | null)?.originalError ?? error;
+    const diagnosedText = underlying instanceof Error ? underlying.message : String(underlying);
     
-    if (errorMessage.includes("not found") || errorMessage.includes("undefined")) {
+    if (diagnosedText.includes("not found") || diagnosedText.includes("undefined")) {
       diagnosticMessage += `\n❌ Tool might not exist or package not properly connected`;
       diagnosticMessage += `\nTroubleshooting:`;
       diagnosticMessage += `\n  1. Run 'health_check_all()' to verify package status`;
       diagnosticMessage += `\n  2. Run 'list_tools(package_id: "${package_id}")' to see available tools`;
       diagnosticMessage += `\n  3. Check if the tool name is correct (case-sensitive)`;
-    } else if (errorMessage.includes("timeout")) {
+    } else if (diagnosedText.includes("timeout")) {
       diagnosticMessage += `\n❌ Tool execution timed out after ${duration}ms`;
       diagnosticMessage += `\nThis might indicate:`;
       diagnosticMessage += `\n  1. The operation is taking longer than expected`;
       diagnosticMessage += `\n  2. The MCP server is not responding`;
       diagnosticMessage += `\n  3. Network issues (for HTTP-based MCPs)`;
-    } else if (errorMessage.includes("permission") || errorMessage.includes("denied")) {
+    } else if (diagnosedText.includes("permission") || diagnosedText.includes("denied")) {
       diagnosticMessage += `\n❌ Permission denied`;
       diagnosticMessage += `\nPossible causes:`;
       diagnosticMessage += `\n  1. Insufficient permissions for the requested operation`;
       diagnosticMessage += `\n  2. API key/token lacks required scopes`;
       diagnosticMessage += `\n  3. File system permissions (for filesystem MCPs)`;
-    } else if (errorMessage.includes("auth") || mentionsStatus401(errorMessage) || errorMessage.includes("403")) {
+    } else if (diagnosedText.includes("auth") || mentionsStatus401(diagnosedText) || diagnosedText.includes("403")) {
       diagnosticMessage += `\n❌ Authentication/Authorization error`;
       diagnosticMessage += `\nTroubleshooting:`;
       diagnosticMessage += `\n  1. Check if API keys/tokens are valid`;
