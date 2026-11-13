@@ -2499,6 +2499,26 @@ export async function handleUseTool(
     // not decide what went wrong, or an unreachable service reads as a sign-in
     // failure (FOX-9088).
     const underlying = (error as { originalError?: unknown } | null)?.originalError ?? error;
+
+    // A connector whose sign-in ran out mid-session (FOX-9819): the HTTP client
+    // turns a transport 401 into an UnauthorizedError (a connector's own McpError
+    // never is). Record auth_required and answer in the same shape as the
+    // pre-call check above, so the host shows the sign-in card. Never replayed;
+    // discovery may still succeed for a connector that only guards its calls.
+    if (underlying instanceof Error && underlying.name === "UnauthorizedError") {
+      catalog.commitFailure(package_id, catalog.getConfigurationGeneration(), {
+        status: "auth_required",
+        failureClass: "auth_required",
+        nextRetryAt: null,
+        nextAuthProbeAt: null,
+      });
+      throw Object.defineProperty({
+        code: ERROR_CODES.PACKAGE_UNAVAILABLE,
+        message: `Package '${package_id}' requires authentication. Run 'authenticate(package_id: "${package_id}")'.`,
+        data: { package_id, status: "auth_required" },
+      }, "cause", { value: error });
+    }
+
     const diagnosedText = underlying instanceof Error ? underlying.message : String(underlying);
     const diagnosedCode = typeof underlying === "object" && underlying !== null ? (underlying as { code?: unknown }).code : undefined;
 

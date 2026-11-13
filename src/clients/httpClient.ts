@@ -12,7 +12,7 @@ import { failDroppedAnswers } from "./failDroppedAnswers.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
 import { SimpleOAuthProvider, RefreshOnlyOAuthProvider } from "../auth/providers/index.js";
 import { OAUTH_REDIRECT_URI_REJECTED_CODE } from "../auth/authorizeProbe.js";
-import { isAuthLikeErrorMessageText, mentionsStatus401 } from "../auth/authLikeVocabulary.js";
+import { isAuthLikeError } from "../auth/authLikeVocabulary.js";
 import type { OAuthErrorSummary, StaticOAuthCredentials } from "../auth/providers/simple.js";
 import { runRefreshTransaction } from "../auth/refreshTransaction.js";
 import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
@@ -429,12 +429,10 @@ export { OAUTH_REDIRECT_URI_REJECTED_CODE } from "../auth/authorizeProbe.js";
 // (src/handlers/__tests__/oauthBudgetInvariant.test.ts).
 export const LIST_TOOLS_TIMEOUT_MS = 10_000;
 
-// The auth-like message vocabulary lives in the auth/authLikeVocabulary.ts
-// LEAF module so auth/authorizeProbe.ts can enforce the rejection-message
-// contract at throw time without closing an authorizeProbe ↔ httpClient
-// import cycle (runtime-safety F6). Re-exported here for existing consumers
-// (tests pin the contract against this module's surface).
-export { isAuthLikeErrorMessageText };
+// The auth-like vocabulary lives in the auth/authLikeVocabulary.ts LEAF module
+// so auth/authorizeProbe.ts can enforce the rejection-message contract at
+// throw time without closing an authorizeProbe ↔ httpClient import cycle
+// (runtime-safety F6). This client classifies only with isAuthLikeError.
 
 export class HttpMcpClient implements McpClient {
   private client: Client;
@@ -569,8 +567,27 @@ export class HttpMcpClient implements McpClient {
     return error as T & { oauthDiscoveryTrace: OAuthDiscoveryTraceEntry[] };
   }
 
-  private isAuthLikeErrorMessage(message: string): boolean {
-    return isAuthLikeErrorMessageText(message);
+  /**
+   * The one sign-in-needed error every HTTP exit throws, so the registry,
+   * catalog and use_tool classify it by name whatever the SDK sent (an
+   * empty-body 401 carries its status only in `.code`, FOX-9819).
+   */
+  private authRequiredError(cause: unknown): Error {
+    const authError = new Error(
+      `Authentication required. Use 'authenticate(package_id: "${this.packageId}")' to sign in.`,
+      { cause },
+    );
+    authError.name = "UnauthorizedError";
+    return authError;
+  }
+
+  /**
+   * A transport-level auth failure from a request on a live session. A
+   * JSON-RPC error the server answered with (McpError) is the connector's
+   * own answer and keeps its text.
+   */
+  private isRequestAuthFailure(error: unknown): boolean {
+    return !(error instanceof McpError) && isAuthLikeError(error);
   }
 
   private async recreateClientForSseFallback(reason: string): Promise<void> {
@@ -765,13 +782,13 @@ export class HttpMcpClient implements McpClient {
           // substring in connectWithOAuth / registry / authenticate) survives SDK
           // message churn. Only genuine negotiation failures get the error-log +
           // "Transport negotiation failed" wrap.
-          if (this.isAuthLikeErrorMessage(fallbackErrorMessage)) {
+          if (isAuthLikeError(fallbackError)) {
             logger.debug("SSE fallback reached OAuth redirect (expected)", {
               package_id: this.packageId,
               original_error: oauthErrorLogText(error, errorMessage),
               fallback_error: oauthErrorLogText(fallbackError, fallbackErrorMessage),
             });
-            throw fallbackError;
+            throw this.authRequiredError(fallbackError);
           }
           logger.error("SSE fallback also failed", {
             package_id: this.packageId,
@@ -842,13 +859,13 @@ export class HttpMcpClient implements McpClient {
           // message churn. Only genuine negotiation failures get the error-log +
           // "Transport negotiation failed" wrap. Mirrors the SSE-fallback branch
           // above.
-          if (this.isAuthLikeErrorMessage(fallbackErrorMessage)) {
+          if (isAuthLikeError(fallbackError)) {
             logger.debug("Streamable HTTP fallback reached OAuth redirect (expected)", {
               package_id: this.packageId,
               original_error: oauthErrorLogText(error, errorMessage),
               fallback_error: oauthErrorLogText(fallbackError, fallbackErrorMessage),
             });
-            throw fallbackError;
+            throw this.authRequiredError(fallbackError);
           }
           logger.error("Streamable HTTP fallback also failed", {
             package_id: this.packageId,
@@ -882,7 +899,7 @@ export class HttpMcpClient implements McpClient {
         throw authError;
       }
       
-      if (this.isAuthLikeErrorMessage(errorMessage)) {
+      if (isAuthLikeError(error)) {
         logger.error("Authentication required for MCP server", {
           package_id: this.packageId,
           error: oauthErrorLogText(error, error instanceof Error ? error.name.slice(0, 80) : "unknown"),
@@ -890,11 +907,7 @@ export class HttpMcpClient implements McpClient {
           oauth_configured: this.config.oauth === true,
           has_saved_tokens: this.useOAuth,
         });
-        const authError = new Error(
-          `Authentication required. Use 'authenticate(package_id: "${this.packageId}")' to sign in.`
-        );
-        authError.name = "UnauthorizedError";
-        throw authError;
+        throw this.authRequiredError(error);
       }
       
       logger.error("Failed to connect to MCP server", {
@@ -1019,7 +1032,7 @@ export class HttpMcpClient implements McpClient {
           package_id: this.packageId,
           error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
         });
-        throw error;
+        throw this.isRequestAuthFailure(error) ? this.authRequiredError(error) : error;
       }
     }) as Promise<any[]>;
   }
@@ -1059,7 +1072,7 @@ export class HttpMcpClient implements McpClient {
           tool_name: name,
           error: oauthErrorLogText(error, error instanceof Error ? error.message : String(error)),
         });
-        throw error;
+        throw this.isRequestAuthFailure(error) ? this.authRequiredError(error) : error;
       }
     });
   }
@@ -1093,8 +1106,7 @@ export class HttpMcpClient implements McpClient {
       await this.listTools();
       return "ok";
     } catch (error) {
-      if (error instanceof Error && 
-          (error.message.includes("Unauthorized") || mentionsStatus401(error.message))) {
+      if (isAuthLikeError(error)) {
         return "needs_auth";
       }
       return "error";
@@ -1164,7 +1176,7 @@ export class HttpMcpClient implements McpClient {
     } catch (error) {
       let authError = error instanceof Error ? error : new Error(String(error));
 
-      if (this.isAuthLikeErrorMessage(authError.message) &&
+      if (isAuthLikeError(authError) &&
           !this.simpleOAuthProvider?.hasStartedRedirect() &&
           this.config.transportType !== "sse" &&
           !this.usedSseFallback) {
@@ -1196,7 +1208,7 @@ export class HttpMcpClient implements McpClient {
       // without the negotiation fallback having fired — kept as a defensive
       // counterpart to the symmetric pre-existing branch. No test: no confirmed
       // real firing shape.
-      if (this.isAuthLikeErrorMessage(authError.message) &&
+      if (isAuthLikeError(authError) &&
           !this.simpleOAuthProvider?.hasStartedRedirect() &&
           this.config.transportType === "sse" &&
           !this.usedSseFallback &&
@@ -1224,7 +1236,7 @@ export class HttpMcpClient implements McpClient {
         throw this.attachOAuthDiscoveryTrace(authError);
       }
 
-      if (this.isAuthLikeErrorMessage(authError.message)) {
+      if (isAuthLikeError(authError)) {
         logger.debug("OAuth redirect initiated or auth needed (expected)", {
           package_id: this.packageId,
           error: oauthErrorLogText(authError, authError.message)

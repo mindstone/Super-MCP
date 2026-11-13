@@ -31,6 +31,23 @@ export function isAuthLikeErrorMessageText(message: string): boolean {
 }
 
 /**
+ * The one way to classify a caught failure as sign-in needed: by name, by
+ * numeric status, or by message. The MCP SDK's StreamableHTTPError / SseError
+ * carry the HTTP status only in `.code` when no auth provider is attached, so a
+ * 401 with an empty body ("Error POSTing to endpoint: ") is recognised by its
+ * code alone. Any other thrown value is read as its string form. Catch sites call this,
+ * never the message form (FOX-9819; test/auth-like-classifier-guard.test.ts).
+ */
+export function isAuthLikeError(error: unknown): boolean {
+  if (!(error instanceof Error)) return isAuthLikeErrorMessageText(String(error));
+  return (
+    error.name === "UnauthorizedError" ||
+    (error as { code?: unknown }).code === 401 ||
+    isAuthLikeErrorMessageText(error.message)
+  );
+}
+
+/**
  * True when the text carries 401 as a status code: the whole number, not
  * digits inside a port (127.0.0.1:40123), a duration (1401ms) or an id. Every
  * "401" check on error text goes through here.

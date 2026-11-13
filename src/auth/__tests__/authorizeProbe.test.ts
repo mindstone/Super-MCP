@@ -11,7 +11,7 @@ import {
   isAuthorizeProbeDisabled,
   probeAuthorizeUrl,
 } from "../authorizeProbe.js";
-import { isAuthLikeErrorMessageText } from "../../clients/httpClient.js";
+import { isAuthLikeErrorMessageText } from "../authLikeVocabulary.js";
 
 vi.mock("../../logging.js", () => ({
   getLogger: () => ({

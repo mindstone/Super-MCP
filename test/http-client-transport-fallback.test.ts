@@ -218,11 +218,12 @@ describe('HttpMcpClient SSE -> StreamableHTTP transport fallback', () => {
     expect(warnCallsText()).not.toContain('Streamable HTTP');
   });
 
-  it('R1: auth-like fallback error propagates unwrapped with no error-level log', async () => {
+  it('R1: auth-like fallback error surfaces as the sign-in error with no error-level log', async () => {
     // SSE 405 -> StreamableHTTP fallback -> POST initialize 401 (no auth provider)
     // -> SDK throws StreamableHTTPError whose message contains "Unauthorized"
-    // (auth-like). connect() must rethrow the ORIGINAL error unwrapped (no
-    // "Transport negotiation failed" wrap) and log at debug, not error.
+    // (auth-like). connect() must not wrap it as "Transport negotiation failed";
+    // it throws the same UnauthorizedError-named sign-in error as a direct
+    // connect (FOX-9819), keeps the SDK error as its cause, and logs at debug.
     const calls: FetchCall[] = [];
     globalThis.fetch = vi.fn(async (url: any, init?: RequestInit) => {
       const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url;
@@ -254,15 +255,40 @@ describe('HttpMcpClient SSE -> StreamableHTTP transport fallback', () => {
 
     expect(caught, 'connect() threw the fallback error').toBeInstanceOf(Error);
     const caughtErr = caught as Error;
-    expect(caughtErr.message, 'original auth-like error propagated unwrapped').not.toContain('Transport negotiation failed');
-    expect(caughtErr.message.toLowerCase(), 'original auth-like message preserved').toContain('unauthorized');
-    expect((caught as Error).name, 'error name preserved (not a generic wrap)').toBe(StreamableHTTPError.prototype.name || 'Error');
+    expect(caughtErr.message, 'not wrapped as a negotiation failure').not.toContain('Transport negotiation failed');
+    expect(caughtErr.message, 'the sign-in error').toContain('Authentication required');
+    expect(caughtErr.name, 'classified by name downstream').toBe('UnauthorizedError');
+    expect(caughtErr.cause, 'SDK error kept as the cause').toBeInstanceOf(StreamableHTTPError);
+    expect((caughtErr.cause as Error).message.toLowerCase(), 'original auth-like message kept on the cause').toContain('unauthorized');
 
     // The fallback-failure error log must NOT fire on the auth-like path; only debug.
     const errorCallsText = mockLogger.error.mock.calls.map((c: unknown[]) => String(c[0] ?? '')).join('\n');
     expect(errorCallsText, 'no "fallback also failed" error log on auth-like path').not.toContain('fallback also failed');
     expect(mockLogger.error, 'no error-level log on the auth-like fallback path').not.toHaveBeenCalled();
     expect(mockLogger.debug).toHaveBeenCalled();
+  });
+
+  it('FOX-9819: an empty-body 401 on the fallback leg surfaces as the UnauthorizedError-named error', async () => {
+    // SSE GET 404 -> StreamableHTTP fallback -> POST initialize 401 with an
+    // empty body (no auth provider): the SDK's error carries 401 only in .code.
+    globalThis.fetch = vi.fn(async (url: any, init?: RequestInit) => {
+      const urlStr = typeof url === 'string' ? url : url instanceof URL ? url.toString() : url.url;
+      const method = init?.method ?? 'GET';
+      if (urlStr === MCP_URL && method === 'GET') return new Response(null, { status: 404 });
+      if (urlStr === MCP_URL && method === 'POST') return new Response(null, { status: 401 });
+      return new Response(null, { status: 404 });
+    }) as unknown as typeof fetch;
+
+    const client = new HttpMcpClient('acme-helpdesk-empty401', ssePackage('acme-helpdesk-empty401'));
+    const caught = await client.connect().then(() => undefined, (e: unknown) => e);
+
+    expect((client as any).usedStreamableHttpFallback).toBe(true);
+    expect(caught).toBeInstanceOf(Error);
+    expect((caught as Error).name).toBe('UnauthorizedError');
+    expect((caught as Error).message).toContain('Authentication required');
+    expect((caught as Error).cause).toBeInstanceOf(StreamableHTTPError);
+    expect(((caught as Error).cause as StreamableHTTPError).code).toBe(401);
+    expect(mockLogger.error, 'no error-level log on the auth-like fallback path').not.toHaveBeenCalled();
   });
 
   it('R4: after a successful fallback a second connect() does not re-fallback or re-GET SSE', async () => {

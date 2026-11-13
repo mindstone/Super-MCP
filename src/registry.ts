@@ -24,7 +24,7 @@ import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamable
 import { HttpMcpClient } from "./clients/httpClient.js";
 import { SimpleOAuthProvider } from "./auth/providers/simple.js";
 import { oauthErrorLogText } from "./auth/oauthErrorLogging.js";
-import { mentionsStatus401 } from "./auth/authLikeVocabulary.js";
+import { isAuthLikeError } from "./auth/authLikeVocabulary.js";
 import { getLogger } from "./logging.js";
 import { SecurityPolicy, SecurityConfig, setSecurityPolicy } from "./security.js";
 
@@ -165,11 +165,10 @@ function classifyTransientConnectFailure(error: unknown): TransientConnectFailur
 
 function isAuthConnectFailure(config: PackageConfig, error: unknown): boolean {
   return config.transport === "http" && error instanceof Error && (
-    error.message.includes("Unauthorized") ||
-    mentionsStatus401(error.message) ||
-    error.message.includes("invalid_token") ||
-    error.message.includes("authorization") ||
-    error.name === "UnauthorizedError"
+    // isAuthLikeError covers the name, a numeric 401 (an empty-body 401 carries
+    // it only in `.code`), "unauthorized", "invalid_token" and a 401 in the text.
+    isAuthLikeError(error) ||
+    error.message.includes("authorization")
   );
 }
 
