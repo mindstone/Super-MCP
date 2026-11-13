@@ -702,15 +702,14 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           },
           {
             name: "get_tool_details",
-            description: "Get full details and schemas for specific tools by ID. Use this to hydrate tool schemas before calling use_tool. Accepts up to 10 tool IDs at once. Always call this before using a tool for the first time.",
+            description: "Get full details and schemas for specific tools by ID. Use this to hydrate tool schemas before calling use_tool. Accepts several tool IDs at once. Always call this before using a tool for the first time.",
             inputSchema: {
               type: "object",
               properties: {
                 tool_ids: {
                   type: "array",
                   items: { type: "string" },
-                  description: "Array of namespaced tool IDs (e.g., ['GoogleWorkspace__send_email', 'Slack__post_message']). Max 10.",
-                  maxItems: 10,
+                  description: "Array of namespaced tool IDs (e.g., ['GoogleWorkspace__send_email', 'Slack__post_message']).",
                 },
               },
               required: ["tool_ids"],

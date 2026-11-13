@@ -774,19 +774,24 @@ describe('handleGetToolDetails', () => {
   // Validation errors
   // -----------------------------------------------------------------------
 
-  it('more than 10 tool_ids throws INVALID_PARAMS', async () => {
-    const catalog = createMockCatalog({});
+  it('answers every tool in a request for more than 10 tools (REBEL-61S)', async () => {
+    const names = Array.from({ length: 13 }, (_, i) => `tool_${i}`);
+    const catalog = createMockCatalog({ pkg: names.map(name => makeToolDef(name)) });
 
-    await expect(
-      handleGetToolDetails(
-        { tool_ids: Array.from({ length: 11 }, (_, i) => `pkg__tool_${i}`) },
-        catalog,
-        registry,
-      )
-    ).rejects.toMatchObject({
-      code: ERROR_CODES.INVALID_PARAMS,
-      message: expect.stringContaining('exceeds maximum of 10'),
-    });
+    const result = await handleGetToolDetails(
+      { tool_ids: names.map(name => `pkg__${name}`) },
+      catalog,
+      registry,
+    );
+
+    const parsed = parseResult(result);
+    expect(parsed.tools.map(tool => tool.tool_id)).toEqual(names.map(name => `pkg__${name}`));
+    for (const [i, tool] of parsed.tools.entries()) {
+      expect(tool.not_found).toBeUndefined();
+      expect(tool.error).toBeUndefined();
+      expect(tool.schema).toEqual({ type: 'object', properties: { arg1: { type: 'string' } } });
+      expect(tool.schema_hash).toBe(`sha256:${names[i]}hash`);
+    }
   });
 
   it('empty array throws INVALID_PARAMS', async () => {
@@ -1023,21 +1028,6 @@ describe('handleGetToolDetails', () => {
     const invalid = parsed.tools.find((t: any) => t.tool_id === 'invalid');
     expect(invalid.not_found).toBe(true);
     expect(invalid.description).toContain('Invalid tool ID format');
-  });
-
-  it('exactly 10 tool_ids is accepted (boundary)', async () => {
-    const tools = Array.from({ length: 10 }, (_, i) => makeToolDef(`tool_${i}`));
-    const catalog = createMockCatalog({ 'pkg': tools });
-
-    const result = await handleGetToolDetails(
-      { tool_ids: tools.map(t => `pkg__${t.name}`) },
-      catalog,
-      registry,
-    );
-
-    const parsed = parseResult(result);
-    expect(parsed.tools).toHaveLength(10);
-    expect(parsed.tools.every((t: any) => !t.not_found && !t.error)).toBe(true);
   });
 
   it('keeps stored note content out of list, search, and REST tool surfaces', async () => {

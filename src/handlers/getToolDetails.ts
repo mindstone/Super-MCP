@@ -51,12 +51,6 @@ export async function handleGetToolDetails(
       message: "tool_ids must be a non-empty array of tool ID strings.",
     };
   }
-  if (tool_ids.length > 10) {
-    throw {
-      code: ERROR_CODES.INVALID_PARAMS,
-      message: `tool_ids exceeds maximum of 10 items (got ${tool_ids.length}).`,
-    };
-  }
   // Validate each tool_id is a non-empty string
   for (const id of tool_ids) {
     if (typeof id !== 'string' || id.trim().length === 0) {

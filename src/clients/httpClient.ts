@@ -1300,6 +1300,13 @@ export class HttpMcpClient implements McpClient {
       // the marker existing, so the common first-time-connect path is a no-op.
       await this.simpleOAuthProvider?.clearNeedsReconnectMarker();
 
+      // From here on the client holds tokens, so it runs as start-up does:
+      // refresh allowed, browser blocked, and a temporary token-server failure
+      // stays temporary instead of reading as "sign in again" (FOX-7609).
+      if (this.simpleOAuthProvider) {
+        this.oauthProvider = new RefreshOnlyOAuthProvider(this.simpleOAuthProvider);
+      }
+
       try {
         try {
           await this.client.close();

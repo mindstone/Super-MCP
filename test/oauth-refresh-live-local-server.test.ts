@@ -403,6 +403,39 @@ describe("OAuth refresh over a real local authorization server", () => {
     expect(await readDiskTokens(tempDir, packageId)).toMatchObject({ refresh_token: "fictional-old-refresh" });
   });
 
+  it("keeps a temporary refresh failure transient after a sign-in finished in this session (FOX-7609)", async () => {
+    const { server, packageId, provider } = await connectionFixture();
+    server.setTokenStatus(200);
+    const client = new HttpMcpClient(packageId, {
+      ...oauthHttpPackage(packageId), base_url: `${server.baseUrl}/mcp`,
+    }, { oauthProvider: provider });
+    const internals = client as unknown as {
+      initializeOAuthIfNeeded(force: boolean): Promise<void>;
+      createTransport(): unknown;
+      transport: unknown;
+    };
+    try {
+      // The interactive sign-in path: browser-capable provider, then the code exchange.
+      await internals.initializeOAuthIfNeeded(true);
+      internals.transport = internals.createTransport();
+      await provider.saveCodeVerifier("fictional-verifier");
+      await client.finishOAuth("fictional-code");
+      expect(await readDiskTokens(tempDir, packageId)).toMatchObject({ refresh_token: "fictional-new-refresh" });
+
+      // Later in the same session the access token is rejected and the token server is down.
+      await provider.saveTokens({ access_token: "fictional-stale-access", refresh_token: "fictional-new-refresh", token_type: "Bearer", expires_in: 3600 });
+      server.setTokenStatus(503);
+      const redirect = vi.spyOn(provider, "redirectToAuthorization").mockResolvedValue();
+
+      await expect(client.listTools()).rejects.toThrow("This connector's service didn't respond just now. It'll retry automatically.");
+      expect(redirect).not.toHaveBeenCalled();
+      expect(await readDiskTokens(tempDir, packageId)).toMatchObject({ refresh_token: "fictional-new-refresh" });
+      expect(await SimpleOAuthProvider.readNeedsReconnectMarkerState(packageId)).toEqual({ state: "absent" });
+    } finally {
+      await client.close();
+    }
+  });
+
   it("keeps a dead grant as auth_required, removes tokens, and logs the cause", async () => {
     const { server, registry, packageId } = await connectionFixture();
     server.setTokenStatus(400);
