@@ -205,7 +205,7 @@ export async function handleSearchTools(
 
     const rawToolId = extractRawToolId(toolId);
     const packageConfig = packagesView.getPackage(tool.package_id!);
-    const annotation = computeSecurityAnnotation(tool.package_id!, packageConfig?.catalogId, rawToolId);
+    const annotation = computeSecurityAnnotation(tool.package_id!, packageConfig, rawToolId);
 
     results.push({
       ...tool,

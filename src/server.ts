@@ -419,7 +419,7 @@ export function registerHttpApiRoutes(
           summary: tool.summary,
           input_schema: tool.schema,
           ...(tool.annotations ? { annotations: tool.annotations } : {}),
-          ...computeSecurityAnnotation(pkg.id, pkg.catalogId, extractRawToolId(tool.tool_id)),
+          ...computeSecurityAnnotation(pkg.id, pkg, extractRawToolId(tool.tool_id)),
         }));
       });
 

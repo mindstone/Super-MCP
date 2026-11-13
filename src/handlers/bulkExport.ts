@@ -10,6 +10,7 @@ import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
 import { getLogger } from "../logging.js";
 import { PackageRegistry } from "../registry.js";
 import { getSecurityPolicy } from "../security.js";
+import { isSafetyDisabled } from "../safetyDisabledTools.js";
 import { BulkExportInput, BulkExportOutput } from "../types.js";
 import { resolveToolResultPayload, type ToolResultPayload } from "../utils/toolResultPayload.js";
 import {
@@ -802,6 +803,10 @@ function validateSecurityPolicy(packageId: string, toolId: string, registry: Pac
     // errors, so no server-level advice gets appended here — the discovery hint
     // must be in the message itself (residue-chunk9 item 3).
     return `Package not found: ${packageId}. ${PACKAGE_DISCOVERY_HINT}`;
+  }
+
+  if (isSafetyDisabled(packageConfig, toolId)) {
+    return `Tool '${packageId}__${toolId}' is turned off for safety: it can read files or run code on this computer.`;
   }
 
   if (securityPolicy.isAdminDisabled(packageConfig.catalogId, toolId)) {

@@ -6,6 +6,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSche
 import type { PackageRegistry } from "./registry.js";
 import { assertToolAccess } from "./toolAccess.js";
 import { getSecurityPolicy } from "./security.js";
+import { isSafetyDisabled } from "./safetyDisabledTools.js";
 import { forwardedFilesSchema, getWorkspacePath, runWithForwardedFiles } from "./forwardedFiles.js";
 import { ERROR_CODES } from "./types.js";
 
@@ -13,7 +14,8 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
   const server = new Server({ name: "super-mcp-package", version: "1.0.0" }, { capabilities: { tools: {}, resources: {}, ...(registry.getPackage(packageId)?.transport === 'stdio' ? { experimental: { [DECLARED_FORWARDING]: { version: 1 } } } : {}) } });
   const allowed = (name: string) => {
     const policy = getSecurityPolicy();
-    return !policy.isToolBlocked(packageId, name, false).blocked && !policy.isAdminDisabled(registry.getPackage(packageId)?.catalogId, name) && !policy.isUserDisabled(packageId, name);
+    const pkg = registry.getPackage(packageId);
+    return !policy.isToolBlocked(packageId, name, false).blocked && !isSafetyDisabled(pkg, name) && !policy.isAdminDisabled(pkg?.catalogId, name) && !policy.isUserDisabled(packageId, name);
   };
   const errorText = (error: unknown) => error instanceof Error ? error.message : String((error as { message?: string }).message ?? error);
   // The registry knows this state; keep the words for older clients while carrying the type.

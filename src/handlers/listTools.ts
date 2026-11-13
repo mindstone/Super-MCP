@@ -125,10 +125,10 @@ export async function handleListTools(
   });
 
   // Annotate tools with security blocked status
-  const catalogId = registry.getPackage(package_id)?.catalogId;
+  const pkg = registry.getPackage(package_id);
   const tools: ToolInfo[] = toolInfos.map(tool => ({
     ...tool,
-    ...computeSecurityAnnotation(package_id, catalogId, extractRawToolId(tool.tool_id)),
+    ...computeSecurityAnnotation(package_id, pkg, extractRawToolId(tool.tool_id)),
   }));
 
   const startIndex = page_token ? 

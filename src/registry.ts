@@ -27,6 +27,7 @@ import { oauthErrorLogText } from "./auth/oauthErrorLogging.js";
 import { isAuthLikeError } from "./auth/authLikeVocabulary.js";
 import { getLogger } from "./logging.js";
 import { SecurityPolicy, SecurityConfig, setSecurityPolicy } from "./security.js";
+import { assertNotSafetyDisabled } from "./safetyDisabledTools.js";
 
 const logger = getLogger();
 
@@ -2044,6 +2045,8 @@ export class PackageRegistry {
     // Runtime compatibility for existing embedders; typed callers must select a mode.
     context ??= { kind: "standalone" };
     assertDispatchActive(context);
+    // Backstop: every route to a connector ends here, so a safety-disabled tool never runs.
+    assertNotSafetyDisabled(this.getPackage(packageId), packageId, toolId);
     let leaseClient = await this.acquireLease(packageId);
     try {
       let client = await this.getClient(packageId);

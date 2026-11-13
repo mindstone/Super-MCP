@@ -282,8 +282,7 @@ export async function handleGetToolDetails(
           ...(cachedTool.tool?.annotations ? { annotations: cachedTool.tool.annotations } : {}),
         };
 
-        const catalogId = registry.getPackage(packageId)?.catalogId;
-        const annotation = computeSecurityAnnotation(packageId, catalogId, req.rawName);
+        const annotation = computeSecurityAnnotation(packageId, registry.getPackage(packageId), req.rawName);
         resultMap.set(req.toolId, { ...toolInfo, ...annotation });
       }
     } catch (err) {

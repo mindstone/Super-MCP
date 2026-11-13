@@ -1,4 +1,5 @@
 import { getSecurityPolicy } from "../security.js";
+import { isSafetyDisabled, SAFETY_DISABLED_REASON, type SafetyIdentity } from "../safetyDisabledTools.js";
 
 export interface SecurityAnnotation {
   blocked?: boolean;
@@ -10,11 +11,11 @@ export interface SecurityAnnotation {
 /**
  * Compute security annotation for a tool.
  * Shape-agnostic: returns only security fields to spread onto any output type.
- * Precedence: security-blocked > admin-disabled > user-disabled.
+ * Precedence: security-blocked > safety-disabled > admin-disabled > user-disabled.
  */
 export function computeSecurityAnnotation(
   packageId: string,
-  catalogId: string | undefined,
+  pkg: SafetyIdentity | undefined,
   rawToolId: string,
 ): SecurityAnnotation {
   const securityPolicy = getSecurityPolicy();
@@ -24,7 +25,11 @@ export function computeSecurityAnnotation(
     return { blocked: true, blocked_reason: blockCheck.reason };
   }
 
-  if (securityPolicy.isAdminDisabled(catalogId, rawToolId)) {
+  if (isSafetyDisabled(pkg, rawToolId)) {
+    return { blocked: true, blocked_reason: SAFETY_DISABLED_REASON };
+  }
+
+  if (securityPolicy.isAdminDisabled(pkg?.catalogId, rawToolId)) {
     return {
       blocked: true,
       blocked_reason: "Disabled by your organization's administrator",
