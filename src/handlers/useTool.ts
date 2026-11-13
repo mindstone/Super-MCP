@@ -1841,7 +1841,7 @@ export async function handleUseTool(
 
   // Stage 0 — deterministic, schema-driven validate-before-send auto-repair.
   // Triggered ONLY when validation fails because of (a) camelCase↔snake_case
-  // key casing or (b) stringified scalars. We repair a snapshot, re-validate,
+  // key casing or (b) stringified scalars, arrays or objects. We repair a snapshot, re-validate,
   // and adopt the repaired args ONLY if they now pass cleanly
   // (`valid && strippedArgs.length === 0`). Otherwise we fall through unchanged
   // to the existing -33003 repair-ticket. See normalizeInput.ts (S6 spike).

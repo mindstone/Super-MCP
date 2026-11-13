@@ -233,6 +233,88 @@ describe("coerceArgsToSchema", () => {
   });
 });
 
+// FOX-7659: the same upstream model bug sends an array or object argument as a JSON string
+// (e.g. rebel_canvas_view's `sections`). Parse it when the schema wants that container type.
+describe("coerceArgsToSchema — stringified arrays and objects (FOX-7659)", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      sections: { type: "array", items: { type: "object" } },
+      options: { type: "object" },
+      either: { anyOf: [{ type: "array" }, { type: "null" }] },
+      text_or_list: { anyOf: [{ type: "string" }, { type: "array" }] },
+    },
+  };
+
+  it("parses a stringified array and a stringified object to the schema's type", () => {
+    const args: Record<string, unknown> = {
+      sections: '[{"type":"draft","body":"Hi"}]',
+      options: '{"pinned":true}',
+      either: "[1,2]",
+    };
+    const { breadcrumbs } = coerceArgsToSchema(args, schema);
+    expect(args).toEqual({
+      sections: [{ type: "draft", body: "Hi" }],
+      options: { pinned: true },
+      either: [1, 2],
+    });
+    expect(breadcrumbs.map(formatAutoRepairBreadcrumb)).toEqual([
+      "auto_repair_coerce:sections",
+      "auto_repair_coerce:options",
+      "auto_repair_coerce:either",
+    ]);
+  });
+
+  it("leaves a string alone when it parses to the wrong container type, or not at all", () => {
+    const args: Record<string, unknown> = {
+      sections: '{"type":"draft"}',
+      options: "[1]",
+      either: "not json",
+    };
+    const { breadcrumbs } = coerceArgsToSchema(args, schema);
+    expect(args).toEqual({ sections: '{"type":"draft"}', options: "[1]", either: "not json" });
+    expect(breadcrumbs).toEqual([]);
+  });
+
+  it("NEVER parses when a string is also an allowed type", () => {
+    const args: Record<string, unknown> = { text_or_list: '["a"]' };
+    const { breadcrumbs } = coerceArgsToSchema(args, schema);
+    expect(args).toEqual({ text_or_list: '["a"]' });
+    expect(breadcrumbs).toEqual([]);
+  });
+
+  it("NEVER coerces when a union branch names no type (it accepts strings too)", () => {
+    const untyped = {
+      type: "object",
+      properties: {
+        list: { anyOf: [{ type: "array" }, { properties: { x: { type: "number" } } }] },
+        flag: { oneOf: [{ type: "boolean" }, {}] },
+      },
+    };
+    const args: Record<string, unknown> = { list: "[1]", flag: "true" };
+    const { breadcrumbs } = coerceArgsToSchema(args, untyped);
+    expect(args).toEqual({ list: "[1]", flag: "true" });
+    expect(breadcrumbs).toEqual([]);
+  });
+
+  it("still parses when an enclosing type rules out strings for its untyped branches", () => {
+    const constrained = {
+      type: "object",
+      properties: {
+        payload: {
+          type: "object",
+          properties: { a: { type: "number" }, b: { type: "number" } },
+          anyOf: [{ required: ["a"] }, { required: ["b"] }],
+        },
+      },
+    };
+    const args: Record<string, unknown> = { payload: '{"a":1}' };
+    const { breadcrumbs } = coerceArgsToSchema(args, constrained);
+    expect(args).toEqual({ payload: { a: 1 } });
+    expect(breadcrumbs.map(formatAutoRepairBreadcrumb)).toEqual(["auto_repair_coerce:payload"]);
+  });
+});
+
 describe("canonicalKeyNormalize — reserved keys", () => {
   it("never rewrites reserved top-level keys (_meta / structuredContent)", () => {
     const schema = { type: "object", properties: { meta: { type: "object" } } };

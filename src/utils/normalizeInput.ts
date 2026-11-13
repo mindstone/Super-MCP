@@ -572,8 +572,9 @@ const STRICT_INTEGER = /^(0|-?[1-9][0-9]*)$/;
  * `type: ["integer", "null"]`). A `nullable: true` keyword adds `"null"`.
  *
  * Returns the union of declared types. The caller decides whether coercion is
- * safe (it is NOT when `string`, an `enum`, or a `const` is among the allowed
- * shapes — those mean a string / a fixed value is legitimately accepted).
+ * safe (it is NOT when `string`, an `enum`, a `const` or an untyped union branch
+ * is among the allowed shapes — those mean a string / a fixed value is
+ * legitimately accepted).
  */
 function resolveDeclaredTypes(propSchema: unknown): {
   types: Set<string>;
@@ -582,7 +583,8 @@ function resolveDeclaredTypes(propSchema: unknown): {
   const types = new Set<string>();
   let hasStringOrLiteral = false;
 
-  const visit = (node: unknown): void => {
+  // `typed`: an enclosing node declares a `type`, which still applies to an untyped branch.
+  const visit = (node: unknown, typed: boolean): void => {
     if (!node || typeof node !== "object") return;
     const s = node as JsonSchemaLike;
 
@@ -606,22 +608,33 @@ function resolveDeclaredTypes(propSchema: unknown): {
 
     for (const branchKey of ["anyOf", "oneOf"] as const) {
       const branch = s[branchKey];
-      if (Array.isArray(branch)) for (const sub of branch) visit(sub);
+      if (!Array.isArray(branch)) continue;
+      const branchTyped = typed || t !== undefined;
+      for (const sub of branch) {
+        // A branch that names no type, value or further union, under no enclosing
+        // type, accepts any type, strings included: a string may already be valid.
+        const b = (sub ?? {}) as JsonSchemaLike;
+        if (!branchTyped && b.type === undefined && b.enum === undefined && b.const === undefined && b.anyOf === undefined && b.oneOf === undefined) {
+          hasStringOrLiteral = true;
+        }
+        visit(sub, branchTyped);
+      }
     }
   };
 
-  visit(propSchema);
+  visit(propSchema, false);
   return { types, hasStringOrLiteral };
 }
 
 /**
- * Coerce a single string scalar to number/integer/boolean ONLY when the
- * property's declared type is exactly that and string/enum/const is NOT also
- * allowed. Uses a canonical-number regex (no hex / whitespace / leading-zero
+ * Coerce a single string to number/integer/boolean, or parse it to an array or
+ * object (the same upstream model bug, FOX-7659), ONLY when the property's
+ * declared type is exactly that and string/enum/const is NOT also allowed.
+ * Uses a canonical-number regex (no hex / whitespace / leading-zero
  * ambiguity) and a `Number.isSafeInteger` guard so large id-like strings (e.g.
  * "12345678901234567890") stay strings rather than coercing lossily.
  */
-function coerceScalarToSchema(
+function coerceValueToSchema(
   value: unknown,
   propSchema: unknown,
 ): { value: unknown; changed: boolean } {
@@ -630,6 +643,18 @@ function coerceScalarToSchema(
   if (types.size === 0) return { value, changed: false };
   // If a string / enum / const is legitimately accepted, never coerce.
   if (hasStringOrLiteral) return { value, changed: false };
+
+  // A stringified array or object: use the parsed value only when it is a container
+  // type the schema declares. The caller re-validates before adopting it.
+  if (types.has("array") || types.has("object")) {
+    const parsed = parseJson(value);
+    const parsedType = Array.isArray(parsed)
+      ? "array"
+      : parsed !== null && typeof parsed === "object"
+        ? "object"
+        : undefined;
+    if (parsedType && types.has(parsedType)) return { value: parsed, changed: true };
+  }
 
   // Match against the ORIGINAL string (no trim): leading/trailing whitespace is sloppy
   // input we leave for the repair-ticket rather than silently accepting.
@@ -661,10 +686,10 @@ function coerceScalarToSchema(
 }
 
 /**
- * Schema-aware type coercion of stringified scalars. For each top-level key
+ * Schema-aware type coercion of stringified values. For each top-level key
  * present in `schema.properties`, coerce a string value to number/integer/
- * boolean when (and only when) the property's declared type is exactly that
- * (see `coerceScalarToSchema` for the union/nullable/enum/safe-integer rules).
+ * boolean/array/object when (and only when) the property's declared type is
+ * exactly that (see `coerceValueToSchema` for the union/nullable/enum/safe-integer rules).
  *
  * Mutates the passed object in place; returns the breadcrumbs.
  */
@@ -678,7 +703,7 @@ export function coerceArgsToSchema(
   const breadcrumbs: AutoRepairBreadcrumb[] = [];
   for (const [key, value] of Object.entries(args)) {
     if (!Object.prototype.hasOwnProperty.call(props, key)) continue;
-    const { value: coerced, changed } = coerceScalarToSchema(value, props[key]);
+    const { value: coerced, changed } = coerceValueToSchema(value, props[key]);
     if (changed) {
       args[key] = coerced;
       breadcrumbs.push({ kind: "coerce", field: key });

@@ -345,6 +345,76 @@ describe("useTool — Stage 0 schema-driven auto-repair", () => {
     expect(mockClient.callTool).not.toHaveBeenCalled();
   });
 
+  it("repairs a stringified array argument (FOX-7659) and dispatches the parsed array", async () => {
+    const schema = {
+      type: "object",
+      properties: {
+        sections: {
+          type: "array",
+          items: { type: "object", properties: { type: { type: "string" } }, required: ["type"] },
+        },
+      },
+      required: ["sections"],
+      additionalProperties: false,
+    };
+    const { mockRegistry, mockCatalog, validator, mockClient } = createMocks(schema, {
+      packageId: "RebelCanvas",
+      toolIds: ["rebel_canvas_view"],
+    });
+
+    const response = await handleUseTool(
+      {
+        package_id: "RebelCanvas",
+        tool_id: "rebel_canvas_view",
+        args: { sections: '[{"type":"draft"}]' },
+        max_output_chars: null,
+      },
+      mockRegistry,
+      mockCatalog,
+      validator,
+    );
+
+    expect(response.isError).toBe(false);
+    expect(mockClient.callTool).toHaveBeenCalledWith("rebel_canvas_view", {
+      sections: [{ type: "draft" }],
+    });
+    const superMcp = (response as { _meta?: Record<string, unknown> })._meta?.superMcp as
+      | Record<string, unknown>
+      | undefined;
+    expect(superMcp?.normalisations).toEqual(["auto_repair_coerce:sections"]);
+  });
+
+  // A union branch with no type accepts strings, so a string there is already valid:
+  // repairing an unrelated field must never also parse it (FOX-7659 review).
+  it("keeps a string an untyped union branch accepts while repairing another field", async () => {
+    const schema = {
+      type: "object",
+      properties: {
+        value: { anyOf: [{ type: "array" }, { properties: { x: { type: "number" } } }] },
+        count: { type: "integer" },
+      },
+    };
+    const { mockRegistry, mockCatalog, validator, mockClient } = createMocks(schema, {
+      packageId: "RebelCanvas",
+      toolIds: ["rebel_canvas_view"],
+    });
+
+    const response = await handleUseTool(
+      {
+        package_id: "RebelCanvas",
+        tool_id: "rebel_canvas_view",
+        args: { value: "[1]", count: "2" },
+        max_output_chars: null,
+      },
+      mockRegistry,
+      mockCatalog,
+      validator,
+    );
+
+    expect(response.isError).toBe(false);
+    expect(mockClient.callTool).toHaveBeenCalledWith("rebel_canvas_view", { value: "[1]", count: 2 });
+  });
+
   // A repair that FIRES (a key gets canonical-normalized) but whose re-validation still
   // FAILS must throw the original ticket and leak NO auto_repair breadcrumbs.
   it("a fired-but-insufficient repair still -33003 and leaks no breadcrumbs", async () => {
