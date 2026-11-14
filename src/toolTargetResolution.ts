@@ -1,6 +1,7 @@
 import type { CachedTool, CatalogView } from "./catalog.js";
 import { getDiscoveryPackageState } from "./catalogFormatters.js";
 import type { PackageRegistry } from "./registry.js";
+import { resolvePackageId } from "./utils/packageResolution.js";
 
 export type ToolTargetResolution =
   | {
@@ -22,6 +23,7 @@ export type ToolTargetResolution =
       packageId: string;
       reason:
         | "package_unknown"
+        | "package_alias"
         | "connecting"
         | "auth_required"
         | "setup_incomplete"
@@ -36,9 +38,8 @@ export function resolveToolTarget(
 ): ToolTargetResolution {
   // Deliberately mirror only use_tool case 2: strip this package's exact
   // namespace prefix, otherwise keep the id verbatim. R5 bare-name search,
-  // R2 package-alias expansion, and package inference from a namespaced id are
-  // call-shape rescues; applying them to this probe could falsely deny a valid
-  // aliased call before use_tool gets the chance to rescue it.
+  // package inference from a namespaced id and trimming are call-shape
+  // rescues this probe does not apply; callers abstain on those shapes.
   const namespacePrefix = `${packageId}__`;
   const bareToolId = toolId.startsWith(namespacePrefix)
     ? toolId.slice(namespacePrefix.length)
@@ -46,10 +47,16 @@ export function resolveToolTarget(
   const namespacedToolId = `${packageId}__${bareToolId}`;
 
   if (!deps.registry.getPackage(packageId)) {
+    // use_tool's R2 alias rescue runs on an unknown id, so an alias hit is
+    // not a certain failure. package_unknown is reserved for "no package and
+    // no alias": the one answer that means use_tool will fail.
     return {
       outcome: "unavailable",
       packageId,
-      reason: "package_unknown",
+      reason:
+        resolvePackageId(deps.registry, packageId).outcome === "not_found"
+          ? "package_unknown"
+          : "package_alias",
     };
   }
 

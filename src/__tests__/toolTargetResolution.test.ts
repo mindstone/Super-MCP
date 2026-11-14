@@ -48,6 +48,11 @@ function makeRegistry(packageIds: readonly string[]): PackageRegistry {
   );
   return {
     getPackage: vi.fn((packageId: string) => packages.get(packageId)),
+    findPackagesByAlias: vi.fn((alias: string) =>
+      [...packages.values()].filter((pkg) =>
+        pkg.id.toLowerCase().startsWith(`${alias.toLowerCase()}-`),
+      ),
+    ),
     getPackages: vi.fn(() => [...packages.values()]),
     setupBlockReason: vi.fn(() => undefined),
   } as unknown as PackageRegistry;
@@ -190,7 +195,7 @@ describe("resolveToolTarget", () => {
     expect(catalog.getTool).not.toHaveBeenCalled();
   });
 
-  it("treats a raw package alias as package_unknown, never absent", () => {
+  it("treats a raw package alias as package_alias, never package_unknown or absent", () => {
     const registry = makeRegistry(["GoogleWorkspace-account"]);
     const catalog = makeCatalog("ready", [
       makeTool("GoogleWorkspace-account", "search_workspace_emails"),
@@ -205,7 +210,7 @@ describe("resolveToolTarget", () => {
     ).toEqual({
       outcome: "unavailable",
       packageId: "GoogleWorkspace",
-      reason: "package_unknown",
+      reason: "package_alias",
     });
     expect(catalog.getTool).not.toHaveBeenCalled();
   });

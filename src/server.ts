@@ -499,7 +499,8 @@ export function registerHttpApiRoutes(
         ? `${packageId}__${bareToolId}`
         : resolution.namespacedToolId;
       const packageStatus = resolution.outcome === "unavailable"
-        ? resolution.reason === "package_unknown"
+        ? resolution.reason === "package_unknown" ||
+          resolution.reason === "package_alias"
           ? "unknown"
           : resolution.reason
         : "ready";
@@ -511,6 +512,13 @@ export function registerHttpApiRoutes(
         outcome: resolution.outcome,
         reason: resolution.outcome === "unavailable" ? resolution.reason : null,
         package_status: packageStatus,
+        // Tells Rebel this package_unknown already excludes use_tool's alias
+        // rescue; an older router's package_unknown does not, so Rebel only
+        // treats a marked one as certain.
+        ...(resolution.outcome === "unavailable" &&
+          resolution.reason === "package_unknown"
+          ? { package_alias_checked: true }
+          : {}),
         ...(resolution.outcome === "absent"
           ? {
               candidates: catalog

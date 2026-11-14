@@ -44,8 +44,18 @@ function makeRegistry(packageIds: readonly string[]): PackageRegistry {
       { id, name: id, transport: "stdio", visibility: "default" },
     ]),
   );
+  // Mirrors PackageRegistry.findPackagesByAlias: case-insensitive exact id,
+  // otherwise every `${alias}-` family member.
+  const findPackagesByAlias = (alias: string): PackageConfig[] => {
+    const aliasLower = alias.toLowerCase();
+    const all = [...packages.values()];
+    const exact = all.find((pkg) => pkg.id.toLowerCase() === aliasLower);
+    if (exact) return [exact];
+    return all.filter((pkg) => pkg.id.toLowerCase().startsWith(`${aliasLower}-`));
+  };
   return {
     getPackage: vi.fn((packageId: string) => packages.get(packageId)),
+    findPackagesByAlias: vi.fn(findPackagesByAlias),
   } as unknown as PackageRegistry;
 }
 
@@ -191,30 +201,77 @@ describe("GET /api/tools/resolve", () => {
     expect(body.candidates.every((name) => !name.startsWith("P__"))).toBe(true);
   });
 
-  it("returns unavailable/package_unknown as 200, never 404", () => {
+  it("returns unavailable/package_unknown as 200, never 404, when no alias matches either", () => {
     const callRoute = registerResolveRoute({
-      registry: makeRegistry(["GoogleWorkspace-account"]),
-      catalog: makeCatalog("ready", [
-        makeTool("GoogleWorkspace-account", "search_workspace_emails"),
-      ]),
+      registry: makeRegistry(["Slack", "GoogleWorkspace-account"]),
+      catalog: makeCatalog("ready", [makeTool("Slack", "search_messages")]),
     });
 
     expect(
-      callRoute({
-        package_id: "GoogleWorkspace",
-        tool_id: "search_workspace_emails",
-      }),
+      callRoute({ package_id: "Gmail", tool_id: "search_emails" }),
     ).toEqual({
       status: 200,
       body: {
-        package_id: "GoogleWorkspace",
-        requested_tool_id: "search_workspace_emails",
-        namespaced_tool_id: "GoogleWorkspace__search_workspace_emails",
+        package_id: "Gmail",
+        requested_tool_id: "search_emails",
+        namespaced_tool_id: "Gmail__search_emails",
         outcome: "unavailable",
         reason: "package_unknown",
         package_status: "unknown",
+        package_alias_checked: true,
         generated_at: expect.any(String),
       },
+    });
+  });
+
+  it.each([
+    [
+      "a unique alias family",
+      ["GoogleWorkspace-account"],
+      "GoogleWorkspace",
+    ],
+    [
+      "an ambiguous alias family",
+      ["GoogleWorkspace-work", "GoogleWorkspace-home"],
+      "GoogleWorkspace",
+    ],
+    ["a case-only spelling", ["Slack"], "slack"],
+  ])(
+    "returns unavailable/package_alias, never package_unknown, for %s",
+    (_label, packageIds, requested) => {
+      const callRoute = registerResolveRoute({
+        registry: makeRegistry(packageIds),
+        catalog: makeCatalog("ready"),
+      });
+
+      expect(
+        callRoute({ package_id: requested, tool_id: "search" }),
+      ).toEqual({
+        status: 200,
+        body: {
+          package_id: requested,
+          requested_tool_id: "search",
+          namespaced_tool_id: `${requested}__search`,
+          outcome: "unavailable",
+          reason: "package_alias",
+          package_status: "unknown",
+          generated_at: expect.any(String),
+        },
+      });
+    },
+  );
+
+  it("does not trim a padded package id before the alias check", () => {
+    const callRoute = registerResolveRoute({
+      registry: makeRegistry(["Slack"]),
+      catalog: makeCatalog("ready"),
+    });
+
+    const result = callRoute({ package_id: " Slack ", tool_id: "search" });
+    expect(result.body).toMatchObject({
+      package_id: " Slack ",
+      outcome: "unavailable",
+      reason: "package_unknown",
     });
   });
 
