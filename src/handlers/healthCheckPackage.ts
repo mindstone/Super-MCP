@@ -1,6 +1,7 @@
 import { PackageRegistry } from "../registry.js";
 import { Catalog } from "../catalog.js";
 import { getLogger } from "../logging.js";
+import { redactConnectorSecrets } from "../connectorLabels.js";
 
 const logger = getLogger();
 
@@ -54,7 +55,10 @@ export async function handleHealthCheckPackage(
       needs_sign_in: true,
       detail: "The server last answered with a sign-in challenge. Run authenticate to sign in.",
     } : healthResult.error ? {
-      detail: healthResult.error instanceof Error ? healthResult.error.message : String(healthResult.error),
+      detail: redactConnectorSecrets(
+        healthResult.error instanceof Error ? healthResult.error.message : String(healthResult.error),
+        registry.getPackage(package_id) ?? [],
+      ),
     } : {}),
   };
 

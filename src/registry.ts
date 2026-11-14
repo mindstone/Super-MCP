@@ -28,6 +28,7 @@ import { isAuthLikeError } from "./auth/authLikeVocabulary.js";
 import { getLogger } from "./logging.js";
 import { SecurityPolicy, SecurityConfig, setSecurityPolicy } from "./security.js";
 import { assertNotSafetyDisabled } from "./safetyDisabledTools.js";
+import { connectorCommandLabel, connectorUrlLabel } from "./connectorLabels.js";
 
 const logger = getLogger();
 
@@ -1538,7 +1539,7 @@ export class PackageRegistry {
       try {
         new URL(pkg.base_url);
       } catch {
-        return `base_url must be a valid URL, got "${pkg.base_url}"`;
+        return "base_url must be a valid URL";
       }
     }
     if (pkg.visibility && pkg.visibility !== "default" && pkg.visibility !== "hidden") {
@@ -1882,9 +1883,9 @@ export class PackageRegistry {
         enhancedMessage += `Transport: ${config.transport}\n`;
         
         if (config.transport === "stdio") {
-          enhancedMessage += `Command: ${config.command} ${config.args?.join(" ") || ""}\n`;
+          enhancedMessage += `Command: ${connectorCommandLabel(config.command)}\n`;
         } else if (config.transport === "http") {
-          enhancedMessage += `URL: ${config.base_url}\n`;
+          enhancedMessage += `URL: ${connectorUrlLabel(config.base_url)}\n`;
         }
         
         enhancedMessage += `\nOriginal error: ${errorMessage}`;

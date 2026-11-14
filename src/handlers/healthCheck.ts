@@ -3,6 +3,7 @@ import { Catalog } from "../catalog.js";
 import { PackageConfig } from "../types.js";
 import { getLogger } from "../logging.js";
 import { coerceStringifiedBoolean } from "../utils/normalizeInput.js";
+import { connectorCommandLabel, connectorUrlLabel, redactConnectorSecrets } from "../connectorLabels.js";
 
 const logger = getLogger();
 
@@ -99,12 +100,9 @@ export async function handleHealthCheckAll(
           if (health === "unavailable") {
             result.suggested_actions = [];
             if (pkg.transport === "stdio") {
-              result.suggested_actions.push(`Check if '${pkg.command}' is installed`);
-              if (pkg.command === "npx" && pkg.args?.[0]) {
-                result.suggested_actions.push(`Try: npm install -g ${pkg.args[0]}`);
-              }
+              result.suggested_actions.push(`Check if '${connectorCommandLabel(pkg.command)}' is installed`);
             } else if (pkg.transport === "http") {
-              result.suggested_actions.push(`Check network connectivity to ${pkg.base_url}`);
+              result.suggested_actions.push(`Check network connectivity to ${connectorUrlLabel(pkg.base_url)}`);
               if (requiresAuth && !isAuthenticated) {
                 result.suggested_actions.push(`Run: authenticate(package_id: "${pkg.id}")`);
               }
@@ -128,17 +126,20 @@ export async function handleHealthCheckAll(
           result.description = pkg.description;
           result.visibility = pkg.visibility;
           if (pkg.transport === "http") {
-            result.base_url = pkg.base_url;
+            result.base_url = connectorUrlLabel(pkg.base_url);
           }
           if (pkg.transport === "stdio") {
-            result.command = pkg.command;
-            result.args = pkg.args;
+            result.command = connectorCommandLabel(pkg.command);
+            result.arg_count = pkg.args?.length ?? 0;
           }
         }
 
         return result;
       } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
+        const errorMessage = redactConnectorSecrets(
+          error instanceof Error ? error.message : String(error),
+          pkg,
+        );
         const diagnostic: any = {
           package_id: pkg.id,
           name: pkg.name,
@@ -150,9 +151,9 @@ export async function handleHealthCheckAll(
         };
         
         if (errorMessage.includes("ENOENT") || errorMessage.includes("not found")) {
-          diagnostic.suggested_actions.push(`Install the MCP server: ${pkg.command}`);
+          diagnostic.suggested_actions.push(`Install the MCP server: ${connectorCommandLabel(pkg.command)}`);
         } else if (errorMessage.includes("EACCES") || errorMessage.includes("permission")) {
-          diagnostic.suggested_actions.push(`Check file permissions for: ${pkg.command}`);
+          diagnostic.suggested_actions.push(`Check file permissions for: ${connectorCommandLabel(pkg.command)}`);
         } else if (errorMessage.includes("auth")) {
           diagnostic.suggested_actions.push(`Check authentication credentials`);
         }

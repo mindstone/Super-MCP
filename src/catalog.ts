@@ -11,6 +11,7 @@ import { getLogger } from "./logging.js";
 import { oauthErrorLogText } from "./auth/oauthErrorLogging.js";
 import { mentionsStatus401 } from "./auth/authLikeVocabulary.js";
 import { ERROR_CODES } from "./types.js";
+import { redactConnectorSecrets } from "./connectorLabels.js";
 
 const logger = getLogger();
 const LEGACY_ERROR_RETRY_INTERVAL_MS = 60_000;
@@ -856,7 +857,9 @@ export class Catalog implements CatalogView {
     lastError?: string;
     logError?: string;
   } {
-    const message = error instanceof Error ? error.message : String(error);
+    const pkg = this.registry.getPackage(packageId);
+    const rawMessage = error instanceof Error ? error.message : String(error);
+    const message = pkg ? redactConnectorSecrets(rawMessage, pkg) : rawMessage;
     if (this.isAuthError(error)) {
       logger.info("Package requires authentication, retaining last-known-good catalog", {
         package_id: packageId,
@@ -867,7 +870,6 @@ export class Catalog implements CatalogView {
     }
 
     // Check for connection refused on localhost URLs (desktop app not running)
-    const pkg = this.registry.getPackage(packageId);
     if (pkg && isLocalhostUrl(pkg.base_url) && isConnectionRefusedError(error)) {
       const friendlyMessage = pkg.name
         ? `${pkg.name} isn't running. Open ${pkg.name} on your computer and try again.`

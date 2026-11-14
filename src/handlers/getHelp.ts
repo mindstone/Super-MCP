@@ -4,6 +4,7 @@ import type {
   PackageMetadataView,
 } from "../catalog.js";
 import { coerceStringifiedNumber } from "../utils/normalizeInput.js";
+import { connectorUrlLabel } from "../connectorLabels.js";
 
 export async function handleGetHelp(
   input: { topic?: string; package_id?: string; error_code?: number },
@@ -439,7 +440,7 @@ ${pkg.description || 'No description available'}
 - **ID**: ${packageId}
 - **Type**: ${pkg.transport}
 - **Status**: Run \`health_check_all()\` to check
-${pkg.transport === "http" ? `- **URL**: ${pkg.base_url || 'Not specified'}` : ''}
+${pkg.transport === "http" ? `- **URL**: ${connectorUrlLabel(pkg.base_url)}` : ''}
 ${toolExamples}
 ${authInfo}
 

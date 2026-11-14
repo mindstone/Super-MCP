@@ -17,6 +17,7 @@ import {
 import { getValidator } from "./validator.js";
 import { getLogger } from "./logging.js";
 import { registerSuperMcpHealthRoute } from "./health.js";
+import { redactConnectorSecrets, redactConnectorSecretsDeep } from "./connectorLabels.js";
 import { ConfigWatcher, handleConfigurationChange, applyConfigurationChange } from "./configWatcher.js";
 import { getSecurityPolicy } from "./security.js";
 import {
@@ -1057,8 +1058,14 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           case "health_check":
             return await handleHealthCheckPackage(args as any, registry, catalog);
 
-          case "authenticate":
-            return await handleAuthenticate(args as any, registry, catalog, catalogRefresher);
+          case "authenticate": {
+            const result = await handleAuthenticate(args as any, registry, catalog, catalogRefresher);
+            // A failed sign-in may quote the connector's error, and so its configuration. A
+            // successful one is left whole: its sign-in link must reach the person unchanged.
+            return result?.isError
+              ? redactConnectorSecretsDeep(result, registry.getPackages({ safe_only: false }))
+              : result;
+          }
 
           case "get_help":
             return await withDiscoveryWatchdog("get_help", () =>
@@ -1086,22 +1093,24 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           error: oauthErrorLogText(error, formatError(error)),
         });
 
+        // A connector's error may quote its address, command or arguments, and so a key.
+        const connectorConfigs = registry.getPackages({ safe_only: false });
         if (error && typeof error === "object" && "code" in error) {
-          throw {
+          throw redactConnectorSecretsDeep({
             ...error,
             message: appendErrorAdvice(
               (error as any).code,
               (error as any).message,
               (error as any).data,
             ),
-          };
+          }, connectorConfigs);
         }
 
-        throw {
+        throw redactConnectorSecretsDeep({
           code: ERROR_CODES.INTERNAL_ERROR,
           message: `${formatError(error)}. Try 'get_help(topic: "error_handling")' for general troubleshooting.`,
           data: { tool_name: name },
-        };
+        }, connectorConfigs);
       }
     });
 
@@ -1126,7 +1135,14 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           uri,
           error: oauthErrorLogText(error, formatError(error)),
         });
-        throw error;
+        const connectorConfigs = registry.getPackages({ safe_only: false });
+        if (error instanceof Error) {
+          error.message = redactConnectorSecrets(error.message, connectorConfigs);
+          const withData = error as Error & { data?: unknown };
+          if (withData.data !== undefined) withData.data = redactConnectorSecretsDeep(withData.data, connectorConfigs);
+          throw error;
+        }
+        throw redactConnectorSecretsDeep(error, connectorConfigs);
       }
     });
 

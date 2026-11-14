@@ -15,7 +15,7 @@ const pkg: PackageConfig = { id: 'tarrowline-wiki', name: 'tarrowline-wiki',
 const catalog = { getPackageStatus: () => 'unknown', clearPackage: vi.fn() } as unknown as Catalog;
 function registryFor(getClient: () => Promise<McpClient>): PackageRegistry {
   return {
-    getClient, getPackages: () => [pkg],
+    getClient, getPackages: () => [pkg], getPackage: () => pkg,
     healthCheckWithClient: PackageRegistry.prototype.healthCheckWithClient,
     healthCheck: PackageRegistry.prototype.healthCheck,
   } as unknown as PackageRegistry;

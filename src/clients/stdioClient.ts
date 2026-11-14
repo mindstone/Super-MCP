@@ -12,6 +12,7 @@ import PQueue from "p-queue";
 import { getToolTimeout, McpClient, PackageConfig, ReadResourceResult } from "../types.js";
 import { getLogger } from "../logging.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
+import { commandBasename, connectorCommandLabel } from "../connectorLabels.js";
 
 const logger = getLogger();
 
@@ -162,10 +163,6 @@ type ParsedDeclaredRoots = {
   declaredCount: number;
   parseable: boolean;
 };
-
-function commandBasename(command: string): string {
-  return command.split(/[\\/]/).pop() ?? "";
-}
 
 function commandNameMatches(command: string, expected: string): boolean {
   return process.platform === "win32"
@@ -404,11 +401,6 @@ function buildFilesystemRootRedactions(roots: readonly string[]): string[] {
     }
   }
   return [...redactions].sort((left, right) => right.length - left.length);
-}
-
-function diagnosticCommandLabel(command: string | undefined): string {
-  const effectiveCommand = command || "echo";
-  return commandBasename(effectiveCommand) || "configured executable";
 }
 
 /** Parse the roots the host serialises into REBEL_ALLOWED_SYMLINK_ROOTS. */
@@ -700,7 +692,7 @@ export class StdioMcpClient implements McpClient {
     }
 
     const filesystemInvocation = inspectFilesystemInvocation(this.config);
-    const commandLabel = diagnosticCommandLabel(this.config.command);
+    const commandLabel = connectorCommandLabel(this.config.command);
 
     logger.info("Connecting to stdio MCP", {
       package_id: this.packageId,
