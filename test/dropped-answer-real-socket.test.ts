@@ -43,7 +43,7 @@ async function startServer(drop: Drop): Promise<{ url: string; close: () => Prom
 
 describe.each<Drop>(["clean-end", "socket-cut"])("a connector's answer stream drops: %s", (drop) => {
   const cleanups: Array<() => Promise<void>> = [];
-  afterEach(async () => { for (const c of cleanups.splice(0)) await c(); });
+  afterEach(async () => { for (const c of cleanups.splice(0)) await c(); logger.warn.mockClear(); });
 
   it.each<[string, (url: string) => McpClient]>([
     ["package-home route", (url) => new PackageHomeClient(config(url), { url, headers: {} })],
@@ -57,6 +57,7 @@ describe.each<Drop>(["clean-end", "socket-cut"])("a connector's answer stream dr
     const outcome = await settledWithin(client.callTool("exec", {}), 2_000);
     expect(outcome).not.toBe(NOT_SETTLED);
     expect(outcome).toMatchObject({ error: expect.objectContaining({ message: expect.stringContaining("Connection closed") }) });
+    expect(logger.warn).toHaveBeenCalledWith("Answer stream ended before the answer", expect.objectContaining({ package_id: "acme", method: "tools/call", tool_name: "exec" }));
   });
 });
 

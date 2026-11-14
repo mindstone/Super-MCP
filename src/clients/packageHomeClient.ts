@@ -92,7 +92,8 @@ export class PackageHomeClient implements McpClient {
     return this.request(() => this.client.callTool({ name, arguments: args as Record<string, unknown>,
       ...(files.length ? { _meta: { "rebel/forwardedFiles": files } } : {}),
     }, undefined, {
-      timeout,
+      // Stop reaches the home, so a call still queued there is never sent.
+      timeout, signal: context.signal,
     }));
   }
   async listResources() {

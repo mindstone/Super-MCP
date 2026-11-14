@@ -360,14 +360,14 @@ describe('central source preflight and declared forwarding compatibility', () =>
     expect(dispatch).not.toHaveBeenCalled();
   });
 
-  it('dispatches home no-file calls without binding and carries no upstream metadata or cancellation', async () => {
+  it('dispatches home no-file calls without binding or upstream metadata, carrying the caller cancellation', async () => {
     const source = sourceOrigin(); source.context.metadata = { trace: 'private', progressToken: 'host-progress', 'host/private': 'host-only' };
     const { client, dispatch } = homeClient();
     await client.callToolFromOrigin('write_note', { text: 'hello' }, source.context);
     expect(source.sendRequest).not.toHaveBeenCalled();
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(dispatch.mock.calls[0][0]).toEqual({ name: 'write_note', arguments: { text: 'hello' } });
-    expect(dispatch.mock.calls[0][2]).not.toHaveProperty('signal');
+    expect(dispatch.mock.calls[0][2].signal).toBe(source.context.signal); // FOX-7907: Stop reaches the home's queue
   });
 
   it.each(['denied', 'approval_pending'] as const)('checks legacy candidates centrally before opening bytes on %s', async outcome => {
@@ -440,7 +440,7 @@ describe('central source preflight and declared forwarding compatibility', () =>
     expect(source.sendRequest.mock.calls[0][0].params.operands).toHaveLength(1);
     const envelope = dispatch.mock.calls[0][0]._meta!['rebel/forwardedFiles'];
     expect(dispatch.mock.calls[0][0]._meta).toEqual({ 'rebel/forwardedFiles': envelope });
-    expect(dispatch.mock.calls[0][2]).not.toHaveProperty('signal');
+    expect(dispatch.mock.calls[0][2].signal).toBe(source.context.signal); // FOX-7907: Stop reaches the home's queue
     expect(envelope).toEqual([{ path: sourceFile, name: 'report.txt', contentBase64: 'YWJj' }]);
     expect(Object.keys((envelope as any)[0]).sort()).toEqual(['contentBase64', 'name', 'path']);
     capability.mockReturnValue({}); source.sendRequest.mockClear();
