@@ -42,7 +42,21 @@ function keep(registry: PackageRegistry) {
   cleanup.push(() => registry.closeAll());
   return registry;
 }
-async function router(extra: object = {}, env: NodeJS.ProcessEnv = {}) {
+// Test-local failure context for a router child: captured stderr and lifecycle state only,
+// never its environment or configuration.
+interface RouterDiagnostics {
+  snapshot?: () => { endpoint: string; exitCode: number | null; signalCode: NodeJS.Signals | null; stderr: string };
+}
+function withRouterDiagnostics(error: unknown, phase: string, diagnostics: RouterDiagnostics): unknown {
+  const snapshot = diagnostics.snapshot?.() ?? { endpoint: 'not started', exitCode: null, signalCode: null, stderr: '' };
+  const context = `\n[router diagnostics] phase=${phase} endpoint=${snapshot.endpoint} exitCode=${snapshot.exitCode} signalCode=${snapshot.signalCode}\n[router stderr]\n${snapshot.stderr.slice(-4000) || '(empty)'}`;
+  if (error instanceof Error) {
+    error.message += context;
+    return error;
+  }
+  return new Error(`${String(error)}${context}`, { cause: error });
+}
+async function router(extra: object = {}, env: NodeJS.ProcessEnv = {}, diagnostics?: RouterDiagnostics) {
   const dir = await temp();
   const reserve = http.createServer();
   reserve.listen(0, '127.0.0.1');
@@ -62,6 +76,7 @@ async function router(extra: object = {}, env: NodeJS.ProcessEnv = {}) {
     }
   });
   const base = `http://127.0.0.1:${port}`;
+  if (diagnostics) diagnostics.snapshot = () => ({ endpoint: base, exitCode: child.exitCode, signalCode: child.signalCode, stderr: output });
   await vi.waitFor(async () => {
     if (child.exitCode !== null) throw new Error(output);
     expect((await fetch(`${base}/health`)).ok).toBe(true);
@@ -239,17 +254,28 @@ describe('package homes and raw package endpoint', () => {
     { adminDisabledToolsByCatalogId: { 'fictional-notebook': ['write_note'] } },
     { security: { blockedPackages: ['notebook'] } },
   ])('enforces the same restriction as use_tool: %j', async restrictions => {
-    const base = await router(restrictions);
-    const { client } = await rawClient(`${base}/mcp/packages/notebook`);
-    expect((await client.callTool({ name: 'write_note', arguments: { text: 'blocked' } })).isError).toBe(true);
-    const registry = keep(new PackageRegistry({ mcpServers: { notebook: { command: 'unused', catalogId: 'fictional-notebook' } } }));
-    const policy = new SecurityPolicy(restrictions.security ?? {});
-    policy.setUserDisabledTools(restrictions.userDisabledToolsByServer ?? {});
-    policy.setAdminDisabledTools(restrictions.adminDisabledToolsByCatalogId ?? {});
-    setSecurityPolicy(policy);
-    await expect(handleUseTool({ package_id: 'notebook', tool_id: 'write_note', args: { text: 'blocked' } }, registry, new Catalog(registry), getValidator())).rejects.toMatchObject({ code: -33008 });
-    if ('blockedPackages' in (restrictions.security ?? {})) await expect(client.listTools()).rejects.toThrow();
-    else expect((await client.listTools()).tools.map(tool => tool.name)).toEqual(['read_file']);
+    // The phase and router snapshot are attached to a failure before afterEach cleanup stops the child.
+    const diagnostics: RouterDiagnostics = {};
+    let phase = 'startup';
+    try {
+      const base = await router(restrictions, {}, diagnostics);
+      phase = 'connect';
+      const { client } = await rawClient(`${base}/mcp/packages/notebook`);
+      phase = 'call';
+      expect((await client.callTool({ name: 'write_note', arguments: { text: 'blocked' } })).isError).toBe(true);
+      phase = 'local-comparison';
+      const registry = keep(new PackageRegistry({ mcpServers: { notebook: { command: 'unused', catalogId: 'fictional-notebook' } } }));
+      const policy = new SecurityPolicy(restrictions.security ?? {});
+      policy.setUserDisabledTools(restrictions.userDisabledToolsByServer ?? {});
+      policy.setAdminDisabledTools(restrictions.adminDisabledToolsByCatalogId ?? {});
+      setSecurityPolicy(policy);
+      await expect(handleUseTool({ package_id: 'notebook', tool_id: 'write_note', args: { text: 'blocked' } }, registry, new Catalog(registry), getValidator())).rejects.toMatchObject({ code: -33008 });
+      phase = 'list';
+      if ('blockedPackages' in (restrictions.security ?? {})) await expect(client.listTools()).rejects.toThrow();
+      else expect((await client.listTools()).tools.map(tool => tool.name)).toEqual(['read_file']);
+    } catch (error) {
+      throw withRouterDiagnostics(error, phase, diagnostics);
+    }
   }, 25_000);
 
   it('returns the paused message for a refused connection and 502/503/504', async () => {
