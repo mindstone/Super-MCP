@@ -76,6 +76,16 @@ async function startRouter(): Promise<Catalog> {
   return catalog;
 }
 
+/**
+ * The catalog is ready at the last commit, but that server's release (its close)
+ * finishes just after, so wait for every discovery to finish its release too:
+ * a passive refresh joins the one in flight, and is a no-op once a package is ready.
+ */
+async function discoveryFinished(): Promise<void> {
+  await refresher.whenCurrentGenerationReady();
+  await Promise.all(registry.getPackages().map(({ id }) => refresher.refreshNow(id)));
+}
+
 describe('catalog discovery releases the servers it started', () => {
   beforeEach(async () => {
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'super-mcp-discovery-'));
@@ -123,7 +133,7 @@ describe('catalog discovery releases the servers it started', () => {
     const claimed = registry.getClient('server-0');
     release();
     await claimed;
-    await refresher.whenCurrentGenerationReady();
+    await discoveryFinished();
 
     expect(servers.live.size).toBe(1);
   });
@@ -147,14 +157,14 @@ describe('catalog discovery releases the servers it started', () => {
 
     await registry.getClient('server-0');
     release();
-    await refresher.whenCurrentGenerationReady();
+    await discoveryFinished();
 
     expect(servers.live.size).toBe(1);
   });
 
   it('starts a server again for a call after discovery, and keeps it', async () => {
     await startRouter();
-    await refresher.whenCurrentGenerationReady();
+    await discoveryFinished();
 
     await registry.getClient('server-3');
 
