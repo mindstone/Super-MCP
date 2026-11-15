@@ -75,6 +75,7 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
       if (error instanceof FileReadAdmissionError) return { isError: true, content: [{ type: 'text', text: error.message }] };
       const typed = await withSignInState(error);
       if (typed !== error) throw typed;
+      if (error instanceof McpError && error.code === ErrorCode.ConnectionClosed) throw error;
       return { isError: true, content: [{ type: "text", text: errorText(error) }] };
     }
   });

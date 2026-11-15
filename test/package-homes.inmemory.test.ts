@@ -18,6 +18,7 @@ import { handleUseTool } from '../src/handlers/useTool.js';
 import { handleListTools } from '../src/handlers/listTools.js';
 import { handleReadResource } from '../src/handlers/readResource.js';
 import { SecurityPolicy, setSecurityPolicy } from '../src/security.js';
+import { ERROR_CODES } from '../src/types.js';
 
 const logger = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }));
 vi.mock('../src/logging.js', () => ({ getLogger: () => logger }));
@@ -134,6 +135,21 @@ describe('package homes over in-memory streamable HTTP', () => {
     await catalog.ensurePackageLoaded('notebook');
     expect(await (await registry.getClient('notebook')).callTool('write_note', { text: 'failed' })).toMatchObject({ isError: true, content: [{ type: 'text', text: 'boom' }] });
     expect(catalog.getPackageStatus('notebook')).toBe('ready');
+  });
+
+  it('wraps a homed connector closing mid-call with its structured MCP code', async () => {
+    const cloud = keep(new PackageRegistry({ mcpServers: { notebook: entry } }));
+    const upstream = await cloud.getClient('notebook');
+    harness(cloud);
+    const registry = desktop();
+    const catalog = new Catalog(registry);
+    await catalog.ensurePackageLoaded('notebook');
+    const callTool = vi.spyOn(upstream, 'callTool').mockRejectedValue(new McpError(ErrorCode.ConnectionClosed, 'Connection closed'));
+    await expect(handleUseTool({ package_id: 'notebook', tool_id: 'write_note', args: { text: 'once' } }, registry, catalog, getValidator())).rejects.toMatchObject({
+      code: ERROR_CODES.DOWNSTREAM_ERROR,
+      data: { package_id: 'notebook', tool_id: 'write_note', mcp_error_code: -32000, original_error: expect.stringContaining('Connection closed') },
+    });
+    expect(callTool).toHaveBeenCalledOnce();
   });
 
   it('restarts both routers after sign-in and refreshes ready without a timer advance', async () => {

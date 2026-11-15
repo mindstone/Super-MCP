@@ -2482,7 +2482,7 @@ export async function handleUseTool(
 
     resetValidationAttempt(downstreamValidationAttemptKey);
     
-    if (registry.isPackageHomed?.(package_id)) {
+    if (registry.isPackageHomed?.(package_id) && !(error instanceof McpError && error.code === SdkErrorCode.ConnectionClosed)) {
       if ((error as { code?: unknown }).code === ERROR_CODES.AUTH_REQUIRED) {
         void catalog.ensurePackageLoaded(package_id, { forceReconnect: true, reason: "explicit" }).catch((refreshError) => {
           logger.warn("Failed to refresh package sign-in state", {
@@ -2570,6 +2570,7 @@ export async function handleUseTool(
         tool_id,
         duration_ms: duration,
         original_error: errorMessage,
+        ...(underlying instanceof McpError ? { mcp_error_code: underlying.code } : {}),
         args_provided: args ? Object.keys(args) : [],
         ...connectDiagnostics,
       },
