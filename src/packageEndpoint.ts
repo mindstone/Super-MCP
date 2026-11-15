@@ -8,7 +8,9 @@ import { assertToolAccess } from "./toolAccess.js";
 import { getSecurityPolicy } from "./security.js";
 import { isSafetyDisabled } from "./safetyDisabledTools.js";
 import { forwardedFilesSchema, getWorkspacePath, runWithForwardedFiles } from "./forwardedFiles.js";
+import { collectReturnedFiles, RETURNED_FILES_META } from "./returnedFiles.js";
 import { ERROR_CODES } from "./types.js";
+import { getLogger } from "./logging.js";
 
 export function createPackageServer(registry: PackageRegistry, packageId: string, workspacePath = getWorkspacePath()): Server {
   const server = new Server({ name: "super-mcp-package", version: "1.0.0" }, { capabilities: { tools: {}, resources: {}, ...(registry.getPackage(packageId)?.transport === 'stdio' ? { experimental: { [DECLARED_FORWARDING]: { version: 1 } } } : {}) } });
@@ -56,7 +58,19 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
       // Package-home senders have no originating home authority. Their child
       // receives explicit standalone, preserving strict remote-only reads.
       return await runWithForwardedFiles(params.arguments ?? {}, forwarded,
-        args => registry.callTool(packageId, params.name, args, context), workspacePath, config?.name ?? packageId, operands);
+        async args => {
+          const startedAt = Date.now();
+          const result = await registry.callTool(packageId, params.name, args, context);
+          const request = params._meta?.["rebel/returnFiles"];
+          if (!request || typeof request !== 'object' || Array.isArray(request) || (request as { version?: unknown }).version !== 1) return result;
+          try {
+            const envelope = await collectReturnedFiles(result, workspacePath, undefined, startedAt);
+            return { ...result, _meta: { ...result._meta, [RETURNED_FILES_META]: envelope } };
+          } catch (error) {
+            getLogger().warn('Returned file collection failed after tool completion', { code: (error as NodeJS.ErrnoException)?.code });
+            return { ...result, _meta: { ...result._meta, [RETURNED_FILES_META]: { version: 1, files: [], references: [], collectionFailed: true } } };
+          }
+        }, workspacePath, config?.name ?? packageId, operands);
     } catch (error) {
       if (error instanceof FileReadAdmissionError) return { isError: true, content: [{ type: 'text', text: error.message }] };
       const typed = await withSignInState(error);

@@ -9,6 +9,7 @@ import { getToolTimeout } from "../types.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
 import { collectForwardedFiles, forwardedFilesTooLargeMessage, getWorkspacePath, hasAbsoluteForwardingInput } from "../forwardedFiles.js";
 import { getLogger } from "../logging.js";
+import { installReturnedFiles, returnedFileFailure, stripReturnedFiles } from "../returnedFiles.js";
 import { failDroppedAnswers } from "./failDroppedAnswers.js";
 
 export class PackageHomeClient implements McpClient {
@@ -89,12 +90,19 @@ export class PackageHomeClient implements McpClient {
     if (tooLarge) return { isError: true, content: [{ type: "text" as const, text: forwardedFilesTooLargeMessage(bytes, this.config.name) }] };
     assertDispatchActive(context);
     // No replay after dispatch, even if the response is lost.
-    return this.request(() => this.client.callTool({ name, arguments: args as Record<string, unknown>,
-      ...(files.length ? { _meta: { "rebel/forwardedFiles": files } } : {}),
+    const result = await this.request(() => this.client.callTool({ name, arguments: args as Record<string, unknown>,
+      _meta: { "rebel/returnFiles": { version: 1 }, ...(files.length ? { "rebel/forwardedFiles": files } : {}) },
     }, undefined, {
       // Stop reaches the home, so a call still queued there is never sent.
       timeout, signal: context.signal,
     }));
+    // Delivery failures describe an already-finished action; never enter request/replay logic.
+    const clean = stripReturnedFiles(result);
+    try { return await installReturnedFiles(result, getWorkspacePath(), context.signal); }
+    catch (error) {
+      getLogger().warn("Returned file installation failed", { code: (error as NodeJS.ErrnoException).code });
+      return returnedFileFailure(clean);
+    }
   }
   async listResources() {
     return this.request(() => this.client.listResources());

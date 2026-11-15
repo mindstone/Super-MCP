@@ -126,8 +126,8 @@ describe('forwarded workspace files', () => {
     const args = { file_path: source };
     await client.callTool('upload_file', args);
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledWith({ name: 'upload_file', arguments: args }, undefined, expect.any(Object));
-    expect(dispatch.mock.calls[0][0]).not.toHaveProperty('_meta');
+    expect(dispatch).toHaveBeenCalledWith({ name: 'upload_file', arguments: args, _meta: { 'rebel/returnFiles': { version: 1 } } }, undefined, expect.any(Object));
+    expect(dispatch.mock.calls[0][0]._meta).toEqual({ 'rebel/returnFiles': { version: 1 } });
     expect(logger.info).not.toHaveBeenCalled();
   });
 
@@ -244,13 +244,13 @@ describe('forwarded workspace files', () => {
     const { client, dispatch } = homeClient();
     const args = { filePath: source };
     await client.callTool('upload_file', args);
-    expect(dispatch.mock.calls[0][0]).toEqual({ name: 'upload_file', arguments: args, _meta: { 'rebel/forwardedFiles': [{ path: source, name: 'report.txt', contentBase64: 'YWJj' }] } });
+    expect(dispatch.mock.calls[0][0]).toEqual({ name: 'upload_file', arguments: args, _meta: { 'rebel/returnFiles': { version: 1 }, 'rebel/forwardedFiles': [{ path: source, name: 'report.txt', contentBase64: 'YWJj' }] } });
     expect(logger.info).toHaveBeenCalledTimes(1);
     expect(logger.info).toHaveBeenCalledWith('Forwarded connector files', { package_id: 'notebook', tool_id: 'upload_file', files: 1, bytes: 3, outcome: 'attached' });
     expect(JSON.stringify(logger.info.mock.calls)).not.toContain(source);
     expect(JSON.stringify(logger.info.mock.calls)).not.toContain('report.txt');
     await client.callTool('write_note', { text: 'hello' });
-    expect(dispatch.mock.calls[1][0]).not.toHaveProperty('_meta');
+    expect(dispatch.mock.calls[1][0]._meta).toEqual({ 'rebel/returnFiles': { version: 1 } });
   });
 
   it('maps a home 413 to the agreed plain message', async () => {
@@ -366,7 +366,7 @@ describe('central source preflight and declared forwarding compatibility', () =>
     await client.callToolFromOrigin('write_note', { text: 'hello' }, source.context);
     expect(source.sendRequest).not.toHaveBeenCalled();
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch.mock.calls[0][0]).toEqual({ name: 'write_note', arguments: { text: 'hello' } });
+    expect(dispatch.mock.calls[0][0]).toEqual({ name: 'write_note', arguments: { text: 'hello' }, _meta: { 'rebel/returnFiles': { version: 1 } } });
     expect(dispatch.mock.calls[0][2].signal).toBe(source.context.signal); // FOX-7907: Stop reaches the home's queue
   });
 
@@ -439,7 +439,7 @@ describe('central source preflight and declared forwarding compatibility', () =>
     await client.callToolFromOrigin('upload', { file: sourceFile, literal: sourceFile }, source.context);
     expect(source.sendRequest.mock.calls[0][0].params.operands).toHaveLength(1);
     const envelope = dispatch.mock.calls[0][0]._meta!['rebel/forwardedFiles'];
-    expect(dispatch.mock.calls[0][0]._meta).toEqual({ 'rebel/forwardedFiles': envelope });
+    expect(dispatch.mock.calls[0][0]._meta).toEqual({ 'rebel/returnFiles': { version: 1 }, 'rebel/forwardedFiles': envelope });
     expect(dispatch.mock.calls[0][2].signal).toBe(source.context.signal); // FOX-7907: Stop reaches the home's queue
     expect(envelope).toEqual([{ path: sourceFile, name: 'report.txt', contentBase64: 'YWJj' }]);
     expect(Object.keys((envelope as any)[0]).sort()).toEqual(['contentBase64', 'name', 'path']);

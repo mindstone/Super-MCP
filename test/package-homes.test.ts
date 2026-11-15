@@ -15,6 +15,9 @@ import { Catalog } from '../src/catalog.js';
 import { getValidator } from '../src/validator.js';
 import { SecurityPolicy, setSecurityPolicy } from '../src/security.js';
 import { FORWARDED_FILES_RELATIVE_DIR } from '../src/forwardedFiles.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { createPackageServer } from '../src/packageEndpoint.js';
+import * as returnedFiles from '../src/returnedFiles.js';
 
 vi.mock('../src/logging.js', () => ({ getLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }) }));
 const cleanup: Array<() => Promise<unknown>> = [];
@@ -88,6 +91,56 @@ function statusWithHost(url: string, host: string, headers: Record<string, strin
 }
 
 describe('package homes and raw package endpoint', () => {
+  it('keeps a successful tool result when cloud collection throws and reports one generic delivery failure', async () => {
+    const desktop = await temp();
+    const registry = keep(new PackageRegistry({ mcpServers: { notebook: { command: '/must-never-run' } } }));
+    const original = { content: [{ type: 'text' as const, text: 'Action completed' }], structuredContent: { id: 'saved' }, _meta: { keep: true } };
+    const dispatch = vi.spyOn(registry, 'callTool').mockResolvedValue(original);
+    vi.spyOn(returnedFiles, 'collectReturnedFiles').mockRejectedValueOnce(new Error('collector failed'));
+    const server = createPackageServer(registry, 'notebook', desktop);
+    const client = new Client({ name: 'test', version: '1' });
+    const [local, remote] = InMemoryTransport.createLinkedPair();
+    await server.connect(remote); await client.connect(local);
+    cleanup.push(() => server.close()); cleanup.push(() => client.close());
+    const response = await client.callTool({ name: 'save', arguments: {}, _meta: { 'rebel/returnFiles': { version: 1 } } });
+    expect(response.content).toEqual(original.content);
+    expect(response.structuredContent).toEqual(original.structuredContent);
+    expect(response.isError).toBeUndefined();
+    expect(response._meta?.['rebel/returnedFiles']).toEqual({ version: 1, files: [], references: [], collectionFailed: true });
+    const installed = await returnedFiles.installReturnedFiles(response, desktop);
+    expect(installed.isError).toBe(true);
+    expect(installed.content).toEqual([...original.content, { type: 'text', text: "The action finished, but Rebel may not have copied every file it saved to this computer. Check before using any path above that isn't on this computer." }]);
+    expect(installed._meta).toEqual({ keep: true });
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+  it('delivers workspace and temp outputs through the real endpoint before returning desktop paths', async () => {
+    const desktop = await temp(); const cloud = await temp(); const tempRoot = await temp();
+    const base = await router({}, { REBEL_WORKSPACE_PATH: cloud, MCP_WORKSPACE_PATH: cloud });
+    vi.stubEnv('REBEL_WORKSPACE_PATH', desktop);
+    const registry = keep(new PackageRegistry({ mcpServers: { notebook: { command: '/must-never-run' } }, packageHomes: { notebook: { url: `${base}/mcp/packages/notebook` } } }));
+    const result = await registry.callTool('notebook', 'write_outputs', { tempRoot });
+    const json = JSON.parse(result.content[0].text);
+    expect(json.attachment.path).toBe(path.join(desktop, 'attachments/report.pdf'));
+    expect(json.file_path).toContain(path.join(desktop, '.rebel/tool-outputs') + path.sep);
+    expect(await readFile(json.attachment.path, 'utf8')).toBe('workspace output');
+    expect(await readFile(json.file_path, 'utf8')).toBe('temporary output');
+    expect(result.structuredContent).toEqual({ workspaceFile: json.attachment.path, temporaryFile: json.file_path });
+    expect(result._meta).toEqual({ fictional: 'output-meta' });
+    const { client } = await rawClient(`${base}/mcp/packages/notebook`);
+    for (const _meta of [undefined, { 'rebel/returnFiles': { version: 2 } }]) {
+      const old = await client.callTool({ name: 'write_outputs', arguments: { tempRoot }, ...(_meta ? { _meta } : {}) });
+      expect(old._meta).not.toHaveProperty('rebel/returnedFiles');
+      expect(JSON.parse(old.content[0].text).attachment.path).toBe(path.join(cloud, 'attachments/report.pdf'));
+      const temporary = JSON.parse(old.content[0].text).file_path;
+      cleanup.push(() => rm(path.dirname(temporary), { recursive: true, force: true }));
+    }
+    // The collector leaves source bytes in place; clean the fixture's host-temp output.
+    const remote = await client.callTool({ name: 'write_outputs', arguments: { tempRoot }, _meta: { 'rebel/returnFiles': { version: 1 } } });
+    const temporary = JSON.parse(remote.content[0].text).file_path;
+    cleanup.push(() => rm(path.dirname(temporary), { recursive: true, force: true }));
+    expect(remote._meta).toHaveProperty('rebel/returnedFiles');
+  }, 25_000);
+
   it('carries a 3 MB desktop file through the real route and removes the cloud copy', async () => {
     const dir = await temp();
     const desktop = path.join(dir, 'desktop'); const cloud = path.join(dir, 'cloud');
@@ -259,7 +312,7 @@ describe('package homes and raw package endpoint', () => {
 
   it('contains no provider or connector names in new mechanism files', async () => {
     const denied = /notion|google|slack|hubspot|microsoft|granola|fireflies|salesforce|zendesk|quickbooks|workday/i;
-    for (const file of ['src/packageEndpoint.ts', 'src/clients/packageHomeClient.ts', 'src/toolAccess.ts', 'src/forwardedFiles.ts']) {
+    for (const file of ['src/packageEndpoint.ts', 'src/clients/packageHomeClient.ts', 'src/toolAccess.ts', 'src/forwardedFiles.ts', 'src/returnedFiles.ts']) {
       expect(await readFile(file, 'utf8'), file).not.toMatch(denied);
     }
   });

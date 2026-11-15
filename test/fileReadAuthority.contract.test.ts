@@ -24,6 +24,10 @@ beforeEach(async () => {
   root = await fs.realpath(await fs.mkdtemp(path.join(tmpdir(), 'read-authority-contract-')));
   sourceWorkspace = path.join(root, 'source'); homeWorkspace = path.join(root, 'home');
   await fs.mkdir(sourceWorkspace); await fs.mkdir(homeWorkspace);
+  // The home is another machine: give it its own temp folder, so the file
+  // hand-back never mistakes this machine's source files for the home's output.
+  const homeTemp = path.join(root, 'home-temp'); await fs.mkdir(homeTemp);
+  for (const name of ['TMPDIR', 'TEMP', 'TMP']) vi.stubEnv(name, homeTemp);
   vi.stubEnv('REBEL_WORKSPACE_PATH', sourceWorkspace);
   setSecurityPolicy(new SecurityPolicy({}));
 });
@@ -164,7 +168,7 @@ describe('source read authority through real router and forwarding boundaries', 
     expect(delivered.meta).toEqual({ 'files/readMode': { version: 1, mode: 'standalone' } });
     expect(fixture.batches.map(batch => batch.invocationId)).toEqual(['held', 'retry']);
     expect(fixture.homeCalls).toHaveLength(1);
-    expect(fixture.homeCalls[0]._meta).toEqual({ 'rebel/forwardedFiles': files.map((file, index) => ({
+    expect(fixture.homeCalls[0]._meta).toEqual({ 'rebel/returnFiles': { version: 1 }, 'rebel/forwardedFiles': files.map((file, index) => ({
       path: file, name: path.basename(file), contentBase64: Buffer.from(`synthetic bytes ${index}`).toString('base64'),
     })) });
     expect(open.mock.calls.map(([file]) => file)).toEqual(files);
@@ -206,7 +210,7 @@ describe('source read authority through real router and forwarding boundaries', 
     expect(fixture.batches.map(batch => batch.invocationId)).toEqual(['held', 'approved']);
     expect(fixture.homeCalls).toHaveLength(1);
     expect(fixture.homeCalls[0].arguments).toEqual(original);
-    expect(fixture.homeCalls[0]._meta).toEqual({ 'rebel/forwardedFiles': [{
+    expect(fixture.homeCalls[0]._meta).toEqual({ 'rebel/returnFiles': { version: 1 }, 'rebel/forwardedFiles': [{
       path: alias, name: 'report.txt', contentBase64: Buffer.from('linked synthetic bytes').toString('base64'),
     }] });
     expect(open.mock.calls.map(([file]) => file)).toEqual([target]);
@@ -223,7 +227,8 @@ describe('source read authority through real router and forwarding boundaries', 
     // An equal absolute literal is outside the declaration, despite existing on disk.
     expect(receipt(await fixture.call({ literal: file })).bytes).toEqual([]);
     expect(fixture.batches).toHaveLength(1); expect(fixture.homeCalls).toHaveLength(2);
-    expect(fixture.homeCalls[1]).not.toHaveProperty('_meta');
+    // Only the file-return opt-in goes with a call that forwards no file.
+    expect(fixture.homeCalls[1]._meta).toEqual({ 'rebel/returnFiles': { version: 1 } });
 
     const forged = { 'files/invocation': { version: 1, invocationId: 'finished' },
       'files/readMode': { version: 1, mode: 'central', reads: [{ location: ['attachments', 0, 'path'], rawPath: file, canonicalPath: file }] },

@@ -1,9 +1,10 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { readFile, realpath } from 'node:fs/promises';
+import { mkdir, mkdtemp, writeFile, readFile, realpath } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
+import { tmpdir } from 'node:os';
 const server = new Server({ name: 'fictional-notebook', version: '1.0.0' }, { capabilities: { tools: {}, resources: {} } });
 const tool = {
   name: 'write_note', description: 'Write a fictional note',
@@ -15,6 +16,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [tool, {
   name: 'read_file', description: 'Read a fictional workspace file', inputSchema: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] },
 }] }));
 server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
+  if (params.name === 'write_outputs') {
+    const workspaceFile = path.join(process.env.MCP_WORKSPACE_PATH, 'attachments/report.pdf');
+    const temporaryFile = path.join(await mkdtemp(path.join(params.arguments.tempRoot ?? tmpdir(), 'home-output-')), 'invoice.pdf');
+    await mkdir(path.dirname(workspaceFile), { recursive: true });
+    await writeFile(workspaceFile, 'workspace output'); await writeFile(temporaryFile, 'temporary output');
+    return { content: [{ type: 'text', text: JSON.stringify({ attachment: { path: workspaceFile }, file_path: temporaryFile }) }], structuredContent: { workspaceFile, temporaryFile }, _meta: { fictional: 'output-meta' } };
+  }
   if (params.name === 'read_file') {
     const root = await realpath(process.env.MCP_WORKSPACE_PATH);
     const file = await realpath(params.arguments.file_path);
