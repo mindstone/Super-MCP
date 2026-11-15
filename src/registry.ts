@@ -400,7 +400,7 @@ export interface ChildStatsEntry {
   pending_requests: boolean;
   /** Cumulative successful `createAndConnectClient()` completions for this package. */
   spawn_count: number;
-  /** Cumulative idle-reaper closures for this package. */
+  /** Cumulative closures of an unused server: idle reaps and stops after catalog discovery. */
   reap_count: number;
   /** Cumulative non-reap, non-user eviction closures (unhealthy-client replacements). */
   eviction_count: number;
@@ -466,6 +466,8 @@ export class PackageRegistry {
   private clientPromises: Map<string, Promise<McpClient>> = new Map();
   private skippedPackages: SkippedPackage[] = [];
   private lastActivity: Map<string, number> = new Map();
+  /** Clients that catalog discovery started and nothing else has asked for since. */
+  private discoveryOnlyClients: Set<string> = new Set();
   private reaperInterval: ReturnType<typeof setInterval> | null = null;
   private reaperTimeoutMs: number = 300_000; // 5 minutes default
   private lifecycleListeners = new Set<(event: RegistryLifecycleEvent) => void>();
@@ -490,8 +492,8 @@ export class PackageRegistry {
   // `spawnCounts` — incremented exactly once per successful
   //   `createAndConnectClient()` completion. The `getOrCreateClient`
   //   healthCheck-ok revive path does NOT increment (no new client spawned).
-  // `reapCounts` — incremented exactly once per idle-reaper closure
-  //   (`sweepIdleClients`). User-initiated `restartPackage()` and
+  // `reapCounts` — incremented exactly once per closure of an unused
+  //   server (`sweepIdleClients`, `releaseAfterDiscovery`). User-initiated `restartPackage()` and
   //   unhealthy-client evictions are tracked separately.
   // `evictionCounts` — incremented when a connected client is discarded
   //   because `healthCheck()` returned non-ok in `getOrCreateClient()`.
@@ -750,6 +752,7 @@ export class PackageRegistry {
     }
 
     this.lastActivity.clear();
+    this.discoveryOnlyClients.clear();
     this.authRequiredPackages.clear();
     this.leaseDrainWaiters.clear();
     this.clientPromises.clear();
@@ -1708,7 +1711,12 @@ export class PackageRegistry {
     }
 
     try {
-      const client = await this.getClient(packageId);
+      // Marked before the await, so a caller joining this connection clears it for good.
+      // A client kept from an earlier discovery attempt keeps whatever mark it has.
+      if (!this.clients.has(packageId) && !this.clientPromises.has(packageId)) {
+        this.discoveryOnlyClients.add(packageId);
+      }
+      const client = await this.acquireClient(packageId);
       const health = await client.healthCheck?.();
       if (this.terminal) return this.terminalConnectOutcome(packageId);
       if (health === "needs_auth") {
@@ -1750,7 +1758,13 @@ export class PackageRegistry {
     }
   }
 
+  /** Get a client for real use, which keeps it running after discovery. */
   async getClient(packageId: string): Promise<McpClient> {
+    this.discoveryOnlyClients.delete(packageId);
+    return this.acquireClient(packageId);
+  }
+
+  private async acquireClient(packageId: string): Promise<McpClient> {
     this.assertAdmissionOpen(packageId);
     const setupReason = this.setupBlockReason(packageId);
     if (setupReason) {
@@ -2102,7 +2116,8 @@ export class PackageRegistry {
   /**
    * Start the idle reaper that periodically closes idle stdio clients.
    * Reads SUPER_MCP_IDLE_TIMEOUT_MS from environment (default: 300000ms = 5 minutes).
-   * A value of 0 disables reaping entirely. Idempotent — safe to call multiple times.
+   * A value of 0 disables periodic idle reaping (discovery still stops the clients it
+   * alone started). Idempotent — safe to call multiple times.
    */
   startIdleReaper(): void {
     if (this.terminal) return;
@@ -2156,60 +2171,9 @@ export class PackageRegistry {
     const reaped: string[] = [];
 
     for (const [packageId, client] of this.clients.entries()) {
-      // Skip if a connection is in progress for this package
-      if (this.clientPromises.has(packageId)) {
-        logger.debug("Skipping reap: connection in progress", { package_id: packageId });
-        continue;
-      }
-
-      // Only reap stdio clients (HTTP clients are stateless, no child process)
-      const config = this.getPackage(packageId);
-      if (!config || config.transport !== "stdio" || this.isPackageHomed(packageId)) {
-        continue;
-      }
-
-      // Skip if the client has in-flight or queued requests
-      if (client.hasPendingRequests?.()) {
-        logger.debug("Skipping reap: pending requests", { package_id: packageId });
-        continue;
-      }
-
-      // Stage 6: skip if an active-use lease is held — a client mid-`callTool`
-      // must never be reaped (closing it would reject the in-flight request
-      // with -32000). The lease is the lock that `hasPendingRequests` (a racy
-      // TOCTOU snapshot) is not.
-      if ((this.activeLeases.get(packageId) ?? 0) > 0) {
-        logger.debug("Skipping reap: active lease", { package_id: packageId });
-        continue;
-      }
-
-      // A server holding live state (e.g. an open browser) runs until the
-      // host stops, when it is stopped cleanly.
-      if (client.holdsLiveState?.()) {
-        logger.debug("Skipping reap: holds live state", { package_id: packageId });
-        continue;
-      }
-
-      // Check if idle beyond threshold
       const lastActive = this.lastActivity.get(packageId) ?? 0;
-      if (now - lastActive < this.reaperTimeoutMs) {
-        continue;
-      }
-
-      // Reap this client
-      this.closeClientExactlyOnce(packageId, client, "idle_reap").catch((error) => {
-        logger.warn("Error closing idle client during reap", {
-          package_id: packageId,
-          error: error instanceof Error ? error.message : String(error),
-        });
-      });
-
-      this.clients.delete(packageId);
-      this.lastActivity.delete(packageId);
-      this.emitLifecycle({ type: "client_evicted", packageId, reason: "idle" });
-      // Stage 4b: count this idle-reaper closure.
-      this.reapCounts.set(packageId, (this.reapCounts.get(packageId) ?? 0) + 1);
-      reaped.push(packageId);
+      if (now - lastActive < this.reaperTimeoutMs) continue;
+      if (this.reapIfUnused(packageId, client, "idle_reap")) reaped.push(packageId);
     }
 
     if (reaped.length > 0) {
@@ -2218,6 +2182,75 @@ export class PackageRegistry {
         reaped,
       });
     }
+  }
+
+  /**
+   * Stop a stdio server that catalog discovery started, once its tools are
+   * listed, unless something else has asked for it since. Without this every
+   * server stays up for the idle timeout after each router start.
+   */
+  async releaseAfterDiscovery(packageId: string): Promise<void> {
+    if (this.terminal || !this.discoveryOnlyClients.delete(packageId)) return;
+    const client = this.clients.get(packageId);
+    if (client) await this.reapIfUnused(packageId, client, "discovery_done");
+  }
+
+  /**
+   * Close a stdio client now if nothing is using it. Returns the close (truthy)
+   * when it reaped, or null when the client must stay.
+   */
+  private reapIfUnused(
+    packageId: string,
+    client: McpClient,
+    closeReason: "idle_reap" | "discovery_done",
+  ): Promise<void> | null {
+    // Skip if a connection is in progress for this package
+    if (this.clientPromises.has(packageId)) {
+      logger.debug("Skipping reap: connection in progress", { package_id: packageId });
+      return null;
+    }
+
+    // Only reap stdio clients (HTTP clients are stateless, no child process)
+    const config = this.getPackage(packageId);
+    if (!config || config.transport !== "stdio" || this.isPackageHomed(packageId)) {
+      return null;
+    }
+
+    // Skip if the client has in-flight or queued requests
+    if (client.hasPendingRequests?.()) {
+      logger.debug("Skipping reap: pending requests", { package_id: packageId });
+      return null;
+    }
+
+    // Stage 6: skip if an active-use lease is held — a client mid-`callTool`
+    // must never be reaped (closing it would reject the in-flight request
+    // with -32000). The lease is the lock that `hasPendingRequests` (a racy
+    // TOCTOU snapshot) is not.
+    if ((this.activeLeases.get(packageId) ?? 0) > 0) {
+      logger.debug("Skipping reap: active lease", { package_id: packageId });
+      return null;
+    }
+
+    // A server holding live state (e.g. an open browser) runs until the
+    // host stops, when it is stopped cleanly.
+    if (client.holdsLiveState?.()) {
+      logger.debug("Skipping reap: holds live state", { package_id: packageId });
+      return null;
+    }
+
+    // Detach synchronously, after the checks, so no caller can pick it up mid-close.
+    this.clients.delete(packageId);
+    this.lastActivity.delete(packageId);
+    this.emitLifecycle({ type: "client_evicted", packageId, reason: "idle" });
+    // Stage 4b: count this closure (reap_count in /stats).
+    this.reapCounts.set(packageId, (this.reapCounts.get(packageId) ?? 0) + 1);
+    return this.closeClientExactlyOnce(packageId, client, closeReason).catch((error) => {
+      logger.warn("Error closing idle client during reap", {
+        package_id: packageId,
+        reason: closeReason,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
   }
 
   private async configForNextSpawn(packageId: string, config: PackageConfig): Promise<PackageConfig> {

@@ -100,6 +100,7 @@ interface CatalogRegistrySeam {
   subscribeLifecycle?(
     listener: (event: RegistryLifecycleEvent) => void,
   ): () => void;
+  releaseAfterDiscovery?(packageId: string): Promise<void>;
 }
 
 export interface CatalogRefresherOptions {
@@ -429,7 +430,10 @@ export class CatalogRefresher {
 
     if (outcome.kind === "connected") {
       const tools = await outcome.client.listTools();
-      if (isCurrent()) this.catalog.commitReady(packageId, tools, generation);
+      if (!isCurrent()) return;
+      this.catalog.commitReady(packageId, tools, generation);
+      // Awaited, so the discovery concurrency also caps how many servers it keeps running.
+      await (this.registry as PackageRegistry & CatalogRegistrySeam).releaseAfterDiscovery?.(packageId);
       return;
     }
     if (outcome.kind === "auth_required") {
