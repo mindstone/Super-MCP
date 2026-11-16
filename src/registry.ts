@@ -1075,7 +1075,25 @@ export class PackageRegistry {
       for (const [client, id] of this.constructedClients) {
         if (id === pkg.id) await this.closeAfterFailure(id, client, "home_changed", "Failed to close MCP client after package home change");
       }
-      if (this.clients.has(pkg.id)) await this.restartPackage(pkg.id);
+      // Not awaited: the restart queues behind any eviction of this package, which
+      // waits for running calls, and a call that is still spawning waits for this
+      // config queue. Its barrier is set synchronously, so calls arriving from here
+      // on wait for it and then use the new home.
+      if (this.clients.has(pkg.id)) {
+        void this.restartPackage(pkg.id).then(
+          (result) => {
+            if (!result.success && !this.terminal) {
+              logger.warn("Package restart after home change did not complete", { package_id: pkg.id, message: result.message });
+            }
+          },
+          (error: unknown) => {
+            logger.warn("Package restart after home change failed", {
+              package_id: pkg.id,
+              error: error instanceof Error ? error.message : String(error),
+            });
+          },
+        );
+      }
       logger.info("Package home changed", { package_id: pkg.id });
     }
 
@@ -1648,11 +1666,7 @@ export class PackageRegistry {
     reason: "unhealthy" | "explicit" | "restart" | "idle" | "shutdown" = "explicit",
   ): Promise<void> {
     if (this.terminal) return;
-    const previousEviction = this.evictionPromises.get(packageId);
-    let eviction!: Promise<void>;
-    eviction = (async () => {
-      if (previousEviction) await previousEviction;
-      if (this.terminal) return;
+    await this.runPackageBarrier(packageId, undefined, async () => {
       await this.waitForActiveLeases(packageId);
       if (this.terminal) return;
 
@@ -1679,13 +1693,31 @@ export class PackageRegistry {
           this.emitLifecycle({ type: "client_evicted", packageId, reason });
         }
       }
-    })().finally(() => {
+    });
+  }
+
+  /**
+   * Runs `work` as this package's eviction: after any earlier one, and with
+   * `acquireLease()` holding new calls until it settles, so no call is handed a
+   * client that is being closed. Returns `terminalValue` once the registry closes.
+   */
+  private runPackageBarrier<T>(packageId: string, terminalValue: T, work: () => Promise<T>): Promise<T> {
+    const previousEviction = this.evictionPromises.get(packageId);
+    const run = (async () => {
+      if (previousEviction) await previousEviction;
+      if (this.terminal) return terminalValue;
+      return work();
+    })();
+    const eviction: Promise<void> = run.then(
+      () => undefined,
+      () => undefined,
+    ).finally(() => {
       if (this.evictionPromises.get(packageId) === eviction) {
         this.evictionPromises.delete(packageId);
       }
     });
     this.evictionPromises.set(packageId, eviction);
-    await eviction;
+    return run;
   }
 
   async connectForCatalog(
@@ -1711,6 +1743,10 @@ export class PackageRegistry {
     }
 
     try {
+      // A restart in progress keeps the retiring client: wait for it (FOX-9654).
+      for (let barrier = this.evictionPromises.get(packageId); barrier; barrier = this.evictionPromises.get(packageId)) {
+        await barrier;
+      }
       // Marked before the await, so a caller joining this connection clears it for good.
       // A client kept from an earlier discovery attempt keeps whatever mark it has.
       if (!this.clients.has(packageId) && !this.clientPromises.has(packageId)) {
@@ -1758,8 +1794,19 @@ export class PackageRegistry {
     }
   }
 
-  /** Get a client for real use, which keeps it running after discovery. */
-  async getClient(packageId: string): Promise<McpClient> {
+  /**
+   * Get a client for real use, which keeps it running after discovery. Waits
+   * out a restart or eviction of the package first, so it never hands out the
+   * retiring client (FOX-9654). `leaseHeld` is only for `callTool()`, which
+   * already holds a lease: an eviction waits for that lease, so waiting for the
+   * eviction there would deadlock.
+   */
+  async getClient(packageId: string, leaseHeld = false): Promise<McpClient> {
+    if (!leaseHeld) {
+      for (let barrier = this.evictionPromises.get(packageId); barrier; barrier = this.evictionPromises.get(packageId)) {
+        await barrier;
+      }
+    }
     this.discoveryOnlyClients.delete(packageId);
     return this.acquireClient(packageId);
   }
@@ -2064,7 +2111,7 @@ export class PackageRegistry {
     assertNotSafetyDisabled(this.getPackage(packageId), packageId, toolId);
     let leaseClient = await this.acquireLease(packageId);
     try {
-      let client = await this.getClient(packageId);
+      let client = await this.getClient(packageId, true);
       leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
       // Pre-send liveness re-check: the lease blocks the reaper, but the client
       // could already have a dead transport (e.g. closed between a prior reap
@@ -2077,7 +2124,7 @@ export class PackageRegistry {
         });
         this.reestablishCounts.set(packageId, (this.reestablishCounts.get(packageId) ?? 0) + 1);
         this.clients.delete(packageId);
-        client = await this.getClient(packageId);
+        client = await this.getClient(packageId, true);
         leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
       }
       const dispatch = async () => {
@@ -2092,7 +2139,7 @@ export class PackageRegistry {
       } catch (error) {
         // A home session 404 is returned before dispatch, so one replay is safe.
         if (!(client instanceof PackageHomeClient && error instanceof StreamableHTTPError && error.code === 404)) throw error;
-        client = await this.getClient(packageId);
+        client = await this.getClient(packageId, true);
         leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
         return await dispatch();
       }
@@ -2544,21 +2591,26 @@ export class PackageRegistry {
 
   /**
    * Restart a package to pick up credential or configuration changes.
-   * Closes the existing client and re-expands environment variables from raw config.
-   * Next tool call will reconnect with fresh configuration.
+   * Runs as the package's eviction: calls arriving meanwhile wait for it and then
+   * reconnect with the fresh configuration. Re-expands environment variables from raw config.
    */
   async restartPackage(packageId: string): Promise<{ success: boolean; message: string }> {
     if (this.terminal) {
       return this.terminalRestartResult(packageId);
     }
     logger.info("Restarting package", { package_id: packageId });
-    
-    // Check if package exists
-    const pkgIndex = this.packages.findIndex(p => p.id === packageId);
-    if (pkgIndex < 0) {
+
+    if (!this.packages.some(p => p.id === packageId)) {
       return { success: false, message: `Package '${packageId}' not found in configuration` };
     }
-    
+    return this.runPackageBarrier(
+      packageId,
+      this.terminalRestartResult(packageId),
+      () => this.restartPackageNow(packageId),
+    );
+  }
+
+  private async restartPackageNow(packageId: string): Promise<{ success: boolean; message: string }> {
     // Wait for any pending connection to complete first (race condition handling)
     const pendingPromise = this.clientPromises.get(packageId);
     if (pendingPromise) {
@@ -2580,10 +2632,12 @@ export class PackageRegistry {
       }
       this.clientPromises.delete(packageId);
     }
-    
-    // Close existing client if any
+
+    // Close existing client if any. It leaves the map first, so nothing arriving picks
+    // it up; calls already running on it settle as they did before (not replayed).
     const client = this.clients.get(packageId);
     if (client) {
+      this.clients.delete(packageId);
       try {
         await this.closeClientExactlyOnce(packageId, client, "restart");
         logger.debug("Closed existing client", { package_id: packageId });
@@ -2596,12 +2650,16 @@ export class PackageRegistry {
       if (this.terminal) {
         return this.terminalRestartResult(packageId);
       }
-      this.clients.delete(packageId);
       this.emitLifecycle({ type: "client_evicted", packageId, reason: "restart" });
     }
 
     this.lastActivity.delete(packageId);
-    
+
+    const pkgIndex = this.packages.findIndex(p => p.id === packageId);
+    if (pkgIndex < 0) {
+      return { success: false, message: `Package '${packageId}' not found in configuration` };
+    }
+
     // Re-normalize from raw config to pick up env var changes
     const serverConfig = this.config.mcpServers?.[packageId];
     if (serverConfig) {

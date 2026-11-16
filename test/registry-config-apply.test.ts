@@ -25,6 +25,7 @@ vi.mock('../src/clients/stdioClient.js', () => ({
     async listTools() { return []; }
     callTool = callTool;
     hasPendingRequests() { return true; }
+    isTransportClosed() { return false; }
   },
 }));
 
@@ -95,6 +96,33 @@ describe('PackageRegistry.applyConfigFromFiles', () => {
     // Restart must re-expand the admitted raw entry, rather than retain the
     // already-normalized config when no raw entry was copied.
     expect(registry.getPackage('Added')?.env).toEqual({ TOKEN: 'rotated-value' });
+  });
+
+  it('applies a package home change while an earlier eviction of that package waits for a running call', async () => {
+    // FOX-9654: the home-change restart queues behind that eviction; awaiting it
+    // inside the config queue would hold every apply, and any spawn, until the call ends.
+    let release!: () => void;
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    callTool.mockImplementationOnce(async () => {
+      entered();
+      await pending;
+      return { content: [{ type: 'text', text: 'finished' }] };
+    });
+    const reply = registry.callTool('Alpha', 'wait', {}, { kind: 'standalone' });
+    await started;
+    const reconnect = registry.connectForCatalog('Alpha', { forceReconnect: true });
+    try {
+      await write(initialServers(), { packageHomes: { Alpha: { url: 'https://cloud.example.test/mcp/packages/Alpha' } } });
+      const applied = registry.applyConfigFromFiles([configPath]);
+      const outcome = await Promise.race([applied, new Promise((resolve) => setTimeout(() => resolve('held'), 1_000))]);
+      expect(outcome).toMatchObject({ status: 'ok' });
+    } finally {
+      release();
+    }
+    await expect(reply).resolves.toEqual({ content: [{ type: 'text', text: 'finished' }] });
+    await reconnect.catch(() => undefined);
   });
 
   it('reports a removal without removing the package', async () => {

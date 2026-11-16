@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import crypto from "node:crypto";
+import type http from "node:http";
 import express from "express";
 import { ERROR_CODES } from "./types.js";
 import { PackageRegistry } from "./registry.js";
@@ -265,6 +266,25 @@ export function registerShutdownRoute(
     }
     res.status(202).end();
     options.shutdown("host_request");
+  });
+}
+
+/**
+ * Listen on the loopback port, telling a failure apart from success. Express 5
+ * hands a listen error (the port already taken) to the listen callback, which
+ * this router used to treat as a successful start: it then ran without
+ * listening while Rebel's health check reached whatever held the port
+ * (FOX-9654, REBEL-7TK).
+ */
+export function listenOnLoopback(
+  app: express.Express,
+  port: number,
+  onListening: () => void,
+  onFailed: (error: Error) => void,
+): http.Server {
+  return app.listen(port, "127.0.0.1", (error?: Error) => {
+    if (error) onFailed(error);
+    else onListening();
   });
 }
 
@@ -1363,7 +1383,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
         shutdown: (reason) => void shutdown(reason),
       });
 
-      const httpServer = app.listen(port, '127.0.0.1', () => {
+      const httpServer = listenOnLoopback(app, port, () => {
         logger.info("Super MCP Router started successfully", {
           transport: "http",
           port,
@@ -1381,6 +1401,14 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
             onOwnerDead: () => shutdown("owner_dead"),
           });
         }
+      }, (error) => {
+        logger.error("Super MCP Router could not listen; exiting so Rebel starts it on another port", {
+          port,
+          error: formatError(error),
+        });
+        // Rethrown to the uncaught-exception handler, which flushes the log and
+        // exits non-zero; Rebel's startup wait sees the exit and retries.
+        throw error;
       });
       httpServer.requestTimeout = 0;
     } else {
