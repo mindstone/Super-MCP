@@ -36,6 +36,8 @@ vi.mock("../../auth/providers/simple.js", () => {
     initialize = vi.fn(async () => {});
     checkAndInvalidateOnPortMismatch = vi.fn(async () => false);
     state = vi.fn(async () => "csrf-state");
+    tokens = vi.fn(async () => undefined);
+    clientInformation = vi.fn(async () => undefined);
     invalidateCredentials = vi.fn(async () => {});
     setSkipAuthorizeProbe = vi.fn();
     consumeProbeVerdict = vi.fn(() => undefined);

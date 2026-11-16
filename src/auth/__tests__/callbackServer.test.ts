@@ -177,3 +177,26 @@ describe("OAuthCallbackServer ?error= branch state validation (REBEL-7F9 Stage 4
     }
   }, 20_000);
 });
+
+// FOX-7899: in Safari, an unanswered "open the app?" prompt left on the
+// finished page stops the next sign-in tab from loading, so the page never
+// steps to the app's link by itself. The button stays as a plain link.
+describe("OAuthCallbackServer finished page", () => {
+  it("offers the app's link only as a button the person clicks", async () => {
+    const port = await freePort();
+    const server = new OAuthCallbackServer(port);
+    await server.start();
+    const waiter = server.waitForCallback(30_000, "state-ok");
+    waiter.catch(() => {});
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/oauth/callback?code=fictional-code&state=state-ok`);
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).not.toMatch(/<script|http-equiv=["']?refresh/i);
+      expect(html).toContain('href="mindstone://settings/connectors"');
+      await expect(waiter).resolves.toBe("fictional-code");
+    } finally {
+      await server.stop();
+    }
+  }, 20_000);
+});

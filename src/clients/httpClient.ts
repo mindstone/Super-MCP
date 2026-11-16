@@ -301,7 +301,12 @@ function createResponseNormalizingFetch(
         onOAuthDiscoveryRequest?.(discoveryClassification, "network-error");
       }
       // Failed rotations clear tokens before throwing; leave those on the sign-in path.
-      if (refreshOnly && isRefresh && (await refreshProvider.tokens())?.refresh_token) {
+      // An error that says it isn't retryable (a broken token-lock folder,
+      // FOX-7670) isn't a busy service either: let it reach the sign-in path,
+      // which gives the person a Reconnect card instead of a lasting error.
+      const notRetryable = error !== null && typeof error === "object"
+        && (error as { retryable?: unknown }).retryable === false;
+      if (refreshOnly && isRefresh && !notRetryable && (await refreshProvider.tokens())?.refresh_token) {
         const cause = error !== null && typeof error === "object"
           ? error as { name?: unknown; code?: unknown; cause?: unknown }
           : undefined;

@@ -28,7 +28,6 @@ function getCallbackHtmlConfig() {
     iconUrl: process.env.SUPER_MCP_ICON_URL || "",
     iconText: process.env.SUPER_MCP_ICON_TEXT || "✓",
     primaryColor: process.env.SUPER_MCP_PRIMARY_COLOR || "#6366f1",
-    countdownSeconds: parseInt(process.env.SUPER_MCP_COUNTDOWN_SECONDS || "5", 10),
     deepLinkUrl: process.env.SUPER_MCP_DEEP_LINK_URL || "mindstone://settings/connectors",
   };
 }
@@ -72,11 +71,14 @@ function generateSuccessMessage(serviceName: string): { headline: string; subtit
 }
 
 /** Generate success HTML page with prominent button to return to Rebel */
+// No script steps to the app's link by itself: in Safari an unanswered "open
+// the app?" prompt left on this page stops the next sign-in tab from loading
+// (FOX-7899). The host brings itself to the front; the button stays for anyone
+// who wants it.
 function generateSuccessHtml(serviceId?: string): string {
   const config = getCallbackHtmlConfig();
   const appName = escapeHtml(config.appName);
   const deepLinkUrl = escapeHtml(config.deepLinkUrl);
-  const countdownSeconds = config.countdownSeconds;
   const serviceName = formatServiceName(serviceId || "");
   const message = generateSuccessMessage(serviceName);
   const headline = escapeHtml(message.headline);
@@ -116,16 +118,6 @@ function generateSuccessHtml(serviceId?: string): string {
     }
     h1 { font-size: 26px; font-weight: 600; margin-bottom: 12px; color: #ffffff; letter-spacing: -0.3px; }
     .subtitle { font-size: 15px; color: #888; line-height: 1.6; margin-bottom: 32px; }
-    .countdown-container {
-      display: flex; align-items: center; justify-content: center; gap: 12px;
-      padding: 16px 24px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid rgba(255, 255, 255, 0.06);
-      border-radius: 12px;
-      margin-bottom: 20px;
-    }
-    .countdown-text { font-size: 14px; color: #666; }
-    .countdown-number { font-size: 18px; font-weight: 600; color: ${escapeHtml(config.primaryColor)}; min-width: 24px; }
     .open-button {
       display: inline-block; padding: 14px 28px;
       background: linear-gradient(135deg, ${escapeHtml(config.primaryColor)} 0%, ${escapeHtml(config.primaryColor)}dd 100%);
@@ -144,51 +136,9 @@ function generateSuccessHtml(serviceId?: string): string {
     <div class="icon">${iconContent}</div>
     <h1>${headline}</h1>
     <p class="subtitle">${subtitle}</p>
-    <div class="countdown-container">
-      <span class="countdown-text">Auto-opening ${appName} in</span>
-      <span class="countdown-number" id="countdown">${countdownSeconds}</span>
-    </div>
-    <a href="${deepLinkUrl}" class="open-button" id="openBtn">Open ${appName}</a>
-    <p class="fallback">If ${appName} doesn't open automatically, click the button above.</p>
+    <a href="${deepLinkUrl}" class="open-button">Open ${appName}</a>
+    <p class="fallback">You can close this tab.</p>
   </div>
-  <script>
-    (function() {
-      var count = ${countdownSeconds};
-      var el = document.getElementById('countdown');
-      var btn = document.getElementById('openBtn');
-      var countdownContainer = document.querySelector('.countdown-container');
-      var fallback = document.querySelector('.fallback');
-      var opened = false;
-      var timerId = null;
-
-      function openApp() {
-        if (opened) return;
-        opened = true;
-        if (timerId) clearTimeout(timerId);
-        if (countdownContainer) countdownContainer.style.display = 'none';
-        if (fallback) fallback.style.display = 'none';
-        window.location.href = '${deepLinkUrl}';
-      }
-
-      function tick() {
-        if (opened) return;
-        count--;
-        el.textContent = count;
-        if (count <= 0) {
-          openApp();
-        } else {
-          timerId = setTimeout(tick, 1000);
-        }
-      }
-
-      btn.addEventListener('click', function(e) {
-        e.preventDefault();
-        openApp();
-      });
-
-      timerId = setTimeout(tick, 1000);
-    })();
-  </script>
 </body>
 </html>`;
 }

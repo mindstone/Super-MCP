@@ -51,6 +51,8 @@ vi.mock('../src/auth/providers/simple.js', async (importOriginal) => {
       initialize: vi.fn().mockResolvedValue(undefined),
       checkAndInvalidateOnPortMismatch: vi.fn().mockResolvedValue(false),
       state: vi.fn().mockResolvedValue('test-state'),
+      tokens: vi.fn().mockResolvedValue(undefined),
+      clientInformation: vi.fn().mockResolvedValue(undefined),
       invalidateCredentials: vi.fn().mockResolvedValue(undefined),
       setSkipAuthorizeProbe: vi.fn(),
       consumeProbeVerdict: vi.fn().mockReturnValue(undefined),

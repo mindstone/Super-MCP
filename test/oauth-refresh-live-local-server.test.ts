@@ -4,6 +4,7 @@ import * as os from "os";
 import * as path from "path";
 import http from "node:http";
 import { randomBytes } from "node:crypto";
+import { createRequire } from "node:module";
 
 import { auth, refreshAuthorization } from "@modelcontextprotocol/sdk/client/auth.js";
 import type { AuthorizationServerMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
@@ -443,7 +444,33 @@ describe("OAuth refresh over a real local authorization server", () => {
     expect(server.refreshRequests()).toBeGreaterThan(0);
     expect(await readDiskTokens(tempDir, packageId)).toBeUndefined();
     expect(await SimpleOAuthProvider.readNeedsReconnectMarkerState(packageId)).toEqual({ state: "present" });
-    expect(mockLogger.error).toHaveBeenCalledWith("Authentication required for MCP server", expect.objectContaining({ package_id: packageId, error: expect.any(String) }));
+    expect(mockLogger.error).toHaveBeenCalledWith("Authentication required for MCP server", expect.objectContaining({ package_id: packageId, error: "RefreshOnlyAuthenticationRequiredError" }));
+  });
+
+  // FOX-7670: a token-lock folder that can't be written isn't a busy service.
+  // It reaches the sign-in path, so the person gets a Reconnect card instead of
+  // a lasting "didn't respond, will retry" error that never retries.
+  it.each([
+    ["EACCES", "auth_required"],
+    ["ENOENT", "auth_required"],
+    ["ELOCKED", "transient_failure"],
+  ])("a token-lock failure with %s ends as %s without presenting the refresh token", async (code, kind) => {
+    const { server, registry, packageId } = await connectionFixture();
+    const properLockfile = createRequire(import.meta.url)("proper-lockfile") as { lock: (...args: unknown[]) => Promise<unknown> };
+    const lock = vi.spyOn(properLockfile, "lock").mockRejectedValue(Object.assign(new Error(`${code}: fictional lock failure`), { code }));
+    try {
+      expect(await registry.connectForCatalog(packageId)).toMatchObject({ kind });
+      expect(lock).toHaveBeenCalled();
+      expect(server.refreshRequests()).toBe(0);
+      expect(await readDiskTokens(tempDir, packageId)).toMatchObject({ refresh_token: "fictional-old-refresh" });
+      const temporaryWarned = mockLogger.warn.mock.calls.some(([message]) => message === "OAuth refresh temporarily unavailable");
+      expect(temporaryWarned).toBe(kind === "transient_failure");
+      if (kind === "auth_required") {
+        expect(mockLogger.error).toHaveBeenCalledWith("Authentication required for MCP server", expect.objectContaining({ package_id: packageId, error: "RefreshOnlyAuthenticationRequiredError" }));
+      }
+    } finally {
+      lock.mockRestore();
+    }
   });
 
   it("requires sign-in for tokens from another issuer without attempting a refresh", async () => {

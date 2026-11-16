@@ -494,6 +494,26 @@ async function handleAuthenticateCore(
         });
       }
 
+      // FOX-7670: a dynamic registration saved before Rebel asked for both
+      // grants can't renew its tokens at a provider that enforces registered
+      // grants, so signing in on it again ends in another short-lived token
+      // and the connector drops out about hourly. Register again; the tokens
+      // belong to the old client id, so they go too. A registration that did
+      // get a refresh token renews fine and is kept, and a static client is
+      // never a dynamic registration.
+      if (!staticCreds && !(await oauthProvider.tokens())?.refresh_token) {
+        const saved = await oauthProvider.clientInformation();
+        // RFC 7591 §2: omitted grant_types means authorization_code only.
+        const grants: unknown = (saved as { grant_types?: unknown } | undefined)?.grant_types;
+        if (saved && !(Array.isArray(grants) && grants.includes("refresh_token"))) {
+          await oauthProvider.invalidateCredentials("all");
+          logger.info("OAuth registration without refresh_token grant dropped, will re-register", {
+            package_id,
+            oauth_port: attemptPort,
+          });
+        }
+      }
+
       // (c) fresh state (PKCE verifier is saved by the SDK per attempt)
       const oauthState = await oauthProvider.state();
       logger.info("OAuth state generated for CSRF protection", {

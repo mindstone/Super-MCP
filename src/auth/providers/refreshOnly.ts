@@ -60,7 +60,11 @@ export class RefreshOnlyOAuthProvider implements OAuthClientProvider {
       has_refresh_token: !!tokens?.refresh_token,
       message: "Use authenticate() to sign in"
     });
-    throw new Error("Authentication required. Use 'authenticate(package_id: \"...\")' to sign in.");
+    // A fixed name, so the sign-in-needed log line says why (FOX-7670).
+    throw Object.assign(
+      new Error("Authentication required. Use 'authenticate(package_id: \"...\")' to sign in."),
+      { name: "RefreshOnlyAuthenticationRequiredError" },
+    );
   }
   
   async invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier') {

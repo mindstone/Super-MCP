@@ -336,4 +336,84 @@ describe('authentication bootstrap settlement', () => {
     } finally { await reg.clients.get(pkg.id)?.close(); }
   });
 
+  // FOX-7670: a registration saved before Rebel asked for refresh_token keeps
+  // handing out tokens that can't renew, so a browser sign-in registers again.
+  it.each([
+    ['grants omitted', true, undefined, undefined],
+    ['authorization_code only', true, ['authorization_code'], undefined],
+    ['both grants', false, ['authorization_code', 'refresh_token'], undefined],
+    ['a token that renews', false, ['authorization_code'], 'fictional-refresh'],
+  ] as const)('a browser sign-in on a saved registration with %s registers again: %s', async (_label, reRegisters, grants, refreshToken) => {
+    const seed = new SimpleOAuthProvider(pkg.id, 5173);
+    await seed.initialize();
+    await seed.saveClientInformation({
+      client_id: 'old-client', redirect_uris: ['http://localhost:5173/oauth/callback'],
+      ...(grants && { grant_types: grants }),
+    });
+    if (refreshToken) await seed.saveTokens({ access_token: 'expired', token_type: 'Bearer', refresh_token: refreshToken });
+    const registrations: unknown[] = [];
+    let authorizeClientId: string | null = null;
+    vi.spyOn(SimpleOAuthProvider.prototype, 'redirectToAuthorization')
+      .mockImplementation(async function (this: SimpleOAuthProvider, url: URL) {
+        authorizeClientId = url.searchParams.get('client_id');
+        Reflect.set(this, 'redirectStarted', true);
+        callback.reject?.(Object.assign(new Error('OAuth error: access_denied'), { code: OAUTH_PROVIDER_ERROR_CODE }));
+      });
+    globalThis.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.endsWith('/.well-known/oauth-authorization-server')) return Response.json({
+        issuer: 'https://mcp.example.com', authorization_endpoint: 'https://mcp.example.com/authorize',
+        token_endpoint: 'https://mcp.example.com/token', registration_endpoint: 'https://mcp.example.com/register',
+        response_types_supported: ['code'], code_challenge_methods_supported: ['S256'],
+      });
+      if (url.endsWith('/register')) {
+        const body = JSON.parse(String(init?.body));
+        registrations.push(body);
+        return Response.json({ client_id: 'new-client', redirect_uris: body.redirect_uris, grant_types: body.grant_types }, { status: 201 });
+      }
+      // The saved refresh token is rejected so the attempt still heads to the browser.
+      if (url.endsWith('/token')) return Response.json({ error: 'invalid_grant' }, { status: 400 });
+      if (url.endsWith('/mcp')) return new Response('Unauthorized', { status: 401, headers: { 'www-authenticate': 'Bearer' } });
+      return new Response(null, { status: 404 });
+    });
+    const reg = registry();
+    try {
+      await handleAuthenticate({ package_id: pkg.id }, reg, catalog);
+      if (reRegisters) {
+        expect(registrations).toHaveLength(1);
+        expect(registrations[0]).toMatchObject({ grant_types: ['authorization_code', 'refresh_token'] });
+        expect(authorizeClientId).toBe('new-client');
+      } else {
+        expect(registrations).toHaveLength(0);
+        expect(authorizeClientId).toBe('old-client');
+      }
+    } finally { await reg.clients.get(pkg.id)?.close(); }
+  });
+
+  it('keeps a static client and never registers one', async () => {
+    const staticPkg = { ...pkg, oauthClientId: 'vendor-client' };
+    const registrations: unknown[] = [];
+    let authorizeClientId: string | null = null;
+    vi.spyOn(SimpleOAuthProvider.prototype, 'redirectToAuthorization')
+      .mockImplementation(async function (this: SimpleOAuthProvider, url: URL) {
+        authorizeClientId = url.searchParams.get('client_id');
+        Reflect.set(this, 'redirectStarted', true);
+        callback.reject?.(Object.assign(new Error('OAuth error: access_denied'), { code: OAUTH_PROVIDER_ERROR_CODE }));
+      });
+    mockLateChallengeFetch();
+    const lateChallengeFetch = globalThis.fetch;
+    globalThis.fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.endsWith('/register')) registrations.push(init?.body);
+      if (new URL(url).pathname === '/authorize') return new Response(null, { status: 302 });
+      return lateChallengeFetch(input, init);
+    });
+    const reg = { ...registry(), getPackage: () => staticPkg } as ReturnType<typeof registry>;
+    try {
+      await handleAuthenticate({ package_id: pkg.id }, reg, catalog);
+      expect(registrations).toHaveLength(0);
+      expect(authorizeClientId).toBe('vendor-client');
+    } finally { await reg.clients.get(pkg.id)?.close(); }
+  });
+
 });

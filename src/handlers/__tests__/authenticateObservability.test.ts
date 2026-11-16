@@ -63,6 +63,8 @@ vi.mock("../../auth/providers/simple.js", () => {
     browserUnavailable = vi.fn(() => new Promise<Error>(() => {}));
     initialize = vi.fn(async () => {});
     checkAndInvalidateOnPortMismatch = vi.fn(async () => false);
+    tokens = vi.fn(async () => undefined);
+    clientInformation = vi.fn(async () => undefined);
     invalidateCredentials = vi.fn(async () => {});
     setSkipAuthorizeProbe = vi.fn((skip: boolean) => {
       this.skipProbe = skip;
