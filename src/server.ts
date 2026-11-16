@@ -1359,7 +1359,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
       process.on("SIGTERM", () => shutdown());
       registerShutdownRoute(app, {
         dnsRebindingGuard,
-        ownerId: ownerInfo?.ownerId,
+        ownerId: healthOwnerId,
         shutdown: (reason) => void shutdown(reason),
       });
 
