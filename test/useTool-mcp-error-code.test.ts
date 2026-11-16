@@ -16,15 +16,15 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function run(error: Error) {
+function run(error: Error, runTool: typeof tool & { annotations?: Record<string, unknown> } = tool) {
   const registry = new PackageRegistry({ mcpServers: { 'fictional-notes': { command: 'unused' } } });
   cleanup.push(() => registry.closeAll());
   const callTool = vi.fn().mockRejectedValue(error);
   vi.spyOn(registry, 'getClient').mockResolvedValue({
-    connect: vi.fn(), close: vi.fn(), listTools: async () => [tool], callTool,
+    connect: vi.fn(), close: vi.fn(), listTools: async () => [runTool], callTool,
   });
   const catalog = new Catalog(registry);
-  catalog.commitReady('fictional-notes', [tool], catalog.getConfigurationGeneration());
+  catalog.commitReady('fictional-notes', [runTool], catalog.getConfigurationGeneration());
   vi.spyOn(catalog, 'ensurePackageLoaded').mockResolvedValue(undefined);
   return { callTool, result: handleUseTool({ package_id: 'fictional-notes', tool_id: 'send', args: {} }, registry, catalog, new Validator()) };
 }
@@ -44,5 +44,22 @@ describe('use_tool downstream MCP error codes', () => {
     await expect(result).rejects.toMatchObject({ code: ERROR_CODES.DOWNSTREAM_ERROR });
     await expect(result).rejects.not.toHaveProperty('data.mcp_error_code');
     expect(callTool).toHaveBeenCalledOnce();
+  });
+
+  // REBEL-6DF: the caller decides whether a lost call is safe to re-run from the
+  // tool's own annotations. A failed first call must carry them too, or the
+  // caller has nothing to go on and never retries.
+  it('carries the tool annotations on a downstream failure', async () => {
+    const annotations = { readOnlyHint: true, idempotentHint: true };
+    const { result } = run(new McpError(ErrorCode.ConnectionClosed, 'Connection closed'), { ...tool, annotations });
+    await expect(result).rejects.toMatchObject({
+      code: ERROR_CODES.DOWNSTREAM_ERROR,
+      data: { mcp_error_code: -32000, annotations },
+    });
+  });
+
+  it('sends empty annotations when the tool declares none, so an older cached hint cannot authorise a retry', async () => {
+    const { result } = run(new McpError(ErrorCode.ConnectionClosed, 'Connection closed'));
+    await expect(result).rejects.toHaveProperty('data.annotations', {});
   });
 });

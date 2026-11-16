@@ -11,7 +11,7 @@ import {
   USE_TOOL_SOFT_META_PARAMS,
 } from "../types.js";
 import { PackageRegistry } from "../registry.js";
-import { Catalog } from "../catalog.js";
+import { Catalog, type CachedTool } from "../catalog.js";
 import type { ValidationResult } from "../validator.js";
 import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { getLogger } from "../logging.js";
@@ -247,6 +247,19 @@ interface RepairTicket {
 
 // Prose omits submitted const/discriminator values; the serialized ticket retains got.
 const schemaOnlyEnumProse = new WeakSet<object>();
+
+/**
+ * The -33007 for a tool call the connector failed. Every one carries the tool's catalog annotations, `{}` when it
+ * declares none: the caller decides from them whether a lost call is safe to re-run, and without them a first call
+ * can never be retried (REBEL-6DF). Build every downstream tool failure here so none can leave them out.
+ */
+function downstreamToolFailure(tool: CachedTool, message: string, data: Record<string, unknown>) {
+  return {
+    code: ERROR_CODES.DOWNSTREAM_ERROR,
+    message,
+    data: { ...data, annotations: tool.tool.annotations ?? {} },
+  };
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -2423,19 +2436,15 @@ export async function handleUseTool(
       resetValidationAttempt(downstreamValidationAttemptKey);
       const providedArgs = isRecord(args) ? Object.keys(args) : [];
 
-      throw {
-        code: ERROR_CODES.DOWNSTREAM_ERROR,
-        message: `Downstream output validation failed for tool '${tool_id}': ${error.message}`,
-        data: {
-          package_id,
-          tool_id,
-          duration_ms: duration,
-          args_provided: providedArgs,
-          mcp_error_code: error.code,
-          mcp_error_data: error.data,
-          validation_direction: "output",
-        },
-      };
+      throw downstreamToolFailure(cachedTool, `Downstream output validation failed for tool '${tool_id}': ${error.message}`, {
+        package_id,
+        tool_id,
+        duration_ms: duration,
+        args_provided: providedArgs,
+        mcp_error_code: error.code,
+        mcp_error_data: error.data,
+        validation_direction: "output",
+      });
     }
 
     if (error instanceof McpError && error.code === SdkErrorCode.InvalidParams) {
@@ -2562,18 +2571,14 @@ export async function handleUseTool(
       diagnosticMessage += `\n  Arguments provided: ${Object.keys(args).join(", ")}`;
     }
     
-    throw Object.defineProperty({
-      code: ERROR_CODES.DOWNSTREAM_ERROR,
-      message: diagnosticMessage,
-      data: {
-        package_id,
-        tool_id,
-        duration_ms: duration,
-        original_error: errorMessage,
-        ...(underlying instanceof McpError ? { mcp_error_code: underlying.code } : {}),
-        args_provided: args ? Object.keys(args) : [],
-        ...connectDiagnostics,
-      },
-    }, "cause", { value: error });
+    throw Object.defineProperty(downstreamToolFailure(cachedTool, diagnosticMessage, {
+      package_id,
+      tool_id,
+      duration_ms: duration,
+      original_error: errorMessage,
+      ...(underlying instanceof McpError ? { mcp_error_code: underlying.code } : {}),
+      args_provided: args ? Object.keys(args) : [],
+      ...connectDiagnostics,
+    }), "cause", { value: error });
   }
 }
