@@ -1,5 +1,5 @@
 import { getSecurityPolicy } from "../security.js";
-import { isSafetyDisabled, SAFETY_DISABLED_REASON, type SafetyIdentity } from "../safetyDisabledTools.js";
+import { safetyBlock, type SafetyIdentity } from "../safetyDisabledTools.js";
 
 export interface SecurityAnnotation {
   blocked?: boolean;
@@ -25,8 +25,10 @@ export function computeSecurityAnnotation(
     return { blocked: true, blocked_reason: blockCheck.reason };
   }
 
-  if (isSafetyDisabled(pkg, rawToolId)) {
-    return { blocked: true, blocked_reason: SAFETY_DISABLED_REASON };
+  // No call arguments here, so an argument-scoped local-fs tool shows as allowed; a call naming the argument is refused.
+  const safety = safetyBlock(pkg, rawToolId);
+  if (safety !== undefined) {
+    return { blocked: true, blocked_reason: safety.reason };
   }
 
   if (securityPolicy.isAdminDisabled(pkg?.catalogId, rawToolId)) {

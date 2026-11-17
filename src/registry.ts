@@ -1274,6 +1274,7 @@ export class PackageRegistry {
             oauthClientSecret: pkg.oauthClientSecret,
             auth: pkg.auth,
             setupStatus: pkg.setupStatus,
+            catalogId: pkg.catalogId,
           } as any;
         }
       }
@@ -2108,7 +2109,7 @@ export class PackageRegistry {
     context ??= { kind: "standalone" };
     assertDispatchActive(context);
     // Backstop: every route to a connector ends here, so a safety-disabled tool never runs.
-    assertNotSafetyDisabled(this.getPackage(packageId), packageId, toolId);
+    assertNotSafetyDisabled(this.getPackage(packageId), packageId, toolId, args);
     let leaseClient = await this.acquireLease(packageId);
     try {
       let client = await this.getClient(packageId, true);

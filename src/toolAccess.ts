@@ -6,7 +6,8 @@ import { getLogger } from "./logging.js";
 
 const logger = getLogger();
 
-export function assertToolAccess(registry: PackageRegistry, package_id: string, tool_id?: string): void {
+/** `args`, when given, are the call's arguments: an argument-scoped safety block refuses only a call that supplies one. */
+export function assertToolAccess(registry: PackageRegistry, package_id: string, tool_id?: string, args?: Record<string, unknown>): void {
   // Check if tool is blocked by security policy
   const securityPolicy = getSecurityPolicy();
   const blockCheck = tool_id === undefined
@@ -22,7 +23,7 @@ export function assertToolAccess(registry: PackageRegistry, package_id: string, 
 
   const packageConfig = registry.getPackage(package_id);
   const catalogId = packageConfig?.catalogId;
-  if (tool_id !== undefined) assertNotSafetyDisabled(packageConfig, package_id, tool_id);
+  if (tool_id !== undefined) assertNotSafetyDisabled(packageConfig, package_id, tool_id, args);
 
   // Check if tool is disabled by admin (takes precedence over user preference)
   if (tool_id !== undefined && securityPolicy.isAdminDisabled(catalogId, tool_id)) {

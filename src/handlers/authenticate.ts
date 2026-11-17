@@ -12,6 +12,7 @@ import { formatError } from "../utils/formatError.js";
 import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
 import { coerceStringifiedBoolean } from "../utils/normalizeInput.js";
 import { getValidator } from "../validator.js";
+import { safetyBlock, safetyBlockMessage } from "../safetyDisabledTools.js";
 
 const logger = getLogger();
 const STDIO_AUTH_DELEGATION_TIMEOUT_MS = 60_000;
@@ -210,6 +211,24 @@ async function handleAuthenticateCore(
       }
 
       if (authTool) {
+        const block = safetyBlock(pkg, authTool.name, {});
+        if (block !== undefined) {
+          logger.warn("Blocked attempt to use safety-disabled tool", { package_id, tool_id: authTool.name, catalog_id: pkg.catalogId, blocked_reason: block.reason });
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  package_id,
+                  status: "error",
+                  error: safetyBlockMessage(package_id, authTool.name, block),
+                  delegated_tool: authTool.name,
+                }, null, 2),
+              },
+            ],
+            isError: true,
+          };
+        }
         logger.info("Delegating to stdio package's auth tool", {
           package_id,
           tool: authTool.name,

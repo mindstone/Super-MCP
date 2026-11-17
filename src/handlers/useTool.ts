@@ -1678,7 +1678,8 @@ export async function handleUseTool(
     };
   }
 
-  assertToolAccess(registry, package_id, tool_id);
+  // The raw arguments; the dispatch backstop checks them again after alias repair.
+  assertToolAccess(registry, package_id, tool_id, args);
 
   await catalog.ensurePackageLoaded(package_id, {
     forceReconnect: catalog.getPackageStatus(package_id) !== "ready",
@@ -2409,6 +2410,9 @@ export async function handleUseTool(
         : {}),
     });
   } catch (error) {
+    // The dispatch backstop's safety refusal is the answer as it stands: an argument
+    // renamed by key repair above reaches it only there.
+    if (isRecord(error) && error.code === ERROR_CODES.TOOL_BLOCKED) throw error;
     registry.notifyActivity(package_id);
     if (error instanceof FileReadAdmissionError) {
       return buildOuter({

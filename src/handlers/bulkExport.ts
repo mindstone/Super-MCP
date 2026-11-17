@@ -10,7 +10,7 @@ import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
 import { getLogger } from "../logging.js";
 import { PackageRegistry } from "../registry.js";
 import { getSecurityPolicy } from "../security.js";
-import { isSafetyDisabled } from "../safetyDisabledTools.js";
+import { safetyBlock, safetyBlockMessage } from "../safetyDisabledTools.js";
 import { BulkExportInput, BulkExportOutput } from "../types.js";
 import { resolveToolResultPayload, type ToolResultPayload } from "../utils/toolResultPayload.js";
 import {
@@ -790,7 +790,7 @@ async function runBulkExport(params: RunBulkExportParams): Promise<BulkExportOut
   };
 }
 
-function validateSecurityPolicy(packageId: string, toolId: string, registry: PackageRegistry): string | null {
+function validateSecurityPolicy(packageId: string, toolId: string, args: Record<string, unknown>, registry: PackageRegistry): string | null {
   const securityPolicy = getSecurityPolicy();
   const blockCheck = securityPolicy.isToolBlocked(packageId, toolId);
   if (blockCheck.blocked) {
@@ -805,8 +805,9 @@ function validateSecurityPolicy(packageId: string, toolId: string, registry: Pac
     return `Package not found: ${packageId}. ${PACKAGE_DISCOVERY_HINT}`;
   }
 
-  if (isSafetyDisabled(packageConfig, toolId)) {
-    return `Tool '${packageId}__${toolId}' is turned off for safety: it can read files or run code on this computer.`;
+  const block = safetyBlock(packageConfig, toolId, args);
+  if (block !== undefined) {
+    return safetyBlockMessage(packageId, toolId, block);
   }
 
   if (securityPolicy.isAdminDisabled(packageConfig.catalogId, toolId)) {
@@ -852,7 +853,7 @@ export async function handleBulkExport(
     return errorResponse(toErrorMessage(error));
   }
 
-  const securityError = validateSecurityPolicy(parsedInput.packageId, parsedInput.toolId, registry);
+  const securityError = validateSecurityPolicy(parsedInput.packageId, parsedInput.toolId, parsedInput.args, registry);
   if (securityError) {
     return errorResponse(securityError);
   }

@@ -6,7 +6,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSche
 import type { PackageRegistry } from "./registry.js";
 import { assertToolAccess } from "./toolAccess.js";
 import { getSecurityPolicy } from "./security.js";
-import { isSafetyDisabled } from "./safetyDisabledTools.js";
+import { safetyBlock } from "./safetyDisabledTools.js";
 import { forwardedFilesSchema, getWorkspacePath, runWithForwardedFiles } from "./forwardedFiles.js";
 import { collectReturnedFiles, RETURNED_FILES_META } from "./returnedFiles.js";
 import { ERROR_CODES } from "./types.js";
@@ -17,7 +17,7 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
   const allowed = (name: string) => {
     const policy = getSecurityPolicy();
     const pkg = registry.getPackage(packageId);
-    return !policy.isToolBlocked(packageId, name, false).blocked && !isSafetyDisabled(pkg, name) && !policy.isAdminDisabled(pkg?.catalogId, name) && !policy.isUserDisabled(packageId, name);
+    return !policy.isToolBlocked(packageId, name, false).blocked && safetyBlock(pkg, name) === undefined && !policy.isAdminDisabled(pkg?.catalogId, name) && !policy.isUserDisabled(packageId, name);
   };
   const errorText = (error: unknown) => error instanceof Error ? error.message : String((error as { message?: string }).message ?? error);
   // The registry knows this state; keep the words for older clients while carrying the type.
@@ -39,7 +39,7 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
   });
   server.setRequestHandler(CallToolRequestSchema, async ({ params }, extra) => {
     try {
-      assertToolAccess(registry, packageId, params.name);
+      assertToolAccess(registry, packageId, params.name, params.arguments);
     } catch (error) {
       return { isError: true, content: [{ type: "text", text: errorText(error) }] };
     }
