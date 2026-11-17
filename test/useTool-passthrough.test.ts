@@ -246,6 +246,16 @@ describe("useTool passthrough contract", () => {
     expect(typeof response._meta.superMcp.outputChars).toBe("number");
   });
 
+  it.each(['sent', 'failed', 'unknown'])('preserves an acknowledged %s receipt through applyOuterMeta', async outcome => {
+    const inner = { isError: false, structuredContent: { slackReplyOutcome: outcome },
+      content: [{ type: 'text', text: 'Acknowledged operation outcome' }] };
+    const { mockRegistry, mockCatalog, mockValidator } = createUseToolMocks(inner);
+    const response = await handleUseTool(SUCCESS_INPUT, mockRegistry, mockCatalog, mockValidator);
+    expect(response.isError).toBe(false);
+    expect(response.structuredContent).toEqual(inner.structuredContent);
+    expect(parseEnvelope(response).result).toEqual(inner);
+  });
+
   it("strips an extracted image/jpg resource from serialized output and emits canonical image/jpeg", async () => {
     const inner = {
       content: [{
