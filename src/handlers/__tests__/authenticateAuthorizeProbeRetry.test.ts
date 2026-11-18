@@ -25,6 +25,7 @@ const {
   uncodedRejectionPorts,
   omitVerdictPorts,
   finishAuthError,
+  lateCallback,
 } = vi.hoisted(() => ({
   mockLogger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
   callbackServerInstances: [] as any[],
@@ -47,6 +48,7 @@ const {
   // When set, the mock's finishOAuth rejects with this error (coded finishAuth
   // timeout shape) instead of resolving.
   finishAuthError: { current: null as Error | null },
+  lateCallback: { current: false },
 }));
 
 vi.mock("../../logging.js", () => ({ getLogger: () => mockLogger }));
@@ -87,6 +89,7 @@ vi.mock("../../auth/providers/simple.js", () => {
       this.probeVerdict = undefined;
       return verdict;
     });
+    getProbeVerdictForTrace = vi.fn(() => undefined);
     // (c) fresh state per attempt (fresh provider ⇒ distinct value).
     state = vi.fn(async () => `state-${providerInstances.length}-${Math.random()}`);
 
@@ -143,6 +146,7 @@ vi.mock("../../clients/httpClient.js", async (importOriginal) => {
     // completed flow from a pending/timed-out one (the real client answers
     // needs_auth without tokens).
     finishedAuth = false;
+    isAuthenticated = vi.fn(async () => lateCallback.current);
     finishOAuth = vi.fn(async () => {
       if (finishAuthError.current) {
         throw finishAuthError.current;
@@ -162,6 +166,7 @@ vi.mock("../../clients/httpClient.js", async (importOriginal) => {
         })}`,
     );
     connectWithOAuth = vi.fn(async () => {
+      if (lateCallback.current) return;
       const provider = this.oauthProvider;
       if (provider?.skipProbe) {
         // Browser-floor / probe-skipped attempt: browser opens; connect stays
@@ -261,6 +266,7 @@ beforeEach(() => {
   uncodedRejectionPorts.clear();
   omitVerdictPorts.clear();
   finishAuthError.current = null;
+  lateCallback.current = false;
   delete process.env.SUPER_MCP_OAUTH_PROBE_DISABLE;
 });
 
@@ -269,6 +275,41 @@ afterEach(() => {
 });
 
 describe("authorize-probe rejection retry loop (REBEL-7F9 repro pin)", () => {
+  it.each([false, true])("client rejection returns private terminal JSON and discards the attempt (late=%s)", async (late) => {
+    lateCallback.current = late;
+    finishAuthError.current = Object.assign(new Error("OAUTH_CLIENT_REJECTED", {
+      cause: new Error("fictional-private-description code=fictional-code verifier=fictional-verifier secret=fictional-secret"),
+    }), { code: "OAUTH_CLIENT_REJECTED" });
+    const { registry, parsed, result } = await run();
+    expect(result.isError).toBe(false);
+    expect(parsed).toEqual({ package_id: PACKAGE_ID, status: "error",
+      error: "Sign-in couldn't finish. Please try connecting again.", message: "OAUTH_CLIENT_REJECTED" });
+    expect(result.content[0].text).not.toMatch(/fictional-|Existing OAuth|check browser|lastOAuthError/);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      "OAuth client rejected at token exchange; sign-in attempt ended",
+      { package_id: PACKAGE_ID, code: "OAUTH_CLIENT_REJECTED" },
+    );
+    expect(JSON.stringify([mockLogger.warn.mock.calls, mockLogger.error.mock.calls, mockLogger.info.mock.calls]))
+      .not.toMatch(/fictional-private-description|fictional-verifier|fictional-secret/);
+    expect(mockLogger.error.mock.calls.map(([message]) => message)).not.toContain("OAuth failed");
+    expect(httpClientInstances).toHaveLength(1);
+    expect(providerInstances).toHaveLength(1);
+    expect(callbackServerInstances[0].stop).toHaveBeenCalledOnce();
+    expect(httpClientInstances[0].close).toHaveBeenCalled();
+    expect((registry as any).clients.size).toBe(0);
+    expect(providerInstances[0].invalidateCredentials).not.toHaveBeenCalled();
+    expect(httpClientInstances[0].finishOAuth).toHaveBeenCalledOnce();
+    expect(httpClientInstances[0].healthCheck).toHaveBeenCalledTimes(late ? 1 : 0);
+    expect(findAvailablePortFromCandidates).toHaveBeenCalledOnce();
+  });
+
+  it("an unrelated callback failure retains its existing pending outcome", async () => {
+    finishAuthError.current = new Error("fictional unrelated failure");
+    const { parsed } = await run();
+    expect(parsed.status).toBe("auth_required");
+    expect(httpClientInstances).toHaveLength(1);
+  });
+
   it("saved port 5173 rejected → attempt 2 at 8080 succeeds (the reported user's exact state)", async () => {
     (SimpleOAuthProvider.getSavedClientPort as any).mockResolvedValue(5173);
     (SimpleOAuthProvider.hasPersistedAccessToken as any).mockResolvedValue(false);

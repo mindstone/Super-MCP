@@ -1,4 +1,4 @@
-import { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
+import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
 import { getLogger } from "../../logging.js";
 import { getOAuthClientIdentity } from "../../clientIdentity.js";
 import { spawn } from "child_process";
@@ -143,6 +143,8 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   private oauthPort: number;
   private stateValue?: string;
   private staticCredentials?: StaticOAuthCredentials;
+  private supportsPublicClientRegistration = false;
+  private allCredentialsInvalidations = 0;
   private redirectStarted: boolean = false;
   private resolveBrowserUnavailable!: (error: Error) => void;
   // Resolve with an error rather than reject: a provider can be used without a waiter.
@@ -306,8 +308,21 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
       name: identity.client_name,       // Fallback for non-compliant servers
       description: "MCP Router for aggregating multiple MCP servers",
       grant_types: ["authorization_code", "refresh_token"],
+      ...(this.supportsPublicClientRegistration && !this.staticCredentials
+        ? { token_endpoint_auth_method: "none" }
+        : {}),
       redirect_uris: [`http://localhost:${this.oauthPort}/oauth/callback`]
     };
+  }
+
+  saveDiscoveryState(state: OAuthDiscoveryState): void {
+    // Derived only from the latest discovery; do not retain an old preference.
+    this.supportsPublicClientRegistration =
+      state.authorizationServerMetadata?.token_endpoint_auth_methods_supported?.includes("none") ?? false;
+  }
+
+  get allCredentialsInvalidationCount(): number {
+    return this.allCredentialsInvalidations;
   }
   
   async clientInformation() {
@@ -1084,6 +1099,8 @@ export class SimpleOAuthProvider implements OAuthClientProvider {
   }
 
   async invalidateCredentials(scope: 'all' | 'client' | 'tokens' | 'verifier' | 'discovery' = 'all') {
+    // Capture rejection even if asynchronous credential cleanup subsequently fails.
+    if (scope === 'all') this.allCredentialsInvalidations += 1;
     const oauthError = this.consumeLastOAuthError();
     logger.info("Invalidating OAuth credentials", { 
       package_id: this.packageId,

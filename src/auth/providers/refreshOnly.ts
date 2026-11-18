@@ -1,4 +1,4 @@
-import { OAuthClientProvider } from "@modelcontextprotocol/sdk/client/auth.js";
+import type { OAuthClientProvider, OAuthDiscoveryState } from "@modelcontextprotocol/sdk/client/auth.js";
 import { getLogger } from "../../logging.js";
 import { SimpleOAuthProvider } from "./simple.js";
 import type { OAuthErrorSummary } from "./simple.js";
@@ -23,6 +23,10 @@ export class RefreshOnlyOAuthProvider implements OAuthClientProvider {
   
   get clientMetadata() {
     return this.delegate.clientMetadata;
+  }
+
+  saveDiscoveryState(state: OAuthDiscoveryState): void {
+    this.delegate.saveDiscoveryState(state);
   }
   
   async clientInformation() {

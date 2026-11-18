@@ -420,6 +420,7 @@ export const FINISH_AUTH_TIMEOUT_MS = 30_000;
 // docs/plans/260728_mcp-connector-setup-failures: the message-only rejection
 // was swallowed as non-fatal and reported as "auth_required").
 export const OAUTH_FINISH_AUTH_TIMEOUT_CODE = "OAUTH_FINISH_AUTH_TIMEOUT";
+export const OAUTH_CLIENT_REJECTED_CODE = "OAUTH_CLIENT_REJECTED";
 
 // Re-exported so handleAuthenticate can import both OAuth machine codes from
 // one place (the OAUTH_FINISH_AUTH_TIMEOUT_CODE precedent above). Defined in
@@ -1270,7 +1271,22 @@ export class HttpMcpClient implements McpClient {
       // finishAuth has no timeout of its own; unbounded, a hung token endpoint
       // would eat the desktop host's outer authenticate budget and report the
       // user's completed sign-in as a timeout.
-      const finishAuthPromise = Promise.resolve(this.transport.finishAuth(authCode));
+      const provider = this.simpleOAuthProvider;
+      const invalidationsBeforeFinish = provider?.allCredentialsInvalidationCount;
+      const finishAuthPromise = Promise.resolve(this.transport.finishAuth(authCode)).catch((error: unknown) => {
+        // Only this exchange's rejection is classified; a timeout winner settles
+        // the separate race, and marker-clear/reconnect failures come later.
+        // Earlier invalidations are baseline; the timeout-code passthrough is defensive.
+        // One provider per sign-in attempt means an 'all' invalidation in this
+        // window is the SDK's client-rejection retry.
+        if ((error as { code?: unknown } | null)?.code === OAUTH_FINISH_AUTH_TIMEOUT_CODE) throw error;
+        if (provider && provider.allCredentialsInvalidationCount !== invalidationsBeforeFinish) {
+          throw Object.assign(new Error(OAUTH_CLIENT_REJECTED_CODE, { cause: error }), {
+            code: OAUTH_CLIENT_REJECTED_CODE,
+          });
+        }
+        throw error;
+      });
       let finishAuthTimer: NodeJS.Timeout | undefined;
       try {
         await Promise.race([

@@ -5,7 +5,7 @@ import { Catalog, type CatalogRefreshController } from "../catalog.js";
 import { getLogger } from "../logging.js";
 import { checkPortAvailable, findAvailablePortFromCandidates, getOAuthCallbackPortCandidates, getOAuthCallbackRetryCandidates } from "../utils/portFinder.js";
 import { OAUTH_BROWSER_UNAVAILABLE_CODE, SimpleOAuthProvider } from "../auth/providers/simple.js";
-import { OAUTH_FINISH_AUTH_TIMEOUT_CODE, OAUTH_REDIRECT_URI_REJECTED_CODE } from "../clients/httpClient.js";
+import { OAUTH_CLIENT_REJECTED_CODE, OAUTH_FINISH_AUTH_TIMEOUT_CODE, OAUTH_REDIRECT_URI_REJECTED_CODE } from "../clients/httpClient.js";
 import type { OAuthProbeVerdictTraceEntry } from "../clients/httpClient.js";
 import { buildRedirectUriRejectedError, isAuthorizeProbeDisabled, type AuthorizeProbeVerdict } from "../auth/authorizeProbe.js";
 import { formatError } from "../utils/formatError.js";
@@ -793,6 +793,26 @@ async function handleAuthenticateCore(
         callbackPromise?.catch(() => {});
         fatalConnectErrorPromise?.catch(() => {});
         connectPromise.catch(() => {});
+
+        if ((error as { code?: unknown } | null)?.code === OAUTH_CLIENT_REJECTED_CODE) {
+          logger.warn("OAuth client rejected at token exchange; sign-in attempt ended", { package_id, code: OAUTH_CLIENT_REJECTED_CODE });
+          await discardAttemptClient();
+          return {
+            kind: "response",
+            response: {
+              content: [{
+                type: "text",
+                text: JSON.stringify({
+                  package_id,
+                  status: "error",
+                  error: "Sign-in couldn't finish. Please try connecting again.",
+                  message: OAUTH_CLIENT_REJECTED_CODE,
+                }, null, 2),
+              }],
+              isError: false,
+            },
+          };
+        }
 
         if ((error as { code?: unknown } | null)?.code === OAUTH_BROWSER_UNAVAILABLE_CODE) {
           await discardAttemptClient();
