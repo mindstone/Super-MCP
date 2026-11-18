@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import {
   ERROR_CODES,
   USE_TOOL_HARD_REJECT_META_PARAMS,
@@ -6,6 +7,38 @@ import {
   USE_TOOL_META_PARAMS,
 } from "../src/types.js";
 import { appendErrorAdvice } from "../src/server.js";
+
+const connectorAnsweredCases: { label: string; data: unknown; answered: boolean; outputValidation: boolean }[] = JSON.parse(
+  readFileSync(new URL("./fixtures/connector-answered-cases.json", import.meta.url), "utf8"),
+);
+const downstreamAdviceTails: { outputValidation: string; connectorAnswered: string; restart: string } = JSON.parse(
+  readFileSync(new URL("./fixtures/downstream-advice-tails.json", import.meta.url), "utf8"),
+);
+
+// Advice is pure; importing the server must not open the router's log file.
+vi.mock("../src/logging.js", () => ({
+  getLogger: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn(), fatal: vi.fn() }),
+}));
+
+describe("appendErrorAdvice for downstream errors", () => {
+  const { outputValidation: outputAdvice, connectorAnswered: answeredAdvice, restart: restartAdvice } = downstreamAdviceTails;
+
+  it.each(connectorAnsweredCases)("uses advice based on evidence that the connector answered: $label", ({ data, answered, outputValidation }) => {
+    // JSON cannot express undefined; decode the fixture's absent-data marker.
+    const errorData = typeof data === "object" && data !== null && "$undefined" in data && data.$undefined === true ? undefined : data;
+    const advice = answered ? (outputValidation ? outputAdvice : answeredAdvice) : restartAdvice;
+    const message = "Tool execution failed";
+    expect(appendErrorAdvice(ERROR_CODES.DOWNSTREAM_ERROR, message, errorData)).toBe(message + advice);
+  });
+
+  it("does not advise argument repair or retry after output validation", () => {
+    const advice = appendErrorAdvice(ERROR_CODES.DOWNSTREAM_ERROR, "", { validation_direction: "output", mcp_error_code: -32602 });
+    expect(advice).toBe(outputAdvice);
+    expect(advice).not.toMatch(/get_tool_details|arguments|retry|restart_package/);
+    expect(advice).toContain("Do not restart the connector or repeat the call");
+    expect(advice).toContain("the action may already have happened");
+  });
+});
 
 /**
  * REBEL-7JD drift guards (planner F6 / reviewer-opus F1, F2 / reviewer-kimi F3).

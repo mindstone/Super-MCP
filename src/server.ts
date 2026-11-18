@@ -2,7 +2,7 @@ import { captureToolDispatch } from './fileReadProtocol.js';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import crypto from "node:crypto";
 import type http from "node:http";
 import express from "express";
@@ -118,6 +118,17 @@ type ManifestPackageEntry = {
   status: string;
 };
 
+// This predicate is duplicated in `src/core/rebelCore/mcpClient.ts`; the two
+// copies must stay identical. Both tests use the shared case fixture at
+// `super-mcp/test/fixtures/connector-answered-cases.json`.
+function downstreamConnectorAnswered(data: unknown): data is Record<string, unknown> {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return false;
+  const record = data as Record<string, unknown>;
+  if (record.validation_direction === "output") return true;
+  const code = record.mcp_error_code;
+  return typeof code === "number" && code !== SdkErrorCode.ConnectionClosed && code !== SdkErrorCode.RequestTimeout;
+}
+
 /**
  * Append the code-specific recovery advice super-mcp adds to a thrown handler error
  * before it leaves the CallToolRequest handler.
@@ -161,6 +172,12 @@ export function appendErrorAdvice(code: unknown, message: string, data?: unknown
     case ERROR_CODES.PACKAGE_UNAVAILABLE:
       return message + ". Run 'health_check_all()' to diagnose the issue.";
     case ERROR_CODES.DOWNSTREAM_ERROR:
+      if (downstreamConnectorAnswered(data)) {
+        if (data.validation_direction === "output") {
+          return message + ". The connector replied, but its reply did not match the tool's declared output. Do not restart the connector or repeat the call; the action may already have happened.";
+        }
+        return message + ". The connector answered with its own error. Do not restart the connector for this error. Read its message. If it rejected the input, use 'get_tool_details' to check the arguments and retry with corrected arguments; if the action may already have happened, check before retrying.";
+      }
       return message + ". Check the error details above. If the error persists, try 'restart_package(package_id: \"...\")' to reconnect.";
     case ERROR_CODES.TOOL_BLOCKED:
       return message + ". This tool has been blocked by the security policy.";

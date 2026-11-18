@@ -1,0 +1,5 @@
+{
+  "outputValidation": ". The connector replied, but its reply did not match the tool's declared output. Do not restart the connector or repeat the call; the action may already have happened.",
+  "connectorAnswered": ". The connector answered with its own error. Do not restart the connector for this error. Read its message. If it rejected the input, use 'get_tool_details' to check the arguments and retry with corrected arguments; if the action may already have happened, check before retrying.",
+  "restart": ". Check the error details above. If the error persists, try 'restart_package(package_id: \"...\")' to reconnect."
+}

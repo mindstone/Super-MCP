@@ -1,0 +1,62 @@
+[
+  {
+    "label": "output validation without a code",
+    "data": { "validation_direction": "output" },
+    "answered": true,
+    "outputValidation": true
+  },
+  {
+    "label": "connector MCP error",
+    "data": { "mcp_error_code": -32603 },
+    "answered": true,
+    "outputValidation": false
+  },
+  {
+    "label": "closed connection",
+    "data": { "mcp_error_code": -32000 },
+    "answered": false,
+    "outputValidation": false
+  },
+  {
+    "label": "request timeout",
+    "data": { "mcp_error_code": -32001 },
+    "answered": false,
+    "outputValidation": false
+  },
+  {
+    "label": "no code",
+    "data": {},
+    "answered": false,
+    "outputValidation": false
+  },
+  {
+    "label": "absent data",
+    "data": { "$undefined": true },
+    "answered": false,
+    "outputValidation": false
+  },
+  {
+    "label": "null data",
+    "data": null,
+    "answered": false,
+    "outputValidation": false
+  },
+  {
+    "label": "string code",
+    "data": { "mcp_error_code": "-32603" },
+    "answered": false,
+    "outputValidation": false
+  },
+  {
+    "label": "array data",
+    "data": [],
+    "answered": false,
+    "outputValidation": false
+  },
+  {
+    "label": "output validation with invalid params code",
+    "data": { "validation_direction": "output", "mcp_error_code": -32602 },
+    "answered": true,
+    "outputValidation": true
+  }
+]
