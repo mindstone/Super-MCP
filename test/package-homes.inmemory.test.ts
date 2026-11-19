@@ -19,6 +19,7 @@ import { handleListTools } from '../src/handlers/listTools.js';
 import { handleReadResource } from '../src/handlers/readResource.js';
 import { SecurityPolicy, setSecurityPolicy } from '../src/security.js';
 import { ERROR_CODES } from '../src/types.js';
+import { toolCallFailure } from '../src/toolCallFailure.js';
 
 const logger = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }));
 vi.mock('../src/logging.js', () => ({ getLogger: () => logger }));
@@ -80,6 +81,15 @@ function desktop() {
     mcpServers: { notebook: { command: '/must-never-run', name: 'Fictional Notes' } },
     packageHomes: { notebook: { url: 'https://cloud.example.test/mcp/packages/notebook', headers: { Authorization: 'Bearer fictional' } } },
   }));
+}
+
+/** The tools/call answer a failing use_tool gets from the router's catch. */
+async function useToolWire(registry: PackageRegistry, catalog: Catalog): Promise<{ code: number; message: string; data: Record<string, unknown> }> {
+  const error = await handleUseTool({ package_id: 'notebook', tool_id: 'write_note', args: { text: 'paused' } }, registry, catalog, getValidator()).then(
+    () => { throw new Error('use_tool did not fail'); },
+    (caught: unknown) => caught,
+  );
+  return toolCallFailure('use_tool', error, registry.getPackages({ safe_only: false })) as never;
 }
 
 async function signInHome() {
@@ -249,7 +259,7 @@ describe('package homes over in-memory streamable HTTP', () => {
     expect(StdioMcpClient.prototype.callTool).not.toHaveBeenCalled();
   });
 
-  it.each([false, true])('returns exactly the paused text on consecutive use_tool calls (warm catalog: %s)', async warm => {
+  it.each([false, true])('returns exactly the paused text, marked on the wire, on consecutive use_tool calls (warm catalog: %s)', async warm => {
     const cloud = keep(new PackageRegistry({ mcpServers: { notebook: entry } }));
     harness(cloud);
     const registry = desktop();
@@ -257,9 +267,47 @@ describe('package homes over in-memory streamable HTTP', () => {
     if (warm) await catalog.ensurePackageLoaded('notebook');
     vi.stubGlobal('fetch', async () => new Response('Unavailable', { status: 503 }));
     for (let attempt = 0; attempt < 2; attempt++) {
-      await expect(handleUseTool({ package_id: 'notebook', tool_id: 'write_note', args: { text: 'paused' } }, registry, catalog, getValidator())).rejects.toMatchObject({ message: paused });
+      // Cold: the first call's refresh leaves an errored catalog, which the second call meets.
+      const wire = await useToolWire(registry, catalog);
+      expect(wire.message).toContain(paused);
+      expect(wire.data).toMatchObject({ home_failure: 'unreachable' });
     }
     expect(StdioMcpClient.prototype.callTool).not.toHaveBeenCalled();
+  });
+
+  it('marks an errored catalog only while its home is unreachable', async () => {
+    const cloud = keep(new PackageRegistry({ mcpServers: { notebook: entry } }));
+    harness(cloud);
+    const reachable = globalThis.fetch;
+    const registry = desktop();
+    const catalog = new Catalog(registry);
+    const refreshWith = async (answer: typeof fetch) => {
+      vi.stubGlobal('fetch', answer);
+      await catalog.refreshPackage('notebook');
+    };
+    const expectPaused = async () => {
+      const wire = await useToolWire(registry, catalog);
+      expect(wire).toMatchObject({ code: ERROR_CODES.PACKAGE_UNAVAILABLE, data: { status: 'error', home_failure: 'unreachable' } });
+      expect(wire.message).toContain(paused);
+    };
+
+    await refreshWith(async () => new Response('Unavailable', { status: 503 }));
+    await expectPaused();
+    // Recovery: the ready commit clears the marker.
+    await refreshWith(reachable);
+    expect(catalog.getPackageStatus('notebook')).toBe('ready');
+    expect(catalog.getPackageHomeFailure('notebook')).toBeUndefined();
+    expect(JSON.stringify(await handleUseTool({ package_id: 'notebook', tool_id: 'write_note', args: { text: 'back' } }, registry, catalog, getValidator()))).toContain('back');
+
+    await refreshWith(async () => new Response('Unavailable', { status: 503 }));
+    await expectPaused();
+    // An unrelated failure (the home answers 500, which is not a pause) replaces it unmarked.
+    await refreshWith(async () => new Response('Broken', { status: 500 }));
+    const wire = await useToolWire(registry, catalog);
+    expect(wire).toMatchObject({ code: ERROR_CODES.PACKAGE_UNAVAILABLE, data: { status: 'error' } });
+    expect(wire.data).not.toHaveProperty('home_failure');
+    expect(wire.message).not.toContain(paused);
+    expect(catalog.getPackageHomeFailure('notebook')).toBeUndefined();
   });
 
   it.each([false, true])('treats a home 401 as a cloud bearer failure (warm catalog: %s)', async warm => {

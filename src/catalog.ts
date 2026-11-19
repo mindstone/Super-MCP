@@ -12,6 +12,7 @@ import { oauthErrorLogText } from "./auth/oauthErrorLogging.js";
 import { mentionsStatus401 } from "./auth/authLikeVocabulary.js";
 import { ERROR_CODES } from "./types.js";
 import { redactConnectorSecrets } from "./connectorLabels.js";
+import { homeFailureOf, type HomeFailure } from "./clients/packageHomeClient.js";
 
 const logger = getLogger();
 const LEGACY_ERROR_RETRY_INTERVAL_MS = 60_000;
@@ -65,6 +66,8 @@ interface PackageToolCache {
   generation: number;
   nextAuthProbeAt: number | null;
   failureClass?: CatalogFailureClass;
+  /** Set only by an error-status failure whose cloud home could not be reached; any later commit replaces it. */
+  homeFailure?: HomeFailure;
   packageIdentity: string;
 }
 
@@ -115,6 +118,8 @@ export interface CatalogFailureState {
   /** Sanitized text for logging only; not persisted in the catalog cache. */
   logError?: string;
   failureClass?: CatalogFailureClass;
+  /** From `categorizeError`: the cloud home could not be reached, so the connector is paused. */
+  homeFailure?: HomeFailure;
   nextRetryAt: number | null;
   nextAuthProbeAt: number | null;
 }
@@ -172,6 +177,7 @@ export interface CatalogView {
   getPackageStatus(packageId: string): CatalogStatus | 'unknown';
   getRefreshInFlight(packageId: string): boolean;
   getPackageError(packageId: string): string | undefined;
+  getPackageHomeFailure(packageId: string): HomeFailure | undefined;
   getRetryHint(packageId: string, now?: number): CatalogRetryHint;
   getPackageDiagnostics(packageId: string): CatalogPackageDiagnostics;
   listDegraded(now?: number): DegradedCatalogPackage[];
@@ -382,6 +388,7 @@ export class Catalog implements CatalogView {
       generation,
       nextAuthProbeAt: failure.nextAuthProbeAt,
       failureClass: failure.failureClass,
+      homeFailure: failure.status === "error" ? failure.homeFailure : undefined,
       packageIdentity: packageIdentity(this.registry.getPackage(packageId), packageId),
     };
     this.cache.set(packageId, failed);
@@ -764,6 +771,11 @@ export class Catalog implements CatalogView {
       this.registry.setupBlockReason(packageId);
   }
 
+  /** Why the package's cloud home failed its last catalog refresh, while that failure stands. */
+  getPackageHomeFailure(packageId: string): HomeFailure | undefined {
+    return this.cache.get(packageId)?.homeFailure;
+  }
+
   getRetryHint(packageId: string, now: number = Date.now()): CatalogRetryHint {
     const cached = this.cache.get(packageId);
     if (!cached) {
@@ -856,6 +868,7 @@ export class Catalog implements CatalogView {
     status: "auth_required" | "error";
     lastError?: string;
     logError?: string;
+    homeFailure?: HomeFailure;
   } {
     const pkg = this.registry.getPackage(packageId);
     const rawMessage = error instanceof Error ? error.message : String(error);
@@ -881,10 +894,12 @@ export class Catalog implements CatalogView {
       };
     }
 
+    const homeFailure = homeFailureOf(error);
     return {
       status: "error",
       lastError: message,
       logError: oauthErrorLogText(error, message),
+      ...(homeFailure && { homeFailure }),
     };
   }
 

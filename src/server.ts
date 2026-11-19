@@ -2,11 +2,12 @@ import { captureToolDispatch } from './fileReadProtocol.js';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import crypto from "node:crypto";
 import type http from "node:http";
 import express from "express";
 import { ERROR_CODES } from "./types.js";
+import { toolCallFailure } from "./toolCallFailure.js";
 import { PackageRegistry } from "./registry.js";
 import { Catalog } from "./catalog.js";
 import { CatalogRefresher } from "./catalogRefresher.js";
@@ -117,74 +118,6 @@ type ManifestPackageEntry = {
   embedding_hash: string;
   status: string;
 };
-
-// This predicate is duplicated in `src/core/rebelCore/mcpClient.ts`; the two
-// copies must stay identical. Both tests use the shared case fixture at
-// `super-mcp/test/fixtures/connector-answered-cases.json`.
-function downstreamConnectorAnswered(data: unknown): data is Record<string, unknown> {
-  if (typeof data !== "object" || data === null || Array.isArray(data)) return false;
-  const record = data as Record<string, unknown>;
-  if (record.validation_direction === "output") return true;
-  const code = record.mcp_error_code;
-  return typeof code === "number" && code !== SdkErrorCode.ConnectionClosed && code !== SdkErrorCode.RequestTimeout;
-}
-
-/**
- * Append the code-specific recovery advice super-mcp adds to a thrown handler error
- * before it leaves the CallToolRequest handler.
- *
- * Extracted from the handler's catch block so the suppression gate below is unit
- * testable: every other test drives the handlers directly, well below this layer, so
- * the gate was previously an untested inline closure (reviewer-opus F2 / kimi F3 /
- * planner F7).
- */
-export function appendErrorAdvice(code: unknown, message: string, data?: unknown): string {
-  switch (code) {
-    case ERROR_CODES.PACKAGE_NOT_FOUND:
-      return message + ". Run 'list_tool_packages()' to see available packages.";
-    case ERROR_CODES.TOOL_NOT_FOUND:
-      return message + ". Try 'search_tools(query: \"...\")' to find tools by intent, or 'list_tools(package_id: \"...\", detail: \"lite\")' to browse.";
-    case ERROR_CODES.ARG_VALIDATION_FAILED: {
-      // Dispatch-stage failures (parseUseToolInput) already carry their own recovery
-      // guidance and, for misplaced meta-params, the exact corrected call shape. The
-      // generic schema advice contradicts or dilutes that, so suppress it for the
-      // whole dispatch stage. See handlers/useToolInput.ts.
-      if ((data as { validation_stage?: unknown } | undefined)?.validation_stage === "dispatch") {
-        return message;
-      }
-      // REBEL-7JD residue R9: same reasoning, stage-independent. A repair ticket
-      // that teaches a MISPLACEMENT already names the exact corrected call shape, so
-      // ". Use 'get_tool_details' … or 'dry_run: true' to test arguments" is at best
-      // noise and at worst self-contradictory — the misplaced param is often
-      // `dry_run` itself. Keyed on the ticket, not the stage, so the validation-stage
-      // declared-property gate (handlers/useTool.ts) is covered too. Plain validation
-      // failures with no misplacement keep the advice.
-      const misplacedParams = (
-        data as { repair_ticket?: { misplaced_params?: unknown } } | undefined
-      )?.repair_ticket?.misplaced_params;
-      if (Array.isArray(misplacedParams) && misplacedParams.length > 0) {
-        return message;
-      }
-      return message + ". Use 'get_tool_details' to review the schema, or 'dry_run: true' to test arguments.";
-    }
-    case ERROR_CODES.AUTH_REQUIRED:
-      return message + ". Run 'authenticate(package_id: \"...\")' to connect this package.";
-    case ERROR_CODES.PACKAGE_UNAVAILABLE:
-      return message + ". Run 'health_check_all()' to diagnose the issue.";
-    case ERROR_CODES.DOWNSTREAM_ERROR:
-      if (downstreamConnectorAnswered(data)) {
-        if (data.validation_direction === "output") {
-          return message + ". The connector replied, but its reply did not match the tool's declared output. Do not restart the connector or repeat the call; the action may already have happened.";
-        }
-        return message + ". The connector answered with its own error. Do not restart the connector for this error. Read its message. If it rejected the input, use 'get_tool_details' to check the arguments and retry with corrected arguments; if the action may already have happened, check before retrying.";
-      }
-      return message + ". Check the error details above. If the error persists, try 'restart_package(package_id: \"...\")' to reconnect.";
-    case ERROR_CODES.TOOL_BLOCKED:
-      return message + ". This tool has been blocked by the security policy.";
-    default:
-      return message;
-  }
-}
 
 /**
  * Read `?packages=`: one id per repeated parameter, or the older comma-joined
@@ -1138,24 +1071,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           error: oauthErrorLogText(error, formatError(error)),
         });
 
-        // A connector's error may quote its address, command or arguments, and so a key.
-        const connectorConfigs = registry.getPackages({ safe_only: false });
-        if (error && typeof error === "object" && "code" in error) {
-          throw redactConnectorSecretsDeep({
-            ...error,
-            message: appendErrorAdvice(
-              (error as any).code,
-              (error as any).message,
-              (error as any).data,
-            ),
-          }, connectorConfigs);
-        }
-
-        throw redactConnectorSecretsDeep({
-          code: ERROR_CODES.INTERNAL_ERROR,
-          message: `${formatError(error)}. Try 'get_help(topic: "error_handling")' for general troubleshooting.`,
-          data: { tool_name: name },
-        }, connectorConfigs);
+        throw toolCallFailure(name, error, registry.getPackages({ safe_only: false }));
       }
     });
 

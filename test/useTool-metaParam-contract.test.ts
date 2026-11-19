@@ -6,7 +6,7 @@ import {
   USE_TOOL_INPUT_FIELD_CLASSIFICATION,
   USE_TOOL_META_PARAMS,
 } from "../src/types.js";
-import { appendErrorAdvice } from "../src/server.js";
+import { appendErrorAdvice } from "../src/toolCallFailure.js";
 
 const connectorAnsweredCases: { label: string; data: unknown; answered: boolean; outputValidation: boolean }[] = JSON.parse(
   readFileSync(new URL("./fixtures/connector-answered-cases.json", import.meta.url), "utf8"),

@@ -12,6 +12,20 @@ import { getLogger } from "../logging.js";
 import { installReturnedFiles, returnedFileFailure, stripReturnedFiles } from "../returnedFiles.js";
 import { failDroppedAnswers } from "./failDroppedAnswers.js";
 
+/**
+ * Why a package's cloud home failed a call, as a closed value. `unreachable`: the
+ * home could not be reached, so the connector is paused (FOX-11451). The router's
+ * tools/call catch forwards it to the host as `data.home_failure`.
+ */
+export type HomeFailure = "unreachable";
+const HOME_FAILURE = Symbol("superMcp.homeFailure");
+
+/** The home failure `unreachableError` marked on this error, if any. */
+export function homeFailureOf(error: unknown): HomeFailure | undefined {
+  if (!(error instanceof Error)) return undefined;
+  return (error as Error & { [HOME_FAILURE]?: unknown })[HOME_FAILURE] === "unreachable" ? "unreachable" : undefined;
+}
+
 export class PackageHomeClient implements McpClient {
   private client = new Client(getMcpClientInfo());
   private transport: StreamableHTTPClientTransport;
@@ -55,7 +69,9 @@ export class PackageHomeClient implements McpClient {
   }
 
   unreachableError(cause: unknown): Error {
-    return new Error(`Your cloud isn't reachable, so ${this.config.name} is paused for now. An action that was in progress may already have happened; check its outcome before trying again.`, { cause });
+    const error = new Error(`Your cloud isn't reachable, so ${this.config.name} is paused for now. An action that was in progress may already have happened; check its outcome before trying again.`, { cause });
+    // No `code`, so the router's advice and wording stay as they are; only the marker is added.
+    return Object.defineProperty(error, HOME_FAILURE, { value: "unreachable" satisfies HomeFailure, enumerable: false });
   }
 
   async connect(): Promise<void> {

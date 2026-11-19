@@ -1704,10 +1704,12 @@ export async function handleUseTool(
   }
   if (packageStatus === "error") {
     const reason = catalog.getPackageError(package_id) || "See logs for details";
+    const homed = registry.isPackageHomed?.(package_id) === true;
+    const homeFailure = homed ? catalog.getPackageHomeFailure(package_id) : undefined;
     throw {
       code: ERROR_CODES.PACKAGE_UNAVAILABLE,
-      message: registry.isPackageHomed?.(package_id) ? reason : `Package '${package_id}' is unavailable: ${reason}`,
-      data: { package_id, status: packageStatus },
+      message: homed ? reason : `Package '${package_id}' is unavailable: ${reason}`,
+      data: { package_id, status: packageStatus, ...(homeFailure && { home_failure: homeFailure }) },
     };
   }
 
