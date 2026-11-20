@@ -12,6 +12,8 @@ import { ProgressNotificationSchema, type ProgressNotification, type Progress } 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { PackageRegistry } from '../src/registry.js';
 import { PackageHomeClient } from '../src/clients/packageHomeClient.js';
+import { HttpMcpClient } from '../src/clients/httpClient.js';
+import { StdioMcpClient } from '../src/clients/stdioClient.js';
 import { createPackageServer } from '../src/packageEndpoint.js';
 import { captureToolDispatch, childCallContext, relayToolProgress, type ToolDispatchContext } from '../src/fileReadProtocol.js';
 import { SecurityPolicy, setSecurityPolicy } from '../src/security.js';
@@ -234,6 +236,24 @@ it('drains delayed sends in order and remaps only the hop token', async () => {
   await started.promise; expect(settled).toBe(false); release.resolve(); expect(await result).toHaveProperty('structuredContent.kept', true);
   expect(seen).toEqual([1, 2].map(value => ({ method: 'notifications/progress', params: { ...progress, progress: value, progressToken: 0 } })));
   callback({ ...progress, progress: 3 }); await Promise.resolve(); expect(seen).toHaveLength(2);
+});
+it.each(['stdio', 'http', 'package home'] as const)('keeps dispatch evidence false when the %s relay starts aborted', async kind => {
+  const abort = new AbortController(); const stopped = new Error('Stopped before relay dispatch');
+  const connectorDispatch = { started: false };
+  const config = { id: 'fixture', name: 'Fixture', transport: 'stdio' as const, visibility: 'default' as const };
+  const client = kind === 'stdio' ? new StdioMcpClient(config.id, config)
+    : kind === 'http' ? new HttpMcpClient(config.id, { ...config, transport: 'http', base_url: 'https://example.test/mcp' })
+    : new PackageHomeClient(config, { url: 'https://example.test/mcp' });
+  if (kind === 'http') Reflect.set(client, 'isConnected', true);
+  const send = vi.spyOn(Client.prototype, 'callTool').mockResolvedValue({ content: [] });
+  // The transport is read after the client's preflight, immediately before entering the relay.
+  const transport = vi.spyOn(Client.prototype, 'transport', 'get').mockImplementation(() => {
+    abort.abort(stopped); return undefined;
+  });
+  await expect(client.callTool('plain', {}, childCallContext({ kind: 'standalone', signal: abort.signal, connectorDispatch },
+    { version: 1, mode: 'standalone' }))).rejects.toBe(stopped);
+  expect(transport).toHaveBeenCalledTimes(1);
+  expect(send).not.toHaveBeenCalled(); expect(connectorDispatch.started).toBe(false);
 });
 it('logs asynchronous forwarding failures', async () => {
   logs.warn.mockClear(); const send = vi.fn().mockRejectedValue(new Error('Synthetic failure'));

@@ -1,7 +1,14 @@
+import { HttpMcpClient } from '../src/clients/httpClient.js';
+import { StdioMcpClient } from '../src/clients/stdioClient.js';
+import { PackageHomeClient } from '../src/clients/packageHomeClient.js';
+import { StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { McpError } from '@modelcontextprotocol/sdk/types.js';
+import { childCallContext, type ToolDispatchContext } from '../src/fileReadProtocol.js';
+import { toolCallFailure } from '../src/toolCallFailure.js';
 import { describe, expect, it, vi } from "vitest";
 import { handleUseTool } from "../src/handlers/useTool.js";
 import { ERROR_CODES, type PackageConfig } from "../src/types.js";
-import type { PackageRegistry } from "../src/registry.js";
+import { PackageRegistry } from "../src/registry.js";
 import type { Catalog } from "../src/catalog.js";
 import { Validator, type ValidationResult } from "../src/validator.js";
 
@@ -702,5 +709,188 @@ describe("useTool misplaced meta-param rejection", () => {
     expect(response._meta?.superMcp).toMatchObject({ staged: true });
     expect(mockValidator.validate).not.toHaveBeenCalled();
     expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+});
+
+const neverDispatchedKey = 'superMcp/neverDispatched';
+// Mirror the server's request scope: proof belongs to the invocation, not its error.
+async function routerCall(...params: Parameters<typeof handleUseTool>) {
+  const evidence = { started: false };
+  params[4] = { ...params[4], dispatch: { ...(params[4]?.dispatch ?? { kind: 'standalone' }), connectorDispatch: evidence } };
+  try { return await handleUseTool(...params); }
+  catch (error) { throw toolCallFailure('use_tool', error, [], !evidence.started); }
+}
+
+async function wireFailure(call: Promise<unknown>) {
+  try { await call; } catch (error) { return error as { data: Record<string, unknown> }; }
+  throw new Error('Expected a router failure');
+}
+
+describe('router-owned never-dispatched evidence', () => {
+  const input = { package_id: 'pkg1', tool_id: 'tool1', args: {} };
+  it.each([
+    ['unknown package', { ...input, package_id: 'absent' }, ERROR_CODES.PACKAGE_NOT_FOUND],
+    ['unknown tool', { ...input, tool_id: 'absent' }, ERROR_CODES.TOOL_NOT_FOUND],
+    ['invalid arguments', { ...input, args: 'not-json' }, ERROR_CODES.ARG_VALIDATION_FAILED],
+  ])('proves %s without sending', async (_name, request, code) => {
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createMocks();
+    const failure = await wireFailure(routerCall(request as typeof input, mockRegistry, mockCatalog, mockValidator));
+    expect(failure).toMatchObject({ code, data: { [neverDispatchedKey]: true } });
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it('proves an invalid envelope and an ambiguous tool never dispatched', async () => {
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createMocks({
+      packages: [makePackageConfig('pkg1'), makePackageConfig('pkg2')],
+      toolMatches: [{ packageId: 'pkg1', toolId: 'tool1' }, { packageId: 'pkg2', toolId: 'tool1' }],
+    });
+    for (const request of [undefined, { tool_id: 'tool1', args: {} }]) {
+      const failure = await wireFailure(routerCall(request as unknown as Parameters<typeof handleUseTool>[0], mockRegistry, mockCatalog, mockValidator));
+      expect(failure.data[neverDispatchedKey]).toBe(true);
+    }
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it.each(['schema validation', 'registry acquisition', 'auth_required', 'setup_incomplete'])('proves %s before sending', async scenario => {
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createMocks(scenario === 'schema validation'
+      ? { realValidator: true, schema: { type: 'object', properties: { target: { type: 'string' } }, required: ['target'] } } : {});
+    if (scenario === 'registry acquisition') mockRegistry.callTool = vi.fn().mockRejectedValue(new Error('Unavailable'));
+    else if (scenario !== 'schema validation') vi.mocked(mockCatalog.getPackageStatus).mockReturnValue(scenario as 'auth_required');
+    const failure = await wireFailure(routerCall(input, mockRegistry, mockCatalog, mockValidator));
+    expect(failure.data[neverDispatchedKey]).toBe(true);
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it.each(['http', 'stdio', 'home'] as const)('never trusts returned or thrown connector proof after a %s send', async transport => {
+    for (const outcome of ['returned', 'thrown', 'validation'] as const) {
+      const { mockRegistry, mockCatalog, mockValidator } = createMocks();
+      mockRegistry.isPackageHomed = () => transport === 'home';
+      const send = vi.fn();
+      const config = makePackageConfig('pkg1');
+      const client = transport === 'http' ? new HttpMcpClient('pkg1', config)
+        : transport === 'stdio' ? new StdioMcpClient('pkg1', config)
+        : new PackageHomeClient(config, { url: 'https://example.test/mcp' });
+      Object.assign(client, { isConnected: true, client: { callTool: send, getServerCapabilities: () => ({}) } });
+      mockRegistry.callTool = (_pkg, name, args, context) => client instanceof PackageHomeClient
+        ? client.callToolFromOrigin(name, args, context)
+        : client.callTool(name, args, childCallContext(context, { version: 1, mode: 'standalone' }));
+      if (outcome === 'returned') send.mockResolvedValue({ isError: true, content: [{ type: 'text', text: 'failed' }],
+        _meta: { superMcp: { neverDispatched: true } }, structuredContent: { [neverDispatchedKey]: true } });
+      else send.mockRejectedValue(new McpError(outcome === 'validation' ? -32602 : -33004, 'Failed after send', { [neverDispatchedKey]: true }));
+      const call = routerCall(input, mockRegistry, mockCatalog, mockValidator);
+      if (outcome === 'returned') {
+        const result = await call;
+        expect(result.isError).toBe(true);
+        expect(result._meta.superMcp.neverDispatched).toBeUndefined();
+      } else {
+        const failure = await wireFailure(call);
+        expect(failure.data[neverDispatchedKey]).toBeUndefined();
+      }
+      expect(send).toHaveBeenCalledOnce();
+    }
+  });
+
+  it('removes a connector-supplied wire marker even on a directly rethrown error', () => {
+    const failure = toolCallFailure('use_tool', { code: -33004, message: 'failed',
+      data: { [neverDispatchedKey]: true, detail: 'unchanged' } }, []);
+    expect(failure).toMatchObject({ data: { detail: 'unchanged' } });
+    expect((failure as { data: object }).data).not.toHaveProperty(neverDispatchedKey);
+  });
+
+  it('adds proof without changing a plain continuation error result', async () => {
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createMocks();
+    const result = await routerCall({ ...input, result_id: 'cached' }, mockRegistry, mockCatalog, mockValidator);
+    expect(result).toMatchObject({ isError: true, content: [{ type: 'text', text: 'Error: output_offset is required when using result_id.' }],
+      _meta: { superMcp: { neverDispatched: true } } });
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  });
+
+  it('proves an HTTP client disconnected before sending', async () => {
+    const { mockRegistry, mockCatalog, mockValidator } = createMocks();
+    const client = new HttpMcpClient('pkg1', makePackageConfig('pkg1'));
+    const send = vi.fn();
+    Object.assign(client, { client: { callTool: send } });
+    mockRegistry.callTool = (_pkg, name, args, context) => client.callTool(name, args, childCallContext(context));
+    const failure = await wireFailure(routerCall(input, mockRegistry, mockCatalog, mockValidator));
+    expect(failure.data[neverDispatchedKey]).toBe(true);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it('retains the first home send when registry retry acquisition fails before its send', async () => {
+    const { mockRegistry, mockCatalog, mockValidator } = createMocks();
+    const registry = new PackageRegistry({ mcpServers: { pkg1: { command: 'unused' } } });
+    const client = new PackageHomeClient(registry.getPackage('pkg1')!, { url: 'https://example.test/mcp' });
+    const send = vi.fn().mockRejectedValue(new StreamableHTTPError(404, 'Session gone'));
+    Object.assign(client, { client: { callTool: send, getServerCapabilities: () => ({}) } });
+    vi.spyOn(registry, 'getClient').mockResolvedValueOnce(client).mockRejectedValueOnce(new Error('Retry unavailable'));
+    mockRegistry.callTool = registry.callTool.bind(registry);
+    const failure = await wireFailure(routerCall(input, mockRegistry, mockCatalog, mockValidator));
+    expect(failure.data[neverDispatchedKey]).toBeUndefined();
+    expect(send).toHaveBeenCalledOnce();
+    expect(registry.getClient).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['acquisition failure', 'replacement send'] as const)('tracks stdio closed-transport re-establishment: %s', async outcome => {
+    const { mockRegistry, mockCatalog, mockValidator } = createMocks();
+    const registry = new PackageRegistry({ mcpServers: { pkg1: { command: 'unused' } } });
+    const config = registry.getPackage('pkg1')!;
+    const closed = new StdioMcpClient('pkg1', config);
+    const oldSend = vi.fn();
+    Object.assign(closed, { client: { callTool: oldSend } });
+    vi.spyOn(closed, 'isTransportClosed').mockReturnValue(true);
+    const replacement = new StdioMcpClient('pkg1', config);
+    const send = vi.fn().mockRejectedValue(new McpError(-33004, 'Failed after replacement send', { [neverDispatchedKey]: true }));
+    Object.assign(replacement, { isConnected: true, client: { callTool: send, getServerCapabilities: () => ({}) } });
+    vi.spyOn(replacement, 'isTransportClosed').mockReturnValue(false);
+    const getClient = vi.spyOn(registry, 'getClient').mockResolvedValueOnce(closed);
+    if (outcome === 'acquisition failure') getClient.mockRejectedValueOnce(new Error('Replacement unavailable'));
+    else getClient.mockResolvedValueOnce(replacement);
+    mockRegistry.callTool = registry.callTool.bind(registry);
+
+    const failure = await wireFailure(routerCall(input, mockRegistry, mockCatalog, mockValidator));
+    expect(oldSend).not.toHaveBeenCalled();
+    expect(getClient).toHaveBeenCalledTimes(2);
+    expect(send).toHaveBeenCalledTimes(outcome === 'replacement send' ? 1 : 0);
+    expect(failure.data[neverDispatchedKey]).toBe(outcome === 'acquisition failure' ? true : undefined);
+  });
+
+  it('keeps proof invocation-local when concurrent calls share an acquisition error', async () => {
+    const { mockRegistry, mockCatalog, mockValidator } = createMocks();
+    const shared = new Error('Shared acquisition failure');
+    mockRegistry.isPackageHomed = () => true;
+    mockRegistry.callTool = async (_pkg, _name, args, context) => {
+      if (args.dispatched && context.connectorDispatch) context.connectorDispatch.started = true;
+      throw shared;
+    };
+    const evidence = [{ started: false }, { started: false }];
+    const failures = await Promise.allSettled([
+      handleUseTool({ ...input, args: { dispatched: true } }, mockRegistry, mockCatalog, mockValidator,
+        { dispatch: { kind: 'standalone', connectorDispatch: evidence[0] } }),
+      handleUseTool(input, mockRegistry, mockCatalog, mockValidator,
+        { dispatch: { kind: 'standalone', connectorDispatch: evidence[1] } }),
+    ]);
+    const [dispatched, early] = failures.map((outcome, index) => {
+      if (outcome.status !== 'rejected') throw new Error('Expected acquisition failure');
+      expect(outcome.reason).toBe(shared);
+      return toolCallFailure('use_tool', outcome.reason, [], !evidence[index].started) as { data: Record<string, unknown> };
+    });
+    expect(dispatched.data[neverDispatchedKey]).toBeUndefined();
+    expect(early.data[neverDispatchedKey]).toBe(true);
+  });
+
+  it('keeps concurrent invocation evidence independent', async () => {
+    const { mockRegistry, mockCatalog, mockValidator } = createMocks();
+    let finish!: () => void;
+    mockRegistry.callTool = async (_pkg, _name, _args, context: ToolDispatchContext) => {
+      if (context.connectorDispatch) context.connectorDispatch.started = true;
+      await new Promise<void>(resolve => { finish = resolve; });
+      throw new Error('Dispatched failure');
+    };
+    const dispatched = routerCall(input, mockRegistry, mockCatalog, mockValidator);
+    await vi.waitFor(() => expect(finish).toBeTypeOf('function'));
+    const early = await wireFailure(routerCall({ ...input, package_id: 'absent' }, mockRegistry, mockCatalog, mockValidator));
+    finish();
+    expect(early.data[neverDispatchedKey]).toBe(true);
+    expect((await wireFailure(dispatched)).data[neverDispatchedKey]).toBeUndefined();
   });
 });

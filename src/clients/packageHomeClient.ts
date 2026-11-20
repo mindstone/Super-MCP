@@ -87,7 +87,7 @@ export class PackageHomeClient implements McpClient {
     });
   }
   async callTool(name: string, args: unknown, context: ChildToolCallContext = { readMode: "unnegotiated" }) {
-    return this.callToolFromOrigin(name, args, { kind: 'standalone', signal: context.signal, metadata: context.metadata, onprogress: context.onprogress });
+    return this.callToolFromOrigin(name, args, { kind: 'standalone', signal: context.signal, metadata: context.metadata, onprogress: context.onprogress, connectorDispatch: context.connectorDispatch });
   }
   async callToolFromOrigin(name: string, args: unknown, context: ToolDispatchContext = standaloneDispatch) {
     assertDispatchActive(context);
@@ -106,12 +106,15 @@ export class PackageHomeClient implements McpClient {
     if (tooLarge) return { isError: true, content: [{ type: "text" as const, text: forwardedFilesTooLargeMessage(bytes, this.config.name) }] };
     assertDispatchActive(context);
     // No replay after dispatch, even if the response is lost.
-    const result = await this.request(() => relayToolProgress(context, timeout, options => this.client.callTool({ name, arguments: args as Record<string, unknown>,
-      _meta: { "rebel/returnFiles": { version: 1 }, ...(files.length ? { "rebel/forwardedFiles": files } : {}) },
-    }, undefined, {
-      // Stop reaches the home, so a call still queued there is never sent.
-      timeout, ...options,
-    }), this.client.transport));
+    const result = await this.request(() => relayToolProgress(context, timeout, options => {
+      if (context.connectorDispatch) context.connectorDispatch.started = true;
+      return this.client.callTool({ name, arguments: args as Record<string, unknown>,
+        _meta: { "rebel/returnFiles": { version: 1 }, ...(files.length ? { "rebel/forwardedFiles": files } : {}) },
+      }, undefined, {
+        // Stop reaches the home, so a call still queued there is never sent.
+        timeout, ...options,
+      });
+    }, this.client.transport));
     // Delivery failures describe an already-finished action; never enter request/replay logic.
     const clean = stripReturnedFiles(result);
     try { return await installReturnedFiles(result, getWorkspacePath(), context.signal); }

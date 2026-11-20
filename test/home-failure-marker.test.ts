@@ -36,10 +36,12 @@ function homedRouter() {
 }
 
 async function routerFailure(registry: PackageRegistry, catalog: Catalog): Promise<unknown> {
+  const evidence = { started: false };
   try {
-    await handleUseTool({ package_id: 'notebook', tool_id: 'write_note', args: { text: 'a note' } }, registry, catalog, getValidator());
+    await handleUseTool({ package_id: 'notebook', tool_id: 'write_note', args: { text: 'a note' } }, registry, catalog, getValidator(),
+      { dispatch: { kind: 'standalone', connectorDispatch: evidence } });
   } catch (error) {
-    return { thrown: error, wire: toolCallFailure('use_tool', error, registry.getPackages({ safe_only: false })) };
+    return { thrown: error, wire: toolCallFailure('use_tool', error, registry.getPackages({ safe_only: false }), !evidence.started) };
   }
   throw new Error('use_tool did not fail');
 }
@@ -64,7 +66,7 @@ describe('a paused package home reaches the tools/call answer with its marker', 
     expect(wire).toEqual({
       code: ERROR_CODES.INTERNAL_ERROR,
       message: paused + advice,
-      data: { tool_name: 'use_tool', home_failure: 'unreachable' },
+      data: { tool_name: 'use_tool', home_failure: 'unreachable', 'superMcp/neverDispatched': true },
     });
   });
 

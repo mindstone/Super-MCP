@@ -1064,13 +1064,16 @@ export class HttpMcpClient implements McpClient {
     return this.enqueue(async () => {
       context.signal?.throwIfAborted();
       try {
-        const response = await relayToolProgress(context, timeout, options => this.client.callTool({
-          name,
-          arguments: args || {},
-        }, undefined, {
-          timeout,
-          ...options,
-        }), this.client.transport);
+        const response = await relayToolProgress(context, timeout, options => {
+          if (context.connectorDispatch) context.connectorDispatch.started = true;
+          return this.client.callTool({
+            name,
+            arguments: args || {},
+          }, undefined, {
+            timeout,
+            ...options,
+          });
+        }, this.client.transport);
         return response;
       } catch (error) {
         logger.error("Tool call failed", {

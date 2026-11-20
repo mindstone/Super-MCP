@@ -33,10 +33,11 @@ export type OriginExtra = Pick<RequestHandlerExtra<Request, Notification>, 'send
 type ProgressContext = { onprogress?: (progress: Progress) => void | Promise<void> };
 
 /** This is request context, never part of model arguments. */
-export type ToolDispatchContext = ProgressContext & (
+export interface ConnectorDispatchEvidence { started: boolean }
+export type ToolDispatchContext = ProgressContext & { connectorDispatch?: ConnectorDispatchEvidence } & (
   | { kind: 'standalone'; signal?: AbortSignal; metadata?: Record<string, unknown> }
   | ({ kind: 'origin'; authority: unknown; metadata?: Record<string, unknown> } & OriginExtra));
-export interface ChildToolCallContext extends ProgressContext { readMode: ReadMode | 'unnegotiated'; metadata?: Record<string, unknown>; signal?: AbortSignal }
+export interface ChildToolCallContext extends ProgressContext { readMode: ReadMode | 'unnegotiated'; metadata?: Record<string, unknown>; signal?: AbortSignal; connectorDispatch?: ConnectorDispatchEvidence }
 export const standaloneDispatch: ToolDispatchContext = { kind: 'standalone' };
 
 export function matchesFileVersion(value: unknown): boolean {
@@ -58,7 +59,7 @@ export function captureToolDispatch(authority: unknown, metadata: Record<string,
 
 /** Only the router's read decision belongs on a child request. */
 export function childCallContext(context: ToolDispatchContext, mode?: ReadMode): ChildToolCallContext {
-  return { readMode: mode ?? 'unnegotiated', ...(mode ? { metadata: { 'files/readMode': mode } } : {}), signal: context.signal, ...(context.onprogress ? { onprogress: context.onprogress } : {}) };
+  return { readMode: mode ?? 'unnegotiated', ...(mode ? { metadata: { 'files/readMode': mode } } : {}), signal: context.signal, ...(context.onprogress ? { onprogress: context.onprogress } : {}), connectorDispatch: context.connectorDispatch };
 }
 
 const orderedProgressTransports = new WeakMap<Transport, Transport['onmessage']>();

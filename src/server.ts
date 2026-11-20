@@ -1006,6 +1006,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
 
     server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const { name, arguments: args } = request.params;
+      const evidence = { started: false };
 
       try {
         switch (name) {
@@ -1024,7 +1025,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           case "use_tool":
             return await handleUseTool(args as any, registry, catalog, validator,
               { ...(request.params._meta?.['rebel/captureProgressDigest'] === true ? { captureProgressDigest: true as const } : {}),
-                dispatch: captureToolDispatch(server.getClientCapabilities()?.experimental?.['files/readAuthority'], request.params._meta, extra) });
+                dispatch: { ...captureToolDispatch(server.getClientCapabilities()?.experimental?.['files/readAuthority'], request.params._meta, extra), connectorDispatch: evidence } });
 
           case "bulk_export":
             return await handleBulkExport(args as any, registry, catalog, extra?.signal,
@@ -1071,7 +1072,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           error: oauthErrorLogText(error, formatError(error)),
         });
 
-        throw toolCallFailure(name, error, registry.getPackages({ safe_only: false }));
+        throw toolCallFailure(name, error, registry.getPackages({ safe_only: false }), name === "use_tool" && !evidence.started);
       }
     });
 

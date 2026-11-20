@@ -1,3 +1,4 @@
+import { toolCallFailure } from '../src/toolCallFailure.js';
 // R2 regression: super-mcp resolves bare package aliases (e.g. "GoogleWorkspace")
 // to the unique active instance ("GoogleWorkspace-sam-work-com") and emits a
 // telemetry breadcrumb. Ambiguous aliases throw a structured ACCOUNT_SELECTION
@@ -169,3 +170,17 @@ describe("useTool R2 — bare package alias resolver", () => {
     });
   });
 });
+
+it.each([['unknown', []], ['ambiguous', [makePackageConfig('demo-one'), makePackageConfig('demo-two')]]] as const)(
+  'proves %s package resolution never dispatched', async (_scenario, packages) => {
+    const { mockRegistry, mockCatalog, mockValidator, mockClient } = createMocks({ packages: [...packages] });
+    const evidence = { started: false };
+    let failure: unknown;
+    try {
+      await handleUseTool({ package_id: 'demo', tool_id: 'send', args: {} }, mockRegistry, mockCatalog, mockValidator,
+        { dispatch: { kind: 'standalone', connectorDispatch: evidence } });
+    } catch (error) { failure = toolCallFailure('use_tool', error, [], !evidence.started); }
+    expect(failure).toMatchObject({ data: { 'superMcp/neverDispatched': true } });
+    expect(mockClient.callTool).not.toHaveBeenCalled();
+  },
+);

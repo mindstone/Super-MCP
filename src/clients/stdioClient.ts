@@ -959,14 +959,17 @@ export class StdioMcpClient implements McpClient {
     return this.enqueue(async () => {
       context.signal?.throwIfAborted();
       try {
-        const response = await relayToolProgress(context, timeout, options => this.client.callTool({
-          name,
-          arguments: args || {},
-          _meta: { "files/readMode": readMode },
-        }, undefined, {
-          timeout,
-          ...options,
-        }), this.client.transport);
+        const response = await relayToolProgress(context, timeout, options => {
+          if (context.connectorDispatch) context.connectorDispatch.started = true;
+          return this.client.callTool({
+            name,
+            arguments: args || {},
+            _meta: { "files/readMode": readMode },
+          }, undefined, {
+            timeout,
+            ...options,
+          });
+        }, this.client.transport);
 
         logger.info("Tool call completed", {
           package_id: this.packageId,

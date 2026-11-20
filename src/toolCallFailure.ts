@@ -85,7 +85,7 @@ export function appendErrorAdvice(code: unknown, message: string, data?: unknown
  * A connector's error may quote its address, command or arguments, and so a key, so
  * both are redacted against the connector configs.
  */
-export function toolCallFailure(name: string, error: unknown, connectorConfigs: readonly PackageConfig[]): unknown {
+function buildToolCallFailure(name: string, error: unknown, connectorConfigs: readonly PackageConfig[]): unknown {
   if (error && typeof error === "object" && "code" in error) {
     return redactConnectorSecretsDeep({
       ...error,
@@ -102,4 +102,19 @@ export function toolCallFailure(name: string, error: unknown, connectorConfigs: 
     message: `${formatError(error)}. Try 'get_help(topic: "error_handling")' for general troubleshooting.`,
     data: { tool_name: name, ...(homeFailure && { home_failure: homeFailure }) },
   }, connectorConfigs);
+}
+
+export function toolCallFailure(name: string, error: unknown, connectorConfigs: readonly PackageConfig[], neverDispatched = false): unknown {
+  const failure = buildToolCallFailure(name, error, connectorConfigs) as { data?: unknown };
+  const key = 'superMcp/neverDispatched';
+  // Reserve the wire key even on failures supplied by a connector. Only the
+  // server's invocation-local tracker can establish that no send started.
+  if (typeof failure.data === 'object' && failure.data !== null && !Array.isArray(failure.data)) {
+    const { [key]: _, ...rest } = failure.data as Record<string, unknown>;
+    failure.data = rest;
+  }
+  if (neverDispatched) {
+    failure.data = { ...(failure.data as Record<string, unknown> | undefined), [key]: true };
+  }
+  return failure;
 }

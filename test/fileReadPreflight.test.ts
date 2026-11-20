@@ -409,7 +409,7 @@ describe('use_tool file-read admission outcomes', () => {
     expect(result).toEqual({
       isError: true,
       content: [{ type: 'text', text: reason }],
-      _meta: { superMcp: { packageId: 'fixture', toolId: 'upload', durationMs: expect.any(Number) } },
+      _meta: { superMcp: { packageId: 'fixture', toolId: 'upload', durationMs: expect.any(Number), neverDispatched: true } },
     });
     expect(result._meta.superMcp.durationMs).toBeGreaterThanOrEqual(0);
     expect(sendRequest).toHaveBeenCalledTimes(1);

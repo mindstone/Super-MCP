@@ -52,10 +52,10 @@ describe("the registered tools/call catch forwards a paused home's marker", () =
     vi.restoreAllMocks();
   });
 
-  function callUseTool(): Promise<unknown> {
+  function callUseTool(signal = new AbortController().signal): Promise<unknown> {
     return handlers.get(CallToolRequestSchema)!(
       { params: { name: "use_tool", arguments: { package_id: "notebook", tool_id: "write_note", args: { text: "a note" } } } },
-      { signal: new AbortController().signal, sendRequest: vi.fn() },
+      { signal, sendRequest: vi.fn() },
     );
   }
 
@@ -66,7 +66,7 @@ describe("the registered tools/call catch forwards a paused home's marker", () =
       await expect(callUseTool()).rejects.toEqual({
         code: ERROR_CODES.PACKAGE_UNAVAILABLE,
         message: `${paused}. Run 'health_check_all()' to diagnose the issue.`,
-        data: { package_id: "notebook", status: "error", home_failure: "unreachable" },
+        data: { package_id: "notebook", status: "error", home_failure: "unreachable", "superMcp/neverDispatched": true },
       });
     }
   });
@@ -79,7 +79,29 @@ describe("the registered tools/call catch forwards a paused home's marker", () =
     await expect(callUseTool()).rejects.toEqual({
       code: ERROR_CODES.INTERNAL_ERROR,
       message: expect.stringContaining(paused),
-      data: { tool_name: "use_tool", home_failure: "unreachable" },
+      data: { tool_name: "use_tool", home_failure: "unreachable", "superMcp/neverDispatched": true },
     });
+  });
+
+  it("preserves a DOMException abort before send through wire formatting and logging", async () => {
+    const client = { listTools: vi.fn(async () => [tool]), callTool: vi.fn() } as unknown as McpClient;
+    vi.spyOn(registry, "getClient").mockResolvedValue(client);
+    await startServer({ configPaths: [], transport: "stdio" });
+    const controller = new AbortController();
+    const reason = new DOMException("Router request cancelled", "AbortError");
+    controller.abort(reason);
+    logger.error.mockClear();
+
+    await expect(callUseTool(controller.signal)).rejects.toMatchObject({
+      message: reason.message,
+      data: { "superMcp/neverDispatched": true },
+    });
+    expect(client.callTool).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith("Tool execution failed", {
+      tool_name: "use_tool", error: reason.message,
+    });
+    expect(controller.signal.reason).toBe(reason);
+    expect(reason.message).toBe("Router request cancelled");
+    expect(String(reason)).toBe("AbortError: Router request cancelled");
   });
 });

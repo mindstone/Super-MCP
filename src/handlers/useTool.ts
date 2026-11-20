@@ -1489,7 +1489,19 @@ function buildRepairTicket(
   return repairTicket;
 }
 
-export async function handleUseTool(
+/** Dispatch evidence belongs to this invocation, including every registry/client retry. */
+export async function handleUseTool(...params: Parameters<typeof handleUseToolImpl>): Promise<any> {
+  const context = params[4];
+  const evidence = context?.dispatch?.connectorDispatch ?? { started: false };
+  params[4] = { ...context, dispatch: { ...(context?.dispatch ?? { kind: 'standalone' }), connectorDispatch: evidence } };
+  const result = await handleUseToolImpl(...params);
+  if (result.isError === true && !evidence.started) {
+    result._meta = { ...result._meta, superMcp: { ...result._meta?.superMcp, neverDispatched: true } };
+  }
+  return result;
+}
+
+async function handleUseToolImpl(
   input: UseToolInput & {
     _rebel_staged?: boolean;
     _rebel_staged_message?: string;
@@ -1546,7 +1558,10 @@ export async function handleUseTool(
   }
   if (cleanForContinuation.result_id) {
     if (cleanForContinuation.output_offset === undefined || cleanForContinuation.output_offset === null) {
-      return { content: [{ type: "text", text: "Error: output_offset is required when using result_id." }], isError: true };
+      return buildOuter({
+        content: [{ type: "text", text: "Error: output_offset is required when using result_id." }], isError: true,
+        superMcp: { packageId: cleanForContinuation.package_id ?? "_", toolId: cleanForContinuation.tool_id ?? "_", durationMs: 0 },
+      });
     }
     const continuation = handleContinuation(cleanForContinuation.result_id, cleanForContinuation.output_offset, cleanForContinuation.max_output_chars);
     return buildOuter({
