@@ -1,0 +1,884 @@
+[
+  {
+    "label": "absent",
+    "reason": "absent"
+  },
+  {
+    "label": "non-object",
+    "value": null,
+    "reason": "shape"
+  },
+  {
+    "label": "non-object",
+    "value": false,
+    "reason": "shape"
+  },
+  {
+    "label": "non-object",
+    "value": 1,
+    "reason": "shape"
+  },
+  {
+    "label": "non-object",
+    "value": "stream",
+    "reason": "shape"
+  },
+  {
+    "label": "non-object",
+    "value": [],
+    "reason": "shape"
+  },
+  {
+    "label": "version",
+    "value": {
+      "version": 0,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "version"
+  },
+  {
+    "label": "version",
+    "value": {
+      "version": 2,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "version"
+  },
+  {
+    "label": "version",
+    "value": {
+      "version": "1",
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "version"
+  },
+  {
+    "label": "version",
+    "value": {
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "version"
+  },
+  {
+    "label": "bytes",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": -1,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "bytes"
+  },
+  {
+    "label": "bytes",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 0.5,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "bytes"
+  },
+  {
+    "label": "bytes",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 9007199254740992,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "bytes"
+  },
+  {
+    "label": "bytes",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": null,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "bytes"
+  },
+  {
+    "label": "bytes",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": null,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "bytes"
+  },
+  {
+    "label": "bytes",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": "6",
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "bytes"
+  },
+  {
+    "label": "bytes",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": null,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "bytes"
+  },
+  {
+    "label": "bytes",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "bytes"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "/tmp/file",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "//server/share",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "C:/file",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "C:file",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "\\server\\share",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs\\file",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "../file",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/../../file",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/../file",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "./file",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/./file",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs//file",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/\u0000file",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/\nfile",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/file:stream",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/file?",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/file*",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/\u007f",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/\u0085",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/\u202e",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/\u200b",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/\ufeff",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/\u2028",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/\u2029",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/\ud83d\udc69\u200d\ud83d\udcbb.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "COM0",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "COM\u00b9.txt",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "COM\u00b2",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "COM\u00b3",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "LPT0",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "LPT\u00b9",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "LPT\u00b2.txt",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "LPT\u00b3",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "CONIN$",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "conout$.txt",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/file.",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/file ",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "NUL",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/COM1.txt",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": "outputs/aux.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "ref": null,
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "ref",
+    "value": {
+      "version": 1,
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "running"
+    },
+    "reason": "ref"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "*/*",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/*",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "*/mpeg",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "/mpeg",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg/extra",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": " audio/mpeg",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg ",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg\n",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg; codecs=mp3",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/\ud83d\udcbf",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mp(3)",
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": null,
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "mime",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "state": "running"
+    },
+    "reason": "mime"
+  },
+  {
+    "label": "state",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "done"
+    },
+    "reason": "state"
+  },
+  {
+    "label": "state",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": "RUNNING"
+    },
+    "reason": "state"
+  },
+  {
+    "label": "state",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": ""
+    },
+    "reason": "state"
+  },
+  {
+    "label": "state",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg",
+      "state": null
+    },
+    "reason": "state"
+  },
+  {
+    "label": "state",
+    "value": {
+      "version": 1,
+      "ref": "outputs/sample.mp3",
+      "bytes": 6,
+      "mime": "audio/mpeg"
+    },
+    "reason": "state"
+  }
+]

@@ -1,6 +1,6 @@
 import type { InputBases } from '../fileReadInputs.js';
 import { effectiveInputBases } from '../fileReadPreflight.js';
-import { FILE_READ_MODES, type ChildToolCallContext } from '../fileReadProtocol.js';
+import { FILE_READ_MODES, relayToolProgress, type ChildToolCallContext } from '../fileReadProtocol.js';
 import { ErrorCode, McpError, type ListResourcesResult } from "@modelcontextprotocol/sdk/types.js";
 import { exec } from "child_process";
 import fs from "node:fs";
@@ -959,14 +959,14 @@ export class StdioMcpClient implements McpClient {
     return this.enqueue(async () => {
       context.signal?.throwIfAborted();
       try {
-        const response = await this.client.callTool({
+        const response = await relayToolProgress(context, timeout, options => this.client.callTool({
           name,
           arguments: args || {},
           _meta: { "files/readMode": readMode },
         }, undefined, {
           timeout,
-          resetTimeoutOnProgress: true, // Reset timeout when progress notifications are received
-        });
+          ...options,
+        }), this.client.transport);
 
         logger.info("Tool call completed", {
           package_id: this.packageId,

@@ -94,7 +94,7 @@ describe('SDK transport and child request metadata', () => {
     expect(await fixture.call('active')).toMatchObject({ content: [{ text: 'uploaded' }] });
     expect(fixture.child.getClientCapabilities()?.experimental?.['files/readModes']).toEqual({ version: 1 });
     expect(fixture.batches).toEqual([{ version: 1, invocationId: 'active', operands: [{ location: ['file'], rawPath: 'report.txt', resolvedPath: path.resolve('/connector', 'report.txt') }] }]);
-    expect(fixture.calls).toEqual([{ args: { file: 'report.txt' }, meta: { 'files/readMode': { version: 1, mode: 'central', reads: [{ location: ['file'], rawPath: 'report.txt', canonicalPath: '/physical/active.txt' }] } } }]);
+    expect(fixture.calls).toEqual([{ args: { file: 'report.txt' }, meta: { progressToken: expect.any(Number), 'files/readMode': { version: 1, mode: 'central', reads: [{ location: ['file'], rawPath: 'report.txt', canonicalPath: '/physical/active.txt' }] } } }]);
   });
 
   it.each([
@@ -136,10 +136,10 @@ describe('SDK transport and child request metadata', () => {
     const fixture = await sdkHarness();
     expect(await fixture.call(undefined, args, name)).toMatchObject({ content: [{ text: 'uploaded' }] });
     expect(fixture.batches).toEqual([]);
-    expect(fixture.calls).toEqual([{ args, meta: { 'files/readMode': { version: 1, mode: 'central', reads: [] } } }]);
+    expect(fixture.calls).toEqual([{ args, meta: { progressToken: expect.any(Number), 'files/readMode': { version: 1, mode: 'central', reads: [] } } }]);
   });
 
-  it('keeps an in-flight child in its queue slot and aborts queued work before sending', async () => {
+  it('cancels an in-flight child and aborts queued work before sending', async () => {
     const fixture = await sdkHarness(false);
     let release!: () => void;
     const held = new Promise<void>(resolve => { release = resolve; });
@@ -153,16 +153,16 @@ describe('SDK transport and child request metadata', () => {
     const send = vi.spyOn(fixture.childClient, 'callTool');
     const first = new AbortController(), queued = new AbortController();
     const mode = { version: 1 as const, mode: 'standalone' as const };
-    const running = fixture.local.callTool('upload', {}, childCallContext({ kind: 'standalone', signal: first.signal }, mode));
+    const running = fixture.local.callTool('upload', {}, childCallContext({ kind: 'standalone', signal: first.signal }, mode)).catch(error => error);
     const childSignal = await active;
     const waiting = fixture.local.callTool('upload', {}, childCallContext({ kind: 'standalone', signal: queued.signal }, mode)).catch(error => error);
     try {
       first.abort(); queued.abort();
-      expect(childSignal.aborted).toBe(false);
+      await vi.waitFor(() => expect(childSignal.aborted).toBe(true));
       expect(send).toHaveBeenCalledTimes(1);
-      expect(send.mock.calls[0][2]).not.toHaveProperty('signal');
+      expect(send.mock.calls[0][2]).toMatchObject({ signal: expect.any(AbortSignal), resetTimeoutOnProgress: false });
     } finally { release(); }
-    expect(await running).toMatchObject({ content: [{ text: 'finished' }] });
+    expect(await running).toMatchObject({ name: 'AbortError' });
     expect(await waiting).toMatchObject({ name: 'AbortError' });
     expect(send).toHaveBeenCalledTimes(1);
   });
@@ -183,7 +183,7 @@ describe('SDK transport and child request metadata', () => {
     const standalone = await sdkHarness(false);
     await standalone.call(undefined, wire.forgedArguments);
     expect(standalone.batches).toEqual([]);
-    expect(standalone.calls[0].meta).toEqual({ 'files/readMode': { version: 1, mode: 'standalone' } });
+    expect(standalone.calls[0].meta).toEqual({ progressToken: expect.any(Number), 'files/readMode': { version: 1, mode: 'standalone' } });
     expect(standalone.calls[0].args).toEqual(wire.forgedArguments);
   });
 });
@@ -234,7 +234,7 @@ describe('preflight failure and negotiation boundaries', () => {
     expect(context.kind === 'origin' && context.sendRequest).not.toHaveBeenCalled();
   });
 
-  it('dispatches HTTP without a binding, upstream metadata, or new child cancellation', async () => {
+  it('dispatches HTTP with cancellation but without a binding or upstream metadata', async () => {
     const httpConfig = { ...config, transport: 'http' as const, base_url: 'https://example.test/mcp' };
     const client = new HttpMcpClient('fixture', httpConfig);
     // Isolate dispatch on an already-connected client; the SDK send is observed below.
@@ -248,7 +248,7 @@ describe('preflight failure and negotiation boundaries', () => {
     await registry.callTool('fixture', 'upload', { file: '/source' }, context);
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0][0]).toEqual({ name: 'upload', arguments: { file: '/source' } });
-    expect(send.mock.calls[0][2]).not.toHaveProperty('signal');
+    expect(send.mock.calls[0][2]).toMatchObject({ signal: expect.any(AbortSignal), resetTimeoutOnProgress: false });
     expect(metadata).not.toHaveBeenCalled();
     expect(context.kind === 'origin' && context.sendRequest).not.toHaveBeenCalled();
   });

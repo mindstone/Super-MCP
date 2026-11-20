@@ -1,4 +1,4 @@
-import type { ChildToolCallContext } from '../fileReadProtocol.js';
+import { relayToolProgress, type ChildToolCallContext } from '../fileReadProtocol.js';
 import { ErrorCode, McpError, type ListResourcesResult } from "@modelcontextprotocol/sdk/types.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
@@ -1064,13 +1064,13 @@ export class HttpMcpClient implements McpClient {
     return this.enqueue(async () => {
       context.signal?.throwIfAborted();
       try {
-        const response = await this.client.callTool({
+        const response = await relayToolProgress(context, timeout, options => this.client.callTool({
           name,
           arguments: args || {},
         }, undefined, {
           timeout,
-          resetTimeoutOnProgress: true,
-        });
+          ...options,
+        }), this.client.transport);
         return response;
       } catch (error) {
         logger.error("Tool call failed", {

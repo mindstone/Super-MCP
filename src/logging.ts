@@ -294,8 +294,10 @@ class Logger {
     this.log("info", msg, data);
   }
 
-  warn(msg: string, data?: Record<string, any>) {
-    this.log("warn", msg, data);
+  warn(msg: string, data?: Record<string, any>): void;
+  warn(data: Record<string, any>, msg: string): void;
+  warn(first: string | Record<string, any>, second?: string | Record<string, any>) {
+    this.log("warn", typeof first === 'string' ? first : second as string, typeof first === 'string' ? second as Record<string, any> : first);
   }
 
   error(msg: string, data?: Record<string, any>) {

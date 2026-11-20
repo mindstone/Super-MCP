@@ -38,14 +38,14 @@ describe('per-call tool timeout', () => {
     expect(callTool).toHaveBeenCalledWith(
       { name: 'write_note', arguments: { text: 'hello' }, _meta: { 'files/readMode': { version: 1, mode: 'standalone' } } },
       undefined,
-      { timeout: expected, resetTimeoutOnProgress: true },
+      { timeout: expected, resetTimeoutOnProgress: false, signal: expect.any(AbortSignal) },
     );
 
     const sendRequest = vi.fn().mockResolvedValue({ version: 1, outcome: 'allowed', reads: [{ location: ['file'], rawPath: '/source', canonicalPath: '/physical' }] });
     vi.spyOn(client, 'getToolMetadata').mockResolvedValue({ 'files/readInputs': { version: 1, inputs: [{ selector: ['file'], base: 'connectorCwd', expandTilde: false }] } });
     await preflightLocalTool(client, config, 'upload', { file: '/source' }, {
       kind: 'origin', authority: { version: 1 }, metadata: { 'files/invocation': { version: 1, invocationId: 'active' } },
-      signal: new AbortController().signal, sendRequest,
+      signal: new AbortController().signal, sendRequest, sendNotification: vi.fn(),
     });
     expect(sendRequest).toHaveBeenCalledWith(expect.any(Object), expect.any(Object), expect.objectContaining({ timeout: expected }));
   });

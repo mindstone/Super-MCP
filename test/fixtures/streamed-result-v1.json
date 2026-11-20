@@ -1,0 +1,5 @@
+[
+  {"version":1,"ref":"outputs/sample.mp3","bytes":6,"mime":"audio/mpeg","state":"running"},
+  {"version":1,"ref":"outputs/sample.mp3","bytes":9,"mime":"audio/mpeg","state":"complete"},
+  {"version":1,"ref":"metadata.jsonl","bytes":17,"mime":"application/x-ndjson","state":"incomplete"}
+]

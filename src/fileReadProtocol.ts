@@ -1,8 +1,10 @@
 import { z } from 'zod';
 import { RequestSchema, ResultSchema } from '@modelcontextprotocol/sdk/types.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
-import type { Request, Notification } from '@modelcontextprotocol/sdk/types.js';
+import { ErrorCode, McpError, type Request, type Notification, type Progress } from '@modelcontextprotocol/sdk/types.js';
 import path from 'node:path';
+import { getLogger } from './logging.js';
 
 export const FILE_READ_MODES = { experimental: { 'files/readModes': { version: 1 } } };
 export const DECLARED_FORWARDING = 'files/forwardedInputs';
@@ -27,13 +29,14 @@ export type ReadOperand = z.infer<typeof readOperandSchema>;
 export type AllowedRead = z.infer<typeof allowedReadSchema>;
 export type ReadMode = z.infer<typeof readModeSchema>;
 export type ReadOutcome = z.infer<typeof authorizeReadsResultSchema>;
-export type OriginExtra = Pick<RequestHandlerExtra<Request, Notification>, 'sendRequest' | 'signal'>;
+export type OriginExtra = Pick<RequestHandlerExtra<Request, Notification>, 'sendRequest' | 'sendNotification' | 'signal'>;
+type ProgressContext = { onprogress?: (progress: Progress) => void | Promise<void> };
 
 /** This is request context, never part of model arguments. */
-export type ToolDispatchContext =
+export type ToolDispatchContext = ProgressContext & (
   | { kind: 'standalone'; signal?: AbortSignal; metadata?: Record<string, unknown> }
-  | ({ kind: 'origin'; authority: unknown; metadata?: Record<string, unknown> } & OriginExtra);
-export interface ChildToolCallContext { readMode: ReadMode | 'unnegotiated'; metadata?: Record<string, unknown>; signal?: AbortSignal }
+  | ({ kind: 'origin'; authority: unknown; metadata?: Record<string, unknown> } & OriginExtra));
+export interface ChildToolCallContext extends ProgressContext { readMode: ReadMode | 'unnegotiated'; metadata?: Record<string, unknown>; signal?: AbortSignal }
 export const standaloneDispatch: ToolDispatchContext = { kind: 'standalone' };
 
 export function matchesFileVersion(value: unknown): boolean {
@@ -46,12 +49,85 @@ export function assertDispatchActive(context: ToolDispatchContext): void {
   context.signal?.throwIfAborted();
 }
 export function captureToolDispatch(authority: unknown, metadata: Record<string, unknown> | undefined, extra: OriginExtra): ToolDispatchContext {
-  return { kind: 'origin', authority, metadata, signal: extra.signal, sendRequest: extra.sendRequest };
+  const token = metadata?.progressToken;
+  return { kind: 'origin', authority, metadata, signal: extra.signal, sendRequest: extra.sendRequest, sendNotification: extra.sendNotification,
+    ...(typeof token === 'string' || typeof token === 'number' ? { onprogress: (progress: Progress) => extra.sendNotification({
+      method: 'notifications/progress', params: { ...progress, progressToken: token },
+    }) } : {}) };
 }
 
 /** Only the router's read decision belongs on a child request. */
 export function childCallContext(context: ToolDispatchContext, mode?: ReadMode): ChildToolCallContext {
-  return { readMode: mode ?? 'unnegotiated', ...(mode ? { metadata: { 'files/readMode': mode } } : {}), signal: context.signal };
+  return { readMode: mode ?? 'unnegotiated', ...(mode ? { metadata: { 'files/readMode': mode } } : {}), signal: context.signal, ...(context.onprogress ? { onprogress: context.onprogress } : {}) };
+}
+
+const orderedProgressTransports = new WeakMap<Transport, Transport['onmessage']>();
+
+/** SDK callbacks are synchronous; drain their ordered sends inside the fixed call budget. */
+export async function relayToolProgress<T>(context: ProgressContext & { signal?: AbortSignal }, timeout: number,
+  call: (options: { signal: AbortSignal; onprogress?: (progress: Progress) => void; resetTimeoutOnProgress: false }) => Promise<T>, transport?: Transport): Promise<T> {
+  if (transport && orderedProgressTransports.get(transport) !== transport.onmessage) {
+    // SDK 1.32.1 defers _onnotification; synchronous _onresponse deletes the progress handler.
+    // Give notifications their turn first; re-check this workaround on SDK upgrades.
+    const receive = transport.onmessage;
+    let incoming = Promise.resolve();
+    transport.onmessage = (message, extra) => {
+      incoming = incoming.then(() => { receive?.(message, extra); }).catch(error => { transport.onerror?.(error); });
+    };
+    orderedProgressTransports.set(transport, transport.onmessage);
+  }
+  const deadline = new AbortController();
+  const signal = context.signal ? AbortSignal.any([context.signal, deadline.signal]) : deadline.signal;
+  const timer = setTimeout(() => deadline.abort(new McpError(ErrorCode.RequestTimeout, 'Request timed out', { timeout })), timeout);
+  let abort!: () => void;
+  const aborted = new Promise<never>((_, reject) => {
+    abort = () => reject(signal.reason);
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  });
+  let accepting = true, forwarding = false, succeeded = false, pending = Promise.resolve();
+  const shared = Symbol(), queued: { key: string | symbol; progress: Progress }[] = [];
+  const slots = new Map<string | symbol, (typeof queued)[number]>();
+  const terminals = new Map<string | symbol, (typeof queued)[number]>();
+  const onprogress = (progress: Progress) => {
+    if (!accepting || signal.aborted) return;
+    const stream = (progress as Progress & { _meta?: Record<string, unknown> })._meta?.['com.mindstone/stream'] as { ref?: unknown; state?: unknown } | undefined;
+    const ref = typeof stream?.ref === 'string' ? stream.ref : shared;
+    // Delivery markers only; validation belongs to the receiver. Bound terminal
+    // slots separately, keeping the latest per ref and routing overflow to shared.
+    const terminal = stream?.state === 'complete' || stream?.state === 'incomplete';
+    const bucket = terminal && (terminals.has(ref) || terminals.size < 256) ? terminals : slots;
+    const key = bucket === terminals || (!terminal && (slots.has(ref) || slots.size < 15)) ? ref : shared;
+    const slot = bucket.get(key);
+    if (slot) { slot.progress = progress; queued.splice(queued.indexOf(slot), 1); queued.push(slot); }
+    else { const next = { key, progress }; bucket.set(key, next); queued.push(next); }
+    if (forwarding) return;
+    forwarding = true;
+    pending = (async () => {
+      while (queued.length && !signal.aborted) {
+        const next = queued.shift()!;
+        if (slots.get(next.key) === next) slots.delete(next.key);
+        if (terminals.get(next.key) === next) terminals.delete(next.key);
+        try { await context.onprogress?.(next.progress); }
+        catch (error) { getLogger().warn({ error_type: error instanceof Error ? error.name : typeof error }, 'Tool progress forwarding failed'); }
+      }
+      forwarding = false;
+    })();
+  };
+  try {
+    signal.throwIfAborted();
+    const result = await Promise.race([call({ signal, ...(context.onprogress ? { onprogress } : {}), resetTimeoutOnProgress: false }), aborted]);
+    succeeded = true;
+    return result;
+  } finally {
+    accepting = false;
+    try { await Promise.race([pending, aborted]); }
+    catch (error) {
+      if (!succeeded) throw error;
+      getLogger().warn({ in_flight: forwarding, queued: queued.length > 0 }, 'Tool finished with undelivered progress');
+    }
+    finally { clearTimeout(timer); signal.removeEventListener('abort', abort); }
+  }
 }
 
 export class FileReadAdmissionError extends Error {

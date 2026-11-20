@@ -19,7 +19,7 @@ import type { PackageConfig } from '../src/types.js';
 vi.mock('../src/logging.js', () => ({ getLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }) }));
 
 // FOX-7907: once its caller has stopped or timed out, a call still waiting for a
-// connector slot must never reach the connector. A call already running is left alone.
+// connector slot must never reach the connector. Stop also reaches a running child request.
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
@@ -33,12 +33,14 @@ async function busyConnector(transport: 'stdio' | 'http') {
     : { id: 'acme', name: 'Acme', transport, visibility: 'default', base_url: 'https://connector.example/mcp' };
   const connector = new Server({ name: 'acme', version: '1' }, { capabilities: { tools: {} } });
   const sent: string[] = [];
+  const cancelled: string[] = [];
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   connector.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [tool] }));
-  connector.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
+  connector.setRequestHandler(CallToolRequestSchema, async ({ params }, extra) => {
     const label = String(params.arguments?.label);
     sent.push(label);
+    extra.signal.addEventListener('abort', () => cancelled.push(label), { once: true });
     if (label.startsWith('running')) await held;
     return { content: [{ type: 'text', text: label }] };
   });
@@ -52,7 +54,7 @@ async function busyConnector(transport: 'stdio' | 'http') {
     ? { command: 'unused', cwd: '/connector' } : { url: 'https://connector.example/mcp' } } });
   vi.spyOn(registry, 'getClient').mockResolvedValue(local);
   cleanup.push(() => connector.close(), () => internals.client.close(), () => registry.closeAll());
-  return { registry, sent, release, internals };
+  return { registry, sent, cancelled, release, internals };
 }
 
 /** Fills every connector slot through `call`, then waits until each running call has reached the connector. */
@@ -138,23 +140,24 @@ describe.each([
 });
 
 describe.each(['stdio', 'http'] as const)('%s connector: a queued use_tool call whose caller has gone', transport => {
-  it('is never sent through use_tool after the person presses Stop, while a running call still finishes', async () => {
+  it('never dispatches the queued use_tool call and cancels running child calls on Stop', async () => {
     const fixture = await busyConnector(transport);
     const catalog = new Catalog(fixture.registry);
     catalog.commitReady('acme', [tool], catalog.getConfigurationGeneration());
     vi.spyOn(catalog, 'ensurePackageLoaded').mockResolvedValue(undefined);
     const useTool = (label: string, signal = new AbortController().signal) => handleUseTool(
       { package_id: 'acme', tool_id: 'write', args: { label } }, fixture.registry, catalog, new Validator(),
-      { dispatch: captureToolDispatch(undefined, undefined, { sendRequest: vi.fn(), signal }) });
+      { dispatch: captureToolDispatch(undefined, undefined, { sendRequest: vi.fn(), sendNotification: vi.fn(), signal }) });
     const runningStop = new AbortController();
-    const running = await fillSlots(fixture, label => useTool(label, runningStop.signal));
+    const running = await fillSlots(fixture, label => useTool(label, runningStop.signal).catch(error => error));
     const stop = new AbortController();
     const queued = useTool('queued-write', stop.signal).catch(error => error);
     await waitingInQueue(fixture);
     stop.abort(); runningStop.abort();
-    fixture.release();
     const answers = await Promise.all(running);
-    expect(answers[0]).toMatchObject({ content: [{ text: expect.stringContaining('"text": "running-0"') }] });
+    for (const answer of answers) expect(answer).toMatchObject({ message: expect.stringContaining('aborted') });
+    await vi.waitFor(() => expect(fixture.cancelled).toHaveLength(running.length));
+    fixture.release();
     await queued;
     expect(fixture.sent).not.toContain('queued-write');
   });

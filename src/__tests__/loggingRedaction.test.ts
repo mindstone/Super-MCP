@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, type WriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { initLogger } from "../logging.js";
+import { initLogger, getLogger } from "../logging.js";
 
 type LoggerInternals = { sanitizeData(data: unknown): unknown; logStream: WriteStream; logFile: string };
 
@@ -35,5 +35,15 @@ describe("logging redaction", () => {
   it("keeps boolean credential flags while redacting credential strings", () => {
     expect(logger.sanitizeData({ has_access_token: true, has_refresh_token: false, access_token: "fictional-access", client_secret: "fictional-secret" }))
       .toEqual({ has_access_token: true, has_refresh_token: false, access_token: "[REDACTED]", client_secret: "[REDACTED]" });
+  });
+
+  it('keeps structured warning data with either argument order', () => {
+    const output = vi.spyOn(console, 'error').mockImplementation(() => {});
+    getLogger().warn({ queued: true, client_secret: 'fictional-secret' }, 'Progress undelivered');
+    getLogger().warn('Progress undelivered', { queued: true, client_secret: 'fictional-secret' });
+    for (const [line] of output.mock.calls) expect(JSON.parse(line)).toMatchObject({
+      level: 'warn', msg: 'Progress undelivered', queued: true, client_secret: '[REDACTED]',
+    });
+    expect(output).toHaveBeenCalledTimes(2); output.mockRestore();
   });
 });

@@ -342,8 +342,9 @@ function sourceOrigin(outcome: 'allowed' | 'denied' | 'approval_pending' = 'allo
   const sendRequest = vi.fn().mockImplementation(async request => ({ version: 1, outcome, ...(outcome === 'allowed'
     ? { reads: await Promise.all(request.params.operands.map(async (operand: any) => ({ location: operand.location, rawPath: operand.rawPath, canonicalPath: await fs.realpath(operand.resolvedPath) }))) }
     : { reason: 'Source folder is held', ...(outcome === 'approval_pending' ? { presentation: 'queued' } : {}) }) }));
-  const context: ToolDispatchContext = { kind: 'origin', authority: { version: 1 }, signal: new AbortController().signal, sendRequest, metadata: { 'files/invocation': { version: 1, invocationId: 'active' } } };
-  return { context, sendRequest, authorize: (operands: any) => authorizeReads(operands, context, 1000) };
+  const controller = new AbortController();
+  const context: ToolDispatchContext = { kind: 'origin', authority: { version: 1 }, signal: controller.signal, sendRequest, sendNotification: vi.fn(), metadata: { 'files/invocation': { version: 1, invocationId: 'active' } } };
+  return { context, controller, sendRequest, authorize: (operands: any) => authorizeReads(operands, context, 1000) };
 }
 
 describe('central source preflight and declared forwarding compatibility', () => {
@@ -367,7 +368,12 @@ describe('central source preflight and declared forwarding compatibility', () =>
     expect(source.sendRequest).not.toHaveBeenCalled();
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(dispatch.mock.calls[0][0]).toEqual({ name: 'write_note', arguments: { text: 'hello' }, _meta: { 'rebel/returnFiles': { version: 1 } } });
-    expect(dispatch.mock.calls[0][2].signal).toBe(source.context.signal); // FOX-7907: Stop reaches the home's queue
+    const signal = dispatch.mock.calls[0][2].signal!;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(signal.aborted).toBe(false);
+    // AbortSignal.any follows the source as well as the fixed call deadline.
+    expect(dispatch.mock.calls[0][2].resetTimeoutOnProgress).toBe(false);
+    source.controller.abort(); expect(signal.aborted).toBe(true);
   });
 
   it.each(['denied', 'approval_pending'] as const)('checks legacy candidates centrally before opening bytes on %s', async outcome => {
@@ -440,7 +446,11 @@ describe('central source preflight and declared forwarding compatibility', () =>
     expect(source.sendRequest.mock.calls[0][0].params.operands).toHaveLength(1);
     const envelope = dispatch.mock.calls[0][0]._meta!['rebel/forwardedFiles'];
     expect(dispatch.mock.calls[0][0]._meta).toEqual({ 'rebel/returnFiles': { version: 1 }, 'rebel/forwardedFiles': envelope });
-    expect(dispatch.mock.calls[0][2].signal).toBe(source.context.signal); // FOX-7907: Stop reaches the home's queue
+    const signal = dispatch.mock.calls[0][2].signal!;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    expect(signal.aborted).toBe(false);
+    // AbortSignal.any follows the source as well as the fixed call deadline.
+    expect(dispatch.mock.calls[0][2].resetTimeoutOnProgress).toBe(false);
     expect(envelope).toEqual([{ path: sourceFile, name: 'report.txt', contentBase64: 'YWJj' }]);
     expect(Object.keys((envelope as any)[0]).sort()).toEqual(['contentBase64', 'name', 'path']);
     capability.mockReturnValue({}); source.sendRequest.mockClear();
@@ -448,6 +458,7 @@ describe('central source preflight and declared forwarding compatibility', () =>
     // Old receiver selected legacy before execution; both equal strings remain its known limitation.
     expect(source.sendRequest.mock.calls[0][0].params.operands).toHaveLength(2);
     expect(dispatch.mock.calls[1][0]._meta!['rebel/forwardedFiles']).toEqual(envelope);
+    source.controller.abort(); expect(signal.aborted).toBe(true);
   });
 });
 
