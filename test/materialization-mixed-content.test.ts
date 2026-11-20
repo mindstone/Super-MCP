@@ -92,7 +92,7 @@ describe("materializeOutput mixed-content behavior", () => {
       isError: false,
     };
 
-    const result = await runMaterialize(toolResult, 1);
+    const result = await runMaterialize(toolResult);
     expect(result).not.toBeNull();
     expect(result?.result.preserved_text).toBe("Saved to: path.png");
     expect(result?.result.image_files).toHaveLength(1);
@@ -394,7 +394,7 @@ describe("materializeOutput mixed-content behavior", () => {
     expect(response.content[0].type).toBe("text");
   });
 
-  it("MC-T15: Preserved text respects max_output_chars", async () => {
+  it("MC-T15: Text beside an image over max_output_chars is saved to its own file, not cut inline", async () => {
     const longText = "A".repeat(2_500);
     const toolResult = {
       content: [
@@ -416,10 +416,10 @@ describe("materializeOutput mixed-content behavior", () => {
     expect(response.content[0].type).toBe("text");
 
     const envelope = JSON.parse(response.content[0].text);
-    const preservedText = envelope.result.preserved_text as string;
-    expect(typeof preservedText).toBe("string");
-    expect(preservedText).toContain("[Preserved text truncated to 1000 chars]");
-    expect(preservedText.length).toBeLessThan(longText.length);
+    expect(envelope.result.preserved_text).toBeUndefined();
+    expect(envelope.result.preview.length).toBeLessThanOrEqual(2_048);
+    const savedText = await fs.readFile(path.join(tempWorkspace, envelope.result.text_file_path), "utf8");
+    expect(savedText.endsWith(longText)).toBe(true);
     expect(response.content[1]).toEqual({
       type: "image",
       data: TINY_PNG_BASE64,
@@ -451,7 +451,7 @@ describe("materializeOutput mixed-content behavior", () => {
       isError: false,
     };
 
-    const result = await runMaterialize(toolResult, 1);
+    const result = await runMaterialize(toolResult);
     expect(result).not.toBeNull();
     expect(result?.result.preserved_text).toBe("Saved to: path.png");
     expect(result?.result.image_files).toHaveLength(1);

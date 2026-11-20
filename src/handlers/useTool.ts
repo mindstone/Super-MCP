@@ -36,7 +36,9 @@ import {
 import {
   materializeOutput,
   extractImageContentBlocks,
-  isSupportedImageMimeType,
+  stripImagePayloads,
+  shortenArgsEcho,
+  argsEchoFor,
 } from "./materializeOutput.js";
 import { parseUseToolInput } from "./useToolInput.js";
 import { resolveToolTarget } from "../toolTargetResolution.js";
@@ -82,6 +84,24 @@ interface ContinuationResult {
 const RESULT_CACHE_MAX_SIZE = 50;
 const RESULT_CACHE_TTL_MS = 5 * 60 * 1000;
 const resultCache = new Map<string, CachedResult>();
+
+/**
+ * Carried near the top of a cut-off reply, before `args_used` and the large
+ * result, so a host that keeps only the head of the reply still has the id.
+ */
+interface PagingField {
+  result_id: string;
+  output_offset: 0;
+  hint: string;
+}
+
+function pagingField(resultId: string): PagingField {
+  return {
+    result_id: resultId,
+    output_offset: 0,
+    hint: "This result is cut short: to read all of it, call use_tool with this result_id and output_offset, then each next offset, until has_more is false.",
+  };
+}
 
 function evictExpiredEntries(): void {
   const now = Date.now();
@@ -157,7 +177,8 @@ const DEFAULT_MAX_OUTPUT_CHARS = 100_000;
 
 // Materialization threshold: save outputs > 20K chars to file instead of keeping in context.
 // Separate from DEFAULT_MAX_OUTPUT_CHARS (100K) which drives truncation + continuation chunk size.
-// With auto-materialization, data isn't lost — it's saved to .rebel/tool-outputs/ for Read/Grep access.
+// With auto-materialization, data isn't lost — it's saved to .rebel/tool-outputs/, where the
+// host's file tools can read it in sections or search it.
 const MATERIALIZATION_THRESHOLD_CHARS = 20_000;
 
 // Safety net threshold: if serialized output exceeds this after all truncation,
@@ -482,7 +503,10 @@ export interface UseToolCallContext { captureProgressDigest?: true; dispatch?: T
 interface MaterializationMeta {
   status: "materialized" | "oversized_output";
   originalChars?: number;
+  /** The saved file; for a result with images, the JSON archive holding the image data. */
   filePath?: string;
+  /** For a result with images whose text was saved on its own: that text file. */
+  textFilePath?: string;
   imageFiles?: string[];
 }
 
@@ -2086,10 +2110,12 @@ export async function handleUseTool(
 
   if (dry_run) {
     resetValidationAttempt(downstreamValidationAttemptKey);
+    // The argument echo follows the same rule as a real call's reply.
+    const dryRunLimit = max_output_chars === null ? undefined : (max_output_chars ?? DEFAULT_MAX_OUTPUT_CHARS);
     const result: UseToolOutput = {
       package_id,
       tool_id,
-      args_used: args,
+      args_used: argsEchoFor(args, dryRunLimit),
       result: { dry_run: true },
       telemetry: { duration_ms: 0, status: "ok" },
       ...(cachedTool?.tool?.annotations ? { annotations: cachedTool.tool.annotations } : {}),
@@ -2157,6 +2183,58 @@ export async function handleUseTool(
       ? undefined
       : (max_output_chars ?? MATERIALIZATION_THRESHOLD_CHARS);
 
+    // Safety net threshold for the whole serialized reply.
+    const safetyNetThreshold = Math.max(effectiveLimit !== undefined ? effectiveLimit + effectiveLimit : 0, SERIALIZED_OUTPUT_SAFETY_NET_FLOOR);
+
+    // One reply shape for every saved-to-file result.
+    const materializedReply = (
+      matResult: NonNullable<Awaited<ReturnType<typeof materializeOutput>>>,
+      images: ReturnType<typeof extractImageContentBlocks>,
+    ): UseToolOuter => {
+      // Forward connector tool annotations into materialized response
+      if (cachedTool?.tool?.annotations) {
+        matResult.annotations = cachedTool.tool.annotations;
+      }
+      const fullArgs = matResult.args_used;
+      matResult.args_used = argsEchoFor(fullArgs, effectiveLimit);
+      let envelopeJson = JSON.stringify(matResult, null, 2);
+      // Still over only when both the echo and the inline text beside an image
+      // are near an explicit limit: shorten the echo so the reply stays bounded.
+      if (effectiveLimit !== undefined && envelopeJson.length > safetyNetThreshold) {
+        matResult.args_used = shortenArgsEcho(fullArgs);
+        envelopeJson = JSON.stringify(matResult, null, 2);
+      }
+      const matResultPayload = isRecord(matResult.result) ? matResult.result as Record<string, unknown> : {};
+      const matStatus = matResultPayload.status === "oversized_output" ? "oversized_output" : "materialized";
+      const materializationMeta: MaterializationMeta = {
+        status: matStatus,
+        ...(typeof matResultPayload.size_chars === "number" ? { originalChars: matResultPayload.size_chars } : {}),
+        ...(typeof matResultPayload.file_path === "string" ? { filePath: matResultPayload.file_path } : {}),
+        ...(typeof matResultPayload.text_file_path === "string" ? { textFilePath: matResultPayload.text_file_path } : {}),
+        ...(Array.isArray(matResultPayload.image_files) ? { imageFiles: matResultPayload.image_files as string[] } : {}),
+      };
+      return buildOuter({
+        content: [
+          { type: "text", text: envelopeJson },
+          ...images,
+        ],
+        isError: downstreamIsError,
+        passthrough: innerPassthrough,
+        superMcp: {
+          packageId: package_id,
+          toolId: tool_id,
+          durationMs: duration,
+          ...(recoveryEvidenceV1 ? { recoveryEvidenceV1 } : {}),
+          ...(progressDigestV1 ? { progressDigestV1 } : {}),
+          outputChars: envelopeJson.length,
+          ...(normalisations.length > 0 ? { normalisations: [...normalisations] } : {}),
+          ...(packageResolution ? { packageResolution } : {}),
+          ...(toolResolution ? { toolResolution } : {}),
+        },
+        materialization: materializationMeta,
+      });
+    };
+
     if (materializationLimit !== undefined && process.env.REBEL_WORKSPACE_PATH) {
       try {
         const matResult = await materializeOutput(
@@ -2169,49 +2247,7 @@ export async function handleUseTool(
           materializationLimit
         );
         if (matResult) {
-          // Forward connector tool annotations into materialized response
-          if (cachedTool?.tool?.annotations) {
-            matResult.annotations = cachedTool.tool.annotations;
-          }
-
-          const imageBlocks = extractImageContentBlocks(toolResult);
-
-          if (typeof matResult.result?.preserved_text === "string" && effectiveLimit !== undefined) {
-            const preservedText = matResult.result.preserved_text;
-            if (preservedText.length > effectiveLimit) {
-              matResult.result.preserved_text = `${preservedText.slice(0, effectiveLimit)}\n\n[Preserved text truncated to ${effectiveLimit} chars]`;
-            }
-          }
-
-          const envelopeJson = JSON.stringify(matResult, null, 2);
-          const matResultPayload = isRecord(matResult.result) ? matResult.result as Record<string, unknown> : {};
-          const matStatus = matResultPayload.status === "oversized_output" ? "oversized_output" : "materialized";
-          const materializationMeta: MaterializationMeta = {
-            status: matStatus,
-            ...(typeof matResultPayload.size_chars === "number" ? { originalChars: matResultPayload.size_chars } : {}),
-            ...(typeof matResultPayload.file_path === "string" ? { filePath: matResultPayload.file_path } : {}),
-            ...(Array.isArray(matResultPayload.image_files) ? { imageFiles: matResultPayload.image_files as string[] } : {}),
-          };
-          return buildOuter({
-            content: [
-              { type: "text", text: envelopeJson },
-              ...imageBlocks,
-            ],
-            isError: downstreamIsError,
-            passthrough: innerPassthrough,
-            superMcp: {
-              packageId: package_id,
-              toolId: tool_id,
-              durationMs: duration,
-              ...(recoveryEvidenceV1 ? { recoveryEvidenceV1 } : {}),
-              ...(progressDigestV1 ? { progressDigestV1 } : {}),
-              outputChars: envelopeJson.length,
-              ...(normalisations.length > 0 ? { normalisations: [...normalisations] } : {}),
-              ...(packageResolution ? { packageResolution } : {}),
-              ...(toolResolution ? { toolResolution } : {}),
-            },
-            materialization: materializationMeta,
-          });
+          return materializedReply(matResult, extractImageContentBlocks(toolResult));
         }
       } catch (err: any) {
         logger.warn("Materialization failed, falling back to continuation", {
@@ -2222,36 +2258,14 @@ export async function handleUseTool(
       }
     }
 
-    // Strip image blocks from tool results before JSON serialization.
-    // Always strip (even errors) to prevent base64 inflation of outputJson.
-    // Only pass images through to response for successful results.
-    let passthroughImages: ReturnType<typeof extractImageContentBlocks> = [];
-    if (isRecord(toolResult) && Array.isArray(toolResult.content)) {
-      const extracted = extractImageContentBlocks(toolResult);
-      if (extracted.length > 0) {
-        if (toolResult.isError !== true) {
-          passthroughImages = extracted;
-        }
-        toolResult = {
-          ...toolResult,
-          content: toolResult.content.filter(
-            (block) => {
-              if (!isRecord(block)) return true;
-              // Strip direct image blocks
-              if (block.type === "image") return false;
-              // Strip resource blocks whose image blob was extracted
-              if (block.type === "resource" && isRecord(block.resource)) {
-                const r = block.resource as Record<string, unknown>;
-                if (typeof r.blob === "string" && r.blob && typeof r.mimeType === "string"
-                  && isSupportedImageMimeType(r.mimeType as string)) {
-                  return false;
-                }
-              }
-              return true;
-            },
-          ),
-        };
-      }
+    // Strip image payloads from tool results before JSON serialization, to
+    // prevent base64 inflation of outputJson. Successful results pass their
+    // extracted images through to the response; error results never have images
+    // extracted, so their payloads are stripped unconditionally and no base64
+    // reaches the inline reply.
+    const passthroughImages = extractImageContentBlocks(toolResult);
+    if (passthroughImages.length > 0 || downstreamIsError) {
+      toolResult = stripImagePayloads(toolResult, { isError: downstreamIsError });
     }
 
     let finalToolResult: unknown = toolResult;
@@ -2273,16 +2287,21 @@ export async function handleUseTool(
     const originalOutputChars = JSON.stringify(untruncatedResult, null, 2).length;
     const estimatedTokens = Math.ceil(originalOutputChars / 4);
 
-    const result: UseToolOutput = {
+    // `paging` is declared here, undefined (so not serialized), to hold its place
+    // before `args_used` and `result` once a paging id is set.
+    const result: UseToolOutput & { paging?: PagingField } = {
       package_id,
       tool_id,
-      args_used: args,
+      paging: undefined,
+      args_used: argsEchoFor(args, effectiveLimit),
       result: finalToolResult,
       telemetry: { duration_ms: duration, status: "ok" },
       ...(cachedTool?.tool?.annotations ? { annotations: cachedTool.tool.annotations } : {}),
     };
 
     let outputJson = JSON.stringify(result, null, 2);
+    // Text after the JSON document (the paging hint); kept if the JSON is re-serialized.
+    let trailer = "";
 
     if (wasTruncated && effectiveLimit !== undefined) {
       const resultId = randomUUID();
@@ -2294,12 +2313,14 @@ export async function handleUseTool(
       result.telemetry.output_truncated = true;
       result.telemetry.original_output_chars = originalOutputChars;
       result.telemetry.result_id = resultId;
+      result.paging = pagingField(resultId);
       outputJson = JSON.stringify(result, null, 2);
       result.telemetry.output_chars = outputJson.length;
       outputJson = JSON.stringify(result, null, 2);
 
       // Continuation hint — offset 0 returns the full untruncated output from the start
-      outputJson += `\n\n[To retrieve the full untruncated result: use_tool({ package_id: "${package_id}", tool_id: "${tool_id}", args: {}, result_id: "${resultId}", output_offset: 0 })]`;
+      trailer = `\n\n[To retrieve the full untruncated result: use_tool({ package_id: "${package_id}", tool_id: "${tool_id}", args: {}, result_id: "${resultId}", output_offset: 0 })]`;
+      outputJson += trailer;
 
       logger.warn("Tool output truncated", {
         package_id,
@@ -2332,9 +2353,45 @@ export async function handleUseTool(
     // (e.g., non-text content blocks with large base64 data survived text truncation),
     // replace result with compact placeholder and trigger continuation. The JSON envelope
     // must remain valid (parseable) — downstream consumers parse the leading JSON.
-    const safetyNetThreshold = Math.max(effectiveLimit !== undefined ? effectiveLimit + effectiveLimit : 0, SERIALIZED_OUTPUT_SAFETY_NET_FLOOR);
     let safetyNetFired = false;
     let safetyNetOriginalChars: number | undefined;
+    // Short text beside large structuredContent: the inline reply is about to be
+    // replaced by the placeholder, so save text and structured data to a file
+    // instead. Judged by the same threshold as the placeholder, so a result that
+    // is returned whole today (e.g. an app's large budget) stays whole.
+    if (
+      effectiveLimit !== undefined &&
+      materializationLimit !== undefined &&
+      outputJson.length > safetyNetThreshold &&
+      !downstreamIsError &&
+      isRecord(toolResult) &&
+      isRecord(toolResult.structuredContent) &&
+      process.env.REBEL_WORKSPACE_PATH
+    ) {
+      try {
+        const matResult = await materializeOutput(
+          package_id,
+          tool_id,
+          args,
+          toolResult,
+          duration,
+          process.env.REBEL_WORKSPACE_PATH,
+          materializationLimit,
+          { includeStructuredContent: true },
+        );
+        if (matResult) {
+          resetValidationAttempt(downstreamValidationAttemptKey);
+          return materializedReply(matResult, passthroughImages);
+        }
+      } catch (err: any) {
+        logger.warn("Structured content materialization failed, falling back to continuation", {
+          error: err.message,
+          package_id,
+          tool_id
+        });
+      }
+    }
+
     if (effectiveLimit !== undefined && outputJson.length > safetyNetThreshold) {
       const originalOutputLength = outputJson.length;
 
@@ -2356,6 +2413,7 @@ export async function handleUseTool(
       result.telemetry.output_truncated = true;
       result.telemetry.original_output_chars = originalOutputLength;
       result.telemetry.result_id = continuationResultId;
+      result.paging = pagingField(continuationResultId);
 
       outputJson = JSON.stringify(result, null, 2);
       result.telemetry.output_chars = outputJson.length;

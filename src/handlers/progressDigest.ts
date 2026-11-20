@@ -3,7 +3,8 @@ import { createHash } from 'node:crypto';
 /** Private producer control, computed on the complete result before any rewrite. */
 export interface ProgressDigestV1 { version: 1; digest: string }
 
-function canonicalJson(value: unknown): string {
+/** Compact JSON with object keys sorted and undefined properties omitted. */
+export function canonicalJson(value: unknown): string {
   if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value);
   if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
