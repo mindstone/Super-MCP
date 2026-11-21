@@ -470,7 +470,8 @@ async function resolveOutputPath(outputFile: string): Promise<{ absolutePath: st
     ...relativeFromRoot.split(path.sep).filter(Boolean),
   );
   const tempSuffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-  const absoluteTempFile = `${absolutePath}.${tempSuffix}.tmp`;
+  // Not derived from the file name, so a name near the 255-byte limit still exports (FOX-11742).
+  const absoluteTempFile = path.join(realOutputDir, `.bulk-export-${tempSuffix}.tmp`);
 
   return { absolutePath, absoluteTempFile, relativePath };
 }

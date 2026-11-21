@@ -58,6 +58,16 @@ describe("bulk_export result payloads", () => {
     return { run, callTool, readOutput };
   }
 
+  it("exports to a file whose name is close to the 255-byte limit (FOX-11742)", async () => {
+    const name = `${"n".repeat(232)}.ndjson`;
+    const { run } = createHarness({ content: [{ type: "text", text: JSON.stringify({ attendees: [{ id: 1 }] }) }] });
+    const output = await run({ output_file: name });
+    expect(output.errors ?? []).toEqual([]);
+    const exportsDir = path.join(workspace, ".rebel", "exports");
+    expect(await fs.readFile(path.join(exportsDir, name), "utf8")).toContain('"id":1');
+    expect(await fs.readdir(exportsDir)).toEqual([name]);
+  });
+
   it("exports structuredContent rows and uses its next-page token", async () => {
     const { run, callTool, readOutput } = createHarness(
       { content: [], structuredContent: { attendees: [{ id: 1 }, { id: 2 }], nextCursor: "page-2" } },
