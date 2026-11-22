@@ -119,6 +119,14 @@ type ManifestPackageEntry = {
   status: string;
 };
 
+/** Host request metadata naming the caller run's automation; anything malformed is ignored. */
+function readCallerAutomation(value: unknown): { automationId: string; automationName: string } | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const { automationId, automationName } = value as Record<string, unknown>;
+  return typeof automationId === "string" && automationId.length > 0 && typeof automationName === "string"
+    ? { automationId, automationName } : undefined;
+}
+
 /**
  * Read `?packages=`: one id per repeated parameter, or the older comma-joined
  * list. A value that is exactly a registered package id is that id, so an id
@@ -1025,6 +1033,9 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           case "use_tool":
             return await handleUseTool(args as any, registry, catalog, validator,
               { ...(request.params._meta?.['rebel/captureProgressDigest'] === true ? { captureProgressDigest: true as const } : {}),
+                callerSessionId: typeof request.params._meta?.['rebel/callerSessionId'] === 'string'
+                  ? request.params._meta['rebel/callerSessionId'] : undefined,
+                callerAutomation: readCallerAutomation(request.params._meta?.['rebel/callerAutomation']),
                 dispatch: { ...captureToolDispatch(server.getClientCapabilities()?.experimental?.['files/readAuthority'], request.params._meta, extra), connectorDispatch: evidence } });
 
           case "bulk_export":

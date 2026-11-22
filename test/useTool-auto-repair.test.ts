@@ -93,6 +93,160 @@ const toolScopedAliasCases = [
   },
 ];
 
+describe("Actions run attribution after argument repair", () => {
+  const source = { kind: "automation", automationId: "daily", automationName: "Daily report", sessionId: "model-run" };
+  const item = { title: "Review report", source };
+  const itemSchema = {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      source: { type: "object", properties: {
+        kind: { const: "automation" }, automationId: { type: "string" },
+        automationName: { type: "string" }, sessionId: { type: "string" },
+      }, required: ["kind", "automationId", "automationName"], additionalProperties: false },
+    },
+    required: ["title", "source"], additionalProperties: false,
+  };
+  const shapes = ["canonical", "Source", "echoed envelope", "stringified batch", "add batch shortcut", "proposed Action"] as const;
+
+  for (const callerSessionId of ["host-run", undefined]) {
+    it(`stamps the RebelInternal package alias (${callerSessionId ?? "unknown caller"})`, async () => {
+      const { mockRegistry, mockCatalog, validator, mockClient } = createMocks(itemSchema, {
+        packageId: "RebelInternal", toolIds: ["rebel_inbox_add"],
+      });
+      const result = await handleUseTool({
+        package_id: "RebelInternal", tool_id: "rebel_inbox_add", args: item,
+      }, mockRegistry, mockCatalog, validator, { callerSessionId });
+      expect(result.isError).toBe(false);
+      expect(mockClient.callTool).toHaveBeenCalledWith("rebel_inbox_add", {
+        title: item.title,
+        source: { kind: "automation", automationId: "daily", automationName: "Daily report",
+          ...(callerSessionId ? { sessionId: callerSessionId } : {}) },
+      });
+    });
+
+    it.each(shapes)(`uses only host attribution (${callerSessionId ?? "unknown caller"}) for %s`, async shape => {
+      const batch = shape === "stringified batch" || shape === "add batch shortcut";
+      const toolId = shape === "stringified batch" ? "rebel_inbox_add_many"
+        : shape === "proposed Action" ? "rebel_inbox_propose" : "rebel_inbox_add";
+      const schema = batch ? {
+        type: "object", properties: { items: { type: "array", items: itemSchema } },
+        required: ["items"], additionalProperties: false,
+      } : itemSchema;
+      const args = shape === "Source" ? { title: item.title, Source: source }
+        : shape === "echoed envelope" ? { package_id: "RebelInbox", tool_id: toolId, args: item }
+          : batch ? { items: shape === "stringified batch" ? JSON.stringify([item]) : [item] } : item;
+      const { mockRegistry, mockCatalog, validator, mockClient } = createMocks(schema, {
+        packageId: "RebelInbox", toolIds: [toolId],
+      });
+      const result = await handleUseTool({
+        package_id: "RebelInbox", tool_id: toolId, args,
+        // An echoed model metadata field cannot become host call context.
+        _meta: { "rebel/callerSessionId": "model-meta-run" },
+      } as Parameters<typeof handleUseTool>[0], mockRegistry, mockCatalog, validator, { callerSessionId });
+      expect(result.isError).toBe(false);
+      const expectedSource = { kind: "automation", automationId: "daily", automationName: "Daily report",
+        ...(callerSessionId ? { sessionId: callerSessionId } : {}) };
+      expect(mockClient.callTool).toHaveBeenCalledTimes(1);
+      expect(mockClient.callTool).toHaveBeenCalledWith(toolId,
+        batch ? { items: [{ title: item.title, source: expectedSource }] } : { title: item.title, source: expectedSource });
+      expect(source.sessionId).toBe("model-run");
+    });
+  }
+});
+
+describe("useTool — an Action an automation run creates links its run", () => {
+  const callerAutomation = { automationId: "intro-drafts", automationName: "Intro drafts" };
+  const runSource = { kind: "automation", ...callerAutomation, sessionId: "host-run" };
+  const brief = { kind: "workspace", path: "Chief-of-Staff/intro.md", label: "Introduction draft" };
+  const open = { type: "object" };
+  const schema = { type: "object", properties: {
+    title: { type: "string" }, source: open, references: { type: "array" },
+    items: { type: "array", items: { type: "object" } },
+  } };
+  const call = async (toolId: string, args: Record<string, unknown>, context: Parameters<typeof handleUseTool>[4]) => {
+    const { mockRegistry, mockCatalog, validator, mockClient } = createMocks(schema, { packageId: "RebelInbox", toolIds: [toolId] });
+    const result = await handleUseTool({ package_id: "RebelInbox", tool_id: toolId, args }, mockRegistry, mockCatalog, validator, context);
+    expect(result.isError).toBe(false);
+    return mockClient.callTool.mock.calls.at(-1)![1];
+  };
+
+  const host = { callerSessionId: "host-run", callerAutomation };
+  const schema2 = { ...schema, properties: { ...schema.properties, source: {}, references: {} } };
+  const callLoose = async (toolId: string, args: Record<string, unknown>) => {
+    const { mockRegistry, mockCatalog, validator, mockClient } = createMocks(schema2, { packageId: "RebelInbox", toolIds: [toolId] });
+    const result = await handleUseTool({ package_id: "RebelInbox", tool_id: toolId, args }, mockRegistry, mockCatalog, validator, host);
+    expect(result.isError).toBe(false);
+    return mockClient.callTool.mock.calls.at(-1)![1];
+  };
+
+  it.each(["rebel_inbox_add", "rebel_inbox_propose"])("moves a workspace source into references for %s", async toolId => {
+    expect(await call(toolId, { title: "Review intro", source: brief }, host))
+      .toEqual({ title: "Review intro", source: runSource, references: [brief] });
+  });
+
+  it.each(["rebel_inbox_add", "rebel_inbox_propose"])("treats a string source as text, label kept, for %s", async toolId => {
+    expect(await callLoose(toolId, { title: "Review intro", source: "  From the sweep " }))
+      .toEqual({ title: "Review intro", source: { ...runSource, label: "From the sweep" } });
+    expect(await callLoose(toolId, { title: "Review intro", source: "   " }))
+      .toEqual({ title: "Review intro", source: runSource });
+  });
+
+  it.each([
+    ["one reference object", { kind: "url", url: "https://example.com/context" }],
+    ["one path string", "other.md"],
+  ])("keeps the workspace path beside %s", async (_case, reference) => {
+    expect(await callLoose("rebel_inbox_add", { title: "Review intro", source: brief, references: reference }))
+      .toEqual({ title: "Review intro", source: runSource, references: [reference, brief] });
+    expect(await callLoose("rebel_inbox_add", { title: "Review intro", source: brief, references: brief.path }))
+      .toEqual({ title: "Review intro", source: runSource, references: [brief.path] });
+  });
+
+  it("gives an automation source the host's run automation, never the model's", async () => {
+    expect(await call("rebel_inbox_add", { title: "Review intro", source: {
+      kind: "automation", automationId: "model-choice", automationName: "Model choice", sessionId: "model-run", label: "Weekly",
+    } }, host)).toEqual({ title: "Review intro", source: { ...runSource, label: "Weekly" } });
+  });
+
+  it("applies the rule to each item of a batch", async () => {
+    const sent = await callLoose("rebel_inbox_add_many", { items: [
+      { title: "No source" },
+      { title: "Text", source: { kind: "text", label: "Sweep" } },
+      { title: "String", source: "Sweep" },
+      { title: "Referenced", source: brief, references: [{ kind: "workspace", path: brief.path }] },
+      { title: "Referenced by path", source: brief, references: [brief.path] },
+      { title: "One reference", source: brief, references: "other.md" },
+      { title: "Model run", source: { kind: "automation", automationId: "x", automationName: "X", sessionId: "guess" } },
+      { title: "Role", source: { kind: "role", roleId: "r", roleName: "Chief of staff" } },
+      { title: "Meeting", source: { kind: "meeting", meetingId: "m" } },
+      { title: "Conversation", source: { kind: "conversation", sessionId: "other" } },
+    ] });
+    expect(sent).toEqual({ items: [
+      { title: "No source", source: runSource },
+      { title: "Text", source: { ...runSource, label: "Sweep" } },
+      { title: "String", source: { ...runSource, label: "Sweep" } },
+      { title: "Referenced", source: runSource, references: [{ kind: "workspace", path: brief.path }] },
+      { title: "Referenced by path", source: runSource, references: [brief.path] },
+      { title: "One reference", source: runSource, references: ["other.md", brief] },
+      { title: "Model run", source: runSource },
+      { title: "Role", source: { kind: "role", roleId: "r", roleName: "Chief of staff" } },
+      { title: "Meeting", source: { kind: "meeting", meetingId: "m" } },
+      { title: "Conversation", source: { kind: "conversation", sessionId: "other" } },
+    ] });
+  });
+
+  it.each([
+    ["no host automation", { callerSessionId: "host-run" }],
+    ["an automation without a caller session", { callerAutomation }],
+  ])("leaves a workspace or text source as given with %s", async (_case, context) => {
+    expect(await call("rebel_inbox_add", { title: "Review intro", source: brief }, context))
+      .toEqual({ title: "Review intro", source: brief });
+    expect(await call("rebel_inbox_add", { title: "Review intro", source: { kind: "text", label: "Notes" } }, context))
+      .toEqual({ title: "Review intro", source: { kind: "text", label: "Notes" } });
+    expect(await call("rebel_inbox_add", { title: "Review intro" }, context)).toEqual({ title: "Review intro" });
+  });
+});
+
 describe("useTool — Stage 0 schema-driven auto-repair", () => {
   it.each(toolScopedAliasCases)(
     "repairs $toolId.$source → $destination and records the key_alias breadcrumb",

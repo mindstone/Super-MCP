@@ -286,6 +286,47 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Who made an Action. The host owns attribution: an item an automation run
+ * creates always links that run, with the run's own automation, whatever
+ * source the model picked, so the person can open the run from the card.
+ * A missing or text source (a bare string is text) becomes the run's
+ * automation source, its label kept; a workspace source does too, its path
+ * kept as a reference. Role, meeting and conversation sources are left alone.
+ * Without a resolved run, an automation source keeps only the host's session
+ * id (none when the caller is unknown) and anything else is left as given.
+ */
+function attributeInboxItem(
+  item: Record<string, unknown>,
+  callerSessionId: string | undefined,
+  automation: { automationId: string; automationName: string } | undefined,
+): Record<string, unknown> {
+  const given = typeof item.source === "string"
+    ? (item.source.trim() ? { kind: "text", label: item.source.trim() } : undefined)
+    : item.source;
+  const kind = isRecord(given) ? given.kind : undefined;
+  if (!automation) {
+    if (kind !== "automation" || !isRecord(given)) return item;
+    const source = { ...given };
+    delete source.sessionId;
+    if (callerSessionId) source.sessionId = callerSessionId;
+    return { ...item, source };
+  }
+  if (given !== undefined && given !== null && kind !== "text" && kind !== "workspace" && kind !== "automation") return item;
+  const label = isRecord(given) && kind !== "workspace" && typeof given.label === "string" ? given.label : undefined;
+  const source = { kind: "automation", automationId: automation.automationId,
+    automationName: automation.automationName, sessionId: callerSessionId, ...(label !== undefined ? { label } : {}) };
+  const path = kind === "workspace" && isRecord(given) && typeof given.path === "string" ? given.path.trim() : "";
+  if (!path || !isRecord(given)) return { ...item, source };
+  // The connector accepts one reference (a path string or an object) as well as a list.
+  const references = item.references === undefined || item.references === null ? []
+    : Array.isArray(item.references) ? item.references : [item.references];
+  const already = references.some(existing => (typeof existing === "string" && existing.trim() === path)
+    || (isRecord(existing) && existing.kind === "workspace" && typeof existing.path === "string" && existing.path.trim() === path));
+  const reference = { kind: "workspace", path: given.path, ...(typeof given.label === "string" ? { label: given.label } : {}) };
+  return { ...item, source, references: already ? references : [...references, reference] };
+}
+
 type ConnectDiagnosticErrorClass =
   | "connect_timeout"
   | "connection_closed"
@@ -498,7 +539,14 @@ interface SuperMcpProducerMeta extends SuperMcpTelemetryMeta {
   progressDigestV1?: ProgressDigestV1;
 }
 
-export interface UseToolCallContext { captureProgressDigest?: true; dispatch?: ToolDispatchContext }
+export interface UseToolCallContext {
+  captureProgressDigest?: true;
+  dispatch?: ToolDispatchContext;
+  /** Host request metadata, never read from the model's arguments. */
+  callerSessionId?: string;
+  /** The automation the caller's run belongs to, resolved by the host. */
+  callerAutomation?: { automationId: string; automationName: string };
+}
 
 interface MaterializationMeta {
   status: "materialized" | "oversized_output";
@@ -2160,6 +2208,19 @@ async function handleUseToolImpl(
 
   const startTime = Date.now();
   try {
+    // Attribute the final payload, after every argument repair and tool/package
+    // resolution. Missing host context also removes any model-selected run id.
+    if (/^(?:RebelInbox__)?rebel_inbox_(?:add(?:_many)?|propose)$/.test(tool_id)) {
+      const callerSessionId = context?.callerSessionId;
+      const automation = callerSessionId ? context?.callerAutomation : undefined;
+      const stamp = (item: Record<string, unknown>) => attributeInboxItem(item, callerSessionId, automation);
+      const batch = Array.isArray(args.items);
+      args = {
+        // A batch envelope is not itself an Action, so it gains no source.
+        ...(batch && args.source === undefined ? args : stamp(args)),
+        ...(batch ? { items: args.items.map((item: unknown) => isRecord(item) ? stamp(item) : item) } : {}),
+      };
+    }
     // Stage 6: route through the liveness-gated `registry.callTool` so the idle
     // reaper cannot close the client mid-flight and a transport that closed
     // before any bytes were sent is re-established (no auto-retry on mid-call
