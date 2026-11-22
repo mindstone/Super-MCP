@@ -9,6 +9,7 @@ import { Catalog } from "../catalog.js";
 import { oauthErrorLogText } from "../auth/oauthErrorLogging.js";
 import { getLogger } from "../logging.js";
 import { PackageRegistry } from "../registry.js";
+import { describePackageNotFound } from "../utils/packageResolution.js";
 import { getSecurityPolicy } from "../security.js";
 import { safetyBlock, safetyBlockMessage } from "../safetyDisabledTools.js";
 import { BulkExportInput, BulkExportOutput } from "../types.js";
@@ -803,7 +804,7 @@ function validateSecurityPolicy(packageId: string, toolId: string, args: Record<
     // bulk_export returns error responses rather than throwing coded JSON-RPC
     // errors, so no server-level advice gets appended here — the discovery hint
     // must be in the message itself (residue-chunk9 item 3).
-    return `Package not found: ${packageId}. ${PACKAGE_DISCOVERY_HINT}`;
+    return `${describePackageNotFound(registry, packageId).message}. ${PACKAGE_DISCOVERY_HINT}`;
   }
 
   const block = safetyBlock(packageConfig, toolId, args);

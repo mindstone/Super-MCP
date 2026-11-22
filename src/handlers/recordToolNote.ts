@@ -9,6 +9,7 @@ import {
   formatAmbiguousPackageMessage,
   resolvePackageId,
   type PackageResolutionRegistry,
+  describePackageNotFound,
 } from "../utils/packageResolution.js";
 import {
   getToolNotesStore,
@@ -116,7 +117,7 @@ export async function handleRecordToolNote(
     return makeResponse(
       {
         status: "not_found",
-        message: `Package not found: ${package_id}. ${PACKAGE_DISCOVERY_HINT}`,
+        message: `${describePackageNotFound(registry, package_id).message}. ${PACKAGE_DISCOVERY_HINT}`,
       },
       true,
     );

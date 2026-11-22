@@ -314,6 +314,29 @@ describe("handleRecordToolNote", () => {
     expect(familyCatalog.getTool).not.toHaveBeenCalled();
   });
 
+  it("names the family's set-up accounts for a missing account id, without writing a note (FOX-10918)", async () => {
+    const familyCatalog = createMockCatalog({});
+    const familyRegistry = createMockRegistry(["calendar-account-a"]);
+
+    const result = await handleRecordToolNote(
+      {
+        package_id: "calendar-account-c",
+        tool_id: "list_events",
+        note: "Prefer a narrow date range.",
+      },
+      familyCatalog,
+      familyRegistry,
+      store,
+    );
+
+    expect(result.isError).toBe(true);
+    const parsed = parseResponse(result);
+    expect(parsed.status).toBe("not_found");
+    expect(parsed.message).toContain("'calendar-account-a'");
+    expect(parsed.message).toContain(PACKAGE_DISCOVERY_HINT);
+    expect(familyCatalog.getTool).not.toHaveBeenCalled();
+  });
+
   it("rejects combined discovery tool_id values with an actionable invalid-params error", async () => {
     await expect(
       handleRecordToolNote(

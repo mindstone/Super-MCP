@@ -9,6 +9,7 @@ import {
   formatAmbiguousPackageMessage,
   resolvePackageId,
   type PackageResolutionRegistry,
+  describePackageNotFound,
 } from "../utils/packageResolution.js";
 import { computeSecurityAnnotation, extractRawToolId } from "./annotateToolSecurity.js";
 import {
@@ -60,10 +61,11 @@ export async function handleListTools(
     };
   }
   if (packageResolution.outcome === "not_found") {
+    const notFound = describePackageNotFound(registry, package_id);
     throw {
       code: ERROR_CODES.PACKAGE_NOT_FOUND,
-      message: `Package not found: ${package_id}`,
-      data: { package_id },
+      message: notFound.message,
+      data: notFound.data,
     };
   }
   package_id = packageResolution.packageId;

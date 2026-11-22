@@ -3,6 +3,7 @@ import { ERROR_CODES, type ToolBlockedReason } from "./types.js";
 import { getSecurityPolicy } from "./security.js";
 import { assertNotSafetyDisabled } from "./safetyDisabledTools.js";
 import { getLogger } from "./logging.js";
+import { describePackageNotFound } from "./utils/packageResolution.js";
 
 const logger = getLogger();
 
@@ -52,10 +53,11 @@ export function assertToolAccess(registry: PackageRegistry, package_id: string, 
     };
   }
   if (!packageConfig) {
+    const notFound = describePackageNotFound(registry, package_id);
     throw {
       code: ERROR_CODES.PACKAGE_NOT_FOUND,
-      message: `Package not found: ${package_id}`,
-      data: { package_id },
+      message: notFound.message,
+      data: notFound.data,
     };
   }
 }

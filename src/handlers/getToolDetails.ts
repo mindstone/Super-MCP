@@ -10,6 +10,7 @@ import { resolveToolTarget } from "../toolTargetResolution.js";
 import {
   formatAmbiguousPackageMessage,
   resolvePackageId,
+  describePackageNotFound,
 } from "../utils/packageResolution.js";
 import { computeSecurityAnnotation } from "./annotateToolSecurity.js";
 import { getLogger } from "../logging.js";
@@ -189,7 +190,7 @@ export async function handleGetToolDetails(
       name: failure.toolId,
       schema_hash: "",
       not_found: true,
-      description: `Package not found: ${failure.packageId}. ${PACKAGE_DISCOVERY_HINT}`,
+      description: `${describePackageNotFound(registry, failure.packageId).message}. ${PACKAGE_DISCOVERY_HINT}`,
     });
   }
 

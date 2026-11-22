@@ -1662,6 +1662,11 @@ export class PackageRegistry {
     return [...this.skippedPackages];
   }
 
+  /** Ids the person switched off; filtered out of the registry at load. */
+  getDisabledPackageIds(): string[] {
+    return [...(this.config.disabledServers ?? [])];
+  }
+
   async evictClient(
     packageId: string,
     reason: "unhealthy" | "explicit" | "restart" | "idle" | "shutdown" = "explicit",
