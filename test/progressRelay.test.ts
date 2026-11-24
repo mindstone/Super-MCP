@@ -262,15 +262,15 @@ it('logs asynchronous forwarding failures', async () => {
   })).toBe('final');
   expect(send).toHaveBeenCalledTimes(2); expect(logs.warn).toHaveBeenCalledTimes(2);
 });
-it.each(['none', 'frequent', 'delayed sender', 'Stop'])('cleans the relay at a fixed scaled budget: %s', async mode => {
+it.each(['none', 'delayed sender', 'Stop'])('cleans the relay at a scaled idle budget: %s', async mode => {
   vi.useFakeTimers(); const abort = new AbortController(); let relaySignal!: AbortSignal; let callback!: (value: Progress) => void;
   const send = vi.fn(mode === 'delayed sender' ? () => new Promise<void>(() => {}) : async () => {});
   const result = relayToolProgress({ signal: abort.signal, onprogress: send }, 100, async options => {
-    relaySignal = options.signal; callback = options.onprogress!; expect(options.resetTimeoutOnProgress).toBe(false);
+    relaySignal = options.signal; callback = options.onprogress!; expect(options.resetTimeoutOnProgress).toBe(true);
     if (mode === 'delayed sender') { callback({ progress: 1 }); return 'final'; } return new Promise<string>(() => {});
   });
   const outcome = mode === 'delayed sender' ? expect(result).resolves.toBe('final') : expect(result).rejects.toThrow(mode === 'Stop' ? 'Stopped' : 'Request timed out');
-  for (let i = 0; i < 9; i++) { if (mode === 'frequent') callback({ progress: i }); await vi.advanceTimersByTimeAsync(10); }
+  for (let i = 0; i < 9; i++) { await vi.advanceTimersByTimeAsync(10); }
   if (mode === 'Stop') abort.abort(new Error('Stopped'));
   else { expect(relaySignal.aborted).toBe(false); await vi.advanceTimersByTimeAsync(10); }
   await outcome;
@@ -278,11 +278,27 @@ it.each(['none', 'frequent', 'delayed sender', 'Stop'])('cleans the relay at a f
   expect(relaySignal.aborted).toBe(true); expect(vi.getTimerCount()).toBe(0);
   const count = send.mock.calls.length; callback({ progress: 100 }); await vi.runAllTimersAsync(); expect(send).toHaveBeenCalledTimes(count);
 });
-it.each(routes)('child budget stays fixed with frequent progress: %j', async ({ kind, home }) => {
-  const { registry } = await setup(kind, home, 10, 150); const args = await workspace('timeout'); const messages: Progress[] = []; const start = Date.now();
-  await expect(registry.callTool('notebook', 'stream-files', args, { kind: 'standalone', onprogress: item => { messages.push(item); } })).rejects.toThrow(/timed out|reachable/);
-  expect(Date.now() - start).toBeLessThan(1500); expect(messages.length).toBeGreaterThan(4);
+it.each(routes)('child progress survives the old total budget: %j', async ({ kind, home }) => {
+  const { registry } = await setup(kind, home, 10, 150); const args = await workspace('idle'); const messages: Progress[] = [];
+  const result = registry.callTool('notebook', 'stream-files', args, { kind: 'standalone', onprogress: item => { messages.push(item); } });
+  void result.catch(() => {}); // Attach rejection handling before awaiting the progress assertion.
+  await vi.waitFor(() => expect(messages.length).toBeGreaterThan(25));
+  await writeFile(args.releaseFile, 'go');
+  expect((await result).isError).toBeUndefined();
   const count = messages.length; await new Promise(resolve => setTimeout(resolve, 30)); expect(messages).toHaveLength(count);
+});
+
+it('renews the relay idle backstop even without an upstream progress consumer', async () => {
+  vi.useFakeTimers(); let callback!: (value: Progress) => void; let finish!: () => void;
+  const result = relayToolProgress({}, 100, async options => {
+    callback = options.onprogress!;
+    await new Promise<void>(resolve => { finish = resolve; }); return 'done';
+  });
+  try {
+    expect(callback).toBeTypeOf('function');
+    for (let i = 0; i < 20; i++) { await vi.advanceTimersByTimeAsync(50); callback({ progress: i }); }
+    finish(); expect(await result).toBe('done'); expect(vi.getTimerCount()).toBe(0);
+  } finally { finish(); await result.catch(() => {}); }
 });
 
 it('preserves progress coalesced with the final SDK response in one transport read', async () => {
@@ -308,15 +324,15 @@ it('preserves progress coalesced with the final SDK response in one transport re
   expect(messages.map(item => item.progress)).toEqual([1, 2, 3, 4, 5, 6]);
 });
 
-it.each([false, true])('omits child progress tokens without a parent consumer (home %s)', async home => {
+it.each([false, true])('requests child progress for idle protection without a parent consumer (home %s)', async home => {
   const { registry, upstream, homeEndpoint } = await setup('http', home);
   const args = await workspace('no-token'); await writeFile(args.releaseFile, 'go');
   const result = await registry.callTool('notebook', 'stream-files', args);
   expect(result.isError).toBeUndefined();
   for (const endpoint of [upstream, homeEndpoint].filter(Boolean)) {
     expect(endpoint!.calls).toHaveLength(1);
-    expect(endpoint!.calls[0].params).not.toHaveProperty('_meta.progressToken');
-    expect(endpoint!.wireTokens).toEqual([]);
+    expect(endpoint!.calls[0].params).toHaveProperty('_meta.progressToken');
+    expect(endpoint!.wireTokens.length).toBeGreaterThan(0);
   }
 });
 it('keeps only the latest queued update under a slow sender', async () => {

@@ -372,7 +372,7 @@ describe('central source preflight and declared forwarding compatibility', () =>
     expect(signal).toBeInstanceOf(AbortSignal);
     expect(signal.aborted).toBe(false);
     // AbortSignal.any follows the source as well as the fixed call deadline.
-    expect(dispatch.mock.calls[0][2].resetTimeoutOnProgress).toBe(false);
+    expect(dispatch.mock.calls[0][2].resetTimeoutOnProgress).toBe(true);
     source.controller.abort(); expect(signal.aborted).toBe(true);
   });
 
@@ -450,7 +450,7 @@ describe('central source preflight and declared forwarding compatibility', () =>
     expect(signal).toBeInstanceOf(AbortSignal);
     expect(signal.aborted).toBe(false);
     // AbortSignal.any follows the source as well as the fixed call deadline.
-    expect(dispatch.mock.calls[0][2].resetTimeoutOnProgress).toBe(false);
+    expect(dispatch.mock.calls[0][2].resetTimeoutOnProgress).toBe(true);
     expect(envelope).toEqual([{ path: sourceFile, name: 'report.txt', contentBase64: 'YWJj' }]);
     expect(Object.keys((envelope as any)[0]).sort()).toEqual(['contentBase64', 'name', 'path']);
     capability.mockReturnValue({}); source.sendRequest.mockClear();

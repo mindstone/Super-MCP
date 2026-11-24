@@ -233,6 +233,7 @@ describe('package homes over in-memory streamable HTTP', () => {
       readMode: { version: 1, mode: 'standalone' },
       metadata: { 'files/readMode': { version: 1, mode: 'standalone' } },
       signal: expect.any(AbortSignal),
+      onprogress: expect.any(Function),
     });
     const bodies = await Promise.all(adapter.requests.filter(req => req.method === 'POST').map(req => req.json()));
     expect(bodies.filter(body => body.method === 'initialize')).toHaveLength(2);

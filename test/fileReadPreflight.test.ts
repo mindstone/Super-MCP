@@ -160,7 +160,7 @@ describe('SDK transport and child request metadata', () => {
       first.abort(); queued.abort();
       await vi.waitFor(() => expect(childSignal.aborted).toBe(true));
       expect(send).toHaveBeenCalledTimes(1);
-      expect(send.mock.calls[0][2]).toMatchObject({ signal: expect.any(AbortSignal), resetTimeoutOnProgress: false });
+      expect(send.mock.calls[0][2]).toMatchObject({ signal: expect.any(AbortSignal), resetTimeoutOnProgress: true });
     } finally { release(); }
     expect(await running).toMatchObject({ name: 'AbortError' });
     expect(await waiting).toMatchObject({ name: 'AbortError' });
@@ -248,7 +248,7 @@ describe('preflight failure and negotiation boundaries', () => {
     await registry.callTool('fixture', 'upload', { file: '/source' }, context);
     expect(send).toHaveBeenCalledTimes(1);
     expect(send.mock.calls[0][0]).toEqual({ name: 'upload', arguments: { file: '/source' } });
-    expect(send.mock.calls[0][2]).toMatchObject({ signal: expect.any(AbortSignal), resetTimeoutOnProgress: false });
+    expect(send.mock.calls[0][2]).toMatchObject({ signal: expect.any(AbortSignal), resetTimeoutOnProgress: true });
     expect(metadata).not.toHaveBeenCalled();
     expect(context.kind === 'origin' && context.sendRequest).not.toHaveBeenCalled();
   });

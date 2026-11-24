@@ -1,3 +1,4 @@
+import { RequestQueueProgress } from './requestQueueProgress.js';
 import type { InputBases } from '../fileReadInputs.js';
 import { effectiveInputBases } from '../fileReadPreflight.js';
 import { FILE_READ_MODES, relayToolProgress, type ChildToolCallContext } from '../fileReadProtocol.js';
@@ -427,6 +428,7 @@ export class StdioMcpClient implements McpClient {
   private packageId: string;
   private config: PackageConfig;
   private requestQueue: PQueue;
+  private queueProgress = new RequestQueueProgress();
   private queueAbort = new AbortController();
 
   // --- Per-package connect diagnostics (B1) ---
@@ -892,12 +894,18 @@ export class StdioMcpClient implements McpClient {
     }
   }
 
-  private enqueue<T>(job: () => Promise<T>): Promise<T> {
+  private async enqueue<T>(job: (context?: ChildToolCallContext) => Promise<T>, context?: ChildToolCallContext): Promise<T> {
     const signal = this.queueAbort.signal;
-    return this.requestQueue.add(async () => {
-      signal.throwIfAborted();
-      return job();
-    });
+    const progress = context ? this.queueProgress.track(context, this.requestQueue.pending >= this.requestQueue.concurrency) : undefined;
+    try {
+      return await this.requestQueue.add(async () => {
+        signal.throwIfAborted();
+        context?.signal?.throwIfAborted();
+        progress?.admit();
+        try { return await job(progress?.context); }
+        finally { this.queueProgress.moved(); }
+      });
+    } finally { progress?.dispose(); }
   }
 
   private toolMetadata = new Map<string, Record<string, unknown> | undefined>();
@@ -939,8 +947,7 @@ export class StdioMcpClient implements McpClient {
   }
 
   async callTool(name: string, args: any, context: ChildToolCallContext = { readMode: { version: 1, mode: "standalone" } }): Promise<any> {
-    // Matches Rebel Core's 90-minute TOOL_CALL_TIMEOUT in src/core/rebelCore/mcpClient.ts
-    // so a call Rebel has given up on frees its connector slot at about the same time.
+    // Matches the outer SDK's 90-minute idle backstop; raw progress renews it.
     // Stdio connectors run one call at a time. The env var overrides the default.
     const timeout = getToolTimeout(this.config);
 
@@ -956,10 +963,10 @@ export class StdioMcpClient implements McpClient {
     if (context.readMode === "unnegotiated") throw new Error("Local file read mode is required");
     const readMode = context.readMode;
     this.servedToolCall = true;
-    return this.enqueue(async () => {
+    return this.enqueue(async (queuedContext) => {
       context.signal?.throwIfAborted();
       try {
-        const response = await relayToolProgress(context, timeout, options => {
+        const response = await relayToolProgress(queuedContext!, timeout, options => {
           if (context.connectorDispatch) context.connectorDispatch.started = true;
           return this.client.callTool({
             name,
@@ -987,7 +994,7 @@ export class StdioMcpClient implements McpClient {
         });
         throw error;
       }
-    });
+    }, context);
   }
 
   async close(): Promise<void> {

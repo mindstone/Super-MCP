@@ -38,7 +38,7 @@ describe('per-call tool timeout', () => {
     expect(callTool).toHaveBeenCalledWith(
       { name: 'write_note', arguments: { text: 'hello' }, _meta: { 'files/readMode': { version: 1, mode: 'standalone' } } },
       undefined,
-      { timeout: expected, resetTimeoutOnProgress: false, signal: expect.any(AbortSignal) },
+      { timeout: expected, resetTimeoutOnProgress: true, onprogress: expect.any(Function), signal: expect.any(AbortSignal) },
     );
 
     const sendRequest = vi.fn().mockResolvedValue({ version: 1, outcome: 'allowed', reads: [{ location: ['file'], rawPath: '/source', canonicalPath: '/physical' }] });

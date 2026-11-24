@@ -18,7 +18,7 @@ import type { PackageConfig } from '../src/types.js';
 
 vi.mock('../src/logging.js', () => ({ getLogger: () => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }) }));
 
-// FOX-7907: once its caller has stopped or timed out, a call still waiting for a
+// Once its caller has stopped or timed out, a call still waiting for a
 // connector slot must never reach the connector. Stop also reaches a running child request.
 
 const cleanup: Array<() => Promise<unknown>> = [];
@@ -34,12 +34,14 @@ async function busyConnector(transport: 'stdio' | 'http') {
   const connector = new Server({ name: 'acme', version: '1' }, { capabilities: { tools: {} } });
   const sent: string[] = [];
   const cancelled: string[] = [];
+  const progress = new Map<string, () => Promise<void>>();
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   connector.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [tool] }));
   connector.setRequestHandler(CallToolRequestSchema, async ({ params }, extra) => {
     const label = String(params.arguments?.label);
     sent.push(label);
+    progress.set(label, () => extra.sendNotification({ method: 'notifications/progress', params: { progressToken: params._meta!.progressToken!, progress: 1 } }));
     extra.signal.addEventListener('abort', () => cancelled.push(label), { once: true });
     if (label.startsWith('running')) await held;
     return { content: [{ type: 'text', text: label }] };
@@ -54,7 +56,7 @@ async function busyConnector(transport: 'stdio' | 'http') {
     ? { command: 'unused', cwd: '/connector' } : { url: 'https://connector.example/mcp' } } });
   vi.spyOn(registry, 'getClient').mockResolvedValue(local);
   cleanup.push(() => connector.close(), () => internals.client.close(), () => registry.closeAll());
-  return { registry, sent, cancelled, release, internals };
+  return { registry, sent, cancelled, release, internals, progress };
 }
 
 /** Fills every connector slot through `call`, then waits until each running call has reached the connector. */
@@ -69,7 +71,7 @@ async function waitingInQueue(fixture: Awaited<ReturnType<typeof busyConnector>>
   await vi.waitFor(() => expect(fixture.internals.requestQueue.size).toBe(1));
 }
 
-/** Serves `registry` as the package home of another Rebel, which reaches it over streamable HTTP. */
+/** Serves `registry` as a package home reached over streamable HTTP. */
 function packageHome(registry: PackageRegistry) {
   const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
   vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -78,7 +80,7 @@ function packageHome(registry: PackageRegistry) {
     let transport = sessions.get(request.headers.get('mcp-session-id') ?? '');
     if (body?.method === 'initialize') {
       const server = createPackageServer(registry, 'acme');
-      transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: randomUUID, enableJsonResponse: true });
+      transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: randomUUID });
       await server.connect(transport);
       cleanup.push(() => server.close());
     }
@@ -103,14 +105,100 @@ describe.each([
     const fixture = await busyConnector(transport);
     const entry = route === 'directly' ? fixture.registry : packageHome(fixture.registry);
     const router = createPackageServer(entry, 'acme');
-    const host = new Client({ name: 'rebel', version: '1' });
+    const host = new Client({ name: 'host', version: '1' });
     const [hostSide, routerSide] = InMemoryTransport.createLinkedPair();
     await Promise.all([host.connect(hostSide), router.connect(routerSide)]);
     cleanup.push(() => router.close(), () => host.close());
-    const call = (label: string, options?: { signal?: AbortSignal; timeout?: number }) =>
+    const call = (label: string, options?: { signal?: AbortSignal; timeout?: number; onprogress?: (progress: { progress: number; message?: string }) => void; resetTimeoutOnProgress?: boolean }) =>
       host.callTool({ name: 'write', arguments: { label } }, undefined, options);
     return { ...fixture, call };
   }
+
+  it.each([true, false])('renews a waiting call only on real queue movement (running progress: %s)', async progressing => {
+    const fixture = await throughPackageEndpoint();
+    const stop = new AbortController();
+    const running = await fillSlots(fixture, label => fixture.call(label, { signal: stop.signal }).catch(error => error));
+    const notifications: { progress: number; message?: string }[] = [];
+    const idleMs = 30 * 60_000;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    let settled = false;
+    const next = fixture.call('waiting', { timeout: idleMs, resetTimeoutOnProgress: true, onprogress: progress => notifications.push(progress) })
+      .then(value => { settled = true; return value; }, error => { settled = true; return error; });
+    try {
+      await vi.waitFor(() => expect(fixture.internals.requestQueue.size).toBe(1));
+      for (let minute = 0; minute < 35; minute++) {
+        if (progressing) {
+          await fixture.progress.get('running-0')!();
+          await vi.waitFor(() => expect(notifications).toHaveLength(minute + 1));
+        }
+        await vi.advanceTimersByTimeAsync(60_000);
+      }
+      expect(settled).toBe(!progressing);
+      if (progressing) expect(notifications.every(item => item.message === undefined)).toBe(true);
+      else { expect(notifications).toEqual([]); expect(await next).toBeInstanceOf(Error); }
+      stop.abort();
+      await Promise.all(running);
+      if (progressing) {
+        expect(await next).not.toBeInstanceOf(Error);
+        expect(notifications.length).toBeGreaterThan(35); // Settlement and own admission.
+        expect(fixture.sent).toContain('waiting');
+      }
+    } finally { stop.abort(); fixture.release(); await Promise.all(running); await next; vi.useRealTimers(); }
+  });
+
+  it('keeps a queued call\'s progress increasing once the connector starts reporting its own', async () => {
+    const fixture = await throughPackageEndpoint();
+    fixture.internals.requestQueue.concurrency = 1;
+    const stop = new AbortController(), seen: { progress: number; total?: number }[] = [];
+    const first = fixture.call('running-first', { signal: stop.signal }).catch(error => error);
+    await vi.waitFor(() => expect(fixture.sent).toEqual(['running-first']));
+    const second = fixture.call('running-second', { onprogress: progress => seen.push(progress) }).catch(error => error);
+    await waitingInQueue(fixture);
+    await fixture.progress.get('running-first')!();
+    await fixture.progress.get('running-first')!();
+    await vi.waitFor(() => expect(seen).toHaveLength(2));
+    stop.abort();
+    expect(await first).toBeInstanceOf(Error);
+    await vi.waitFor(() => expect(fixture.sent).toContain('running-second'));
+    await vi.waitFor(() => expect(seen).toHaveLength(4)); // The first call's settlement, then its own admission.
+    await fixture.progress.get('running-second')!(); // The connector's own value is 1.
+    await vi.waitFor(() => expect(seen).toHaveLength(5));
+    const values = seen.map(item => item.progress);
+    expect(values.every((value, i) => i === 0 || value > values[i - 1])).toBe(true);
+    fixture.release();
+    await second;
+  });
+
+  it('runs the next two calls when the first of three parallel calls hangs and is cancelled', async () => {
+    const fixture = await throughPackageEndpoint();
+    fixture.internals.requestQueue.concurrency = 1;
+    const stop = new AbortController(), secondProgress = vi.fn(), thirdProgress = vi.fn();
+    const first = fixture.call('running-first', { signal: stop.signal }).catch(error => error);
+    await vi.waitFor(() => expect(fixture.sent).toEqual(['running-first']));
+    const second = fixture.call('second', { onprogress: secondProgress });
+    const third = fixture.call('third', { onprogress: thirdProgress });
+    await vi.waitFor(() => expect(fixture.internals.requestQueue.size).toBe(2));
+    stop.abort();
+    expect(await first).toBeInstanceOf(Error);
+    await Promise.all([second, third]);
+    expect(fixture.sent).toEqual(['running-first', 'second', 'third']);
+    expect(secondProgress).toHaveBeenCalled();
+    expect(thirdProgress).toHaveBeenCalled();
+  });
+
+  it('frees a hung running slot on outer request cancellation so queued work runs', async () => {
+    const fixture = await throughPackageEndpoint();
+    const stop = new AbortController();
+    const running = await fillSlots(fixture, label => fixture.call(label, { signal: stop.signal }).catch(error => error));
+    const next = fixture.call('healthy-next');
+    await waitingInQueue(fixture);
+    stop.abort();
+    for (const answer of await Promise.all(running)) expect(answer).toBeInstanceOf(Error);
+    await next;
+    expect(fixture.sent).toContain('healthy-next');
+    await vi.waitFor(() => expect(fixture.internals.requestQueue.pending).toBe(0));
+    // The hung handler is never released: cancellation of the relay freed its slot.
+  });
 
   it('is never sent after the person presses Stop', async () => {
     const fixture = await throughPackageEndpoint();

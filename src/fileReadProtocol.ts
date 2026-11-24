@@ -64,9 +64,9 @@ export function childCallContext(context: ToolDispatchContext, mode?: ReadMode):
 
 const orderedProgressTransports = new WeakMap<Transport, Transport['onmessage']>();
 
-/** SDK callbacks are synchronous; drain their ordered sends inside the fixed call budget. */
+/** SDK callbacks are synchronous; drain their ordered sends inside the idle call budget. */
 export async function relayToolProgress<T>(context: ProgressContext & { signal?: AbortSignal }, timeout: number,
-  call: (options: { signal: AbortSignal; onprogress?: (progress: Progress) => void; resetTimeoutOnProgress: false }) => Promise<T>, transport?: Transport): Promise<T> {
+  call: (options: { signal: AbortSignal; onprogress?: (progress: Progress) => void; resetTimeoutOnProgress: true }) => Promise<T>, transport?: Transport): Promise<T> {
   if (transport && orderedProgressTransports.get(transport) !== transport.onmessage) {
     // SDK 1.32.1 defers _onnotification; synchronous _onresponse deletes the progress handler.
     // Give notifications their turn first; re-check this workaround on SDK upgrades.
@@ -79,7 +79,8 @@ export async function relayToolProgress<T>(context: ProgressContext & { signal?:
   }
   const deadline = new AbortController();
   const signal = context.signal ? AbortSignal.any([context.signal, deadline.signal]) : deadline.signal;
-  const timer = setTimeout(() => deadline.abort(new McpError(ErrorCode.RequestTimeout, 'Request timed out', { timeout })), timeout);
+  const expire = () => deadline.abort(new McpError(ErrorCode.RequestTimeout, 'Request timed out', { timeout }));
+  let timer = setTimeout(expire, timeout);
   let abort!: () => void;
   const aborted = new Promise<never>((_, reject) => {
     abort = () => reject(signal.reason);
@@ -92,6 +93,7 @@ export async function relayToolProgress<T>(context: ProgressContext & { signal?:
   const terminals = new Map<string | symbol, (typeof queued)[number]>();
   const onprogress = (progress: Progress) => {
     if (!accepting || signal.aborted) return;
+    clearTimeout(timer); timer = setTimeout(expire, timeout);
     const stream = (progress as Progress & { _meta?: Record<string, unknown> })._meta?.['com.mindstone/stream'] as { ref?: unknown; state?: unknown } | undefined;
     const ref = typeof stream?.ref === 'string' ? stream.ref : shared;
     // Delivery markers only; validation belongs to the receiver. Bound terminal
@@ -117,7 +119,7 @@ export async function relayToolProgress<T>(context: ProgressContext & { signal?:
   };
   try {
     signal.throwIfAborted();
-    const result = await Promise.race([call({ signal, ...(context.onprogress ? { onprogress } : {}), resetTimeoutOnProgress: false }), aborted]);
+    const result = await Promise.race([call({ signal, onprogress, resetTimeoutOnProgress: true }), aborted]);
     succeeded = true;
     return result;
   } finally {
