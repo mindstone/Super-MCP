@@ -133,6 +133,6 @@ describe("use_tool retained-data execution guard", () => {
     expect(callTool).toHaveBeenCalledWith(PACKAGE.id, TOOL.name, INPUT.args, {
       kind: "standalone",
       connectorDispatch: { started: false },
-    }, { replayNeverSent: false });
+    });
   });
 });

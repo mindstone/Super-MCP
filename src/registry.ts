@@ -2126,18 +2126,19 @@ export class PackageRegistry {
    * 404 is retried once, because the home refused it before dispatch.
    *
    * FOX-11496: a call leased just before a restart closed its client is never
-   * sent (`NeverSentError`). With `replayNeverSent` (the caller knows the tool
-   * is safe to repeat) it runs once more, only after the failed attempt has
-   * released its lease: a forced refresh's eviction waits for that lease, and
-   * a new lease waits for the eviction.
+   * sent (`NeverSentError`). It runs once more, whatever the tool's hints (the
+   * owner's decision: the replay is the first time the action can run), only
+   * after the failed attempt has released its lease: a forced refresh's
+   * eviction waits for that lease, and a new lease waits for the eviction.
+   * A second `NeverSentError` and every other error propagate unchanged.
   */
-  async callTool(packageId: string, toolId: string, args: any, context: ToolDispatchContext, options?: { replayNeverSent?: boolean }): Promise<any> {
+  async callTool(packageId: string, toolId: string, args: any, context: ToolDispatchContext): Promise<any> {
     // Runtime compatibility for existing embedders; typed callers must select a mode.
     context ??= { kind: "standalone" };
     try {
       return await this.callToolOnce(packageId, toolId, args, context);
     } catch (error) {
-      if (!(error instanceof NeverSentError) || options?.replayNeverSent !== true) throw error;
+      if (!(error instanceof NeverSentError)) throw error;
       logger.info("Replaying a call that was never sent because its connector restarted", { package_id: packageId, tool_id: toolId });
       return await this.callToolOnce(packageId, toolId, args, context);
     }

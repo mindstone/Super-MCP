@@ -30,12 +30,6 @@ export class NeverSentError extends Error {
   }
 }
 
-/** Whether a call that was never sent may be sent once more: the connector says the tool only reads, or repeats safely. */
-export function isSafeToReplayNeverSent(annotations: { readOnlyHint?: boolean; idempotentHint?: boolean; destructiveHint?: boolean } | undefined): boolean {
-  if (!annotations) return false;
-  return (annotations.readOnlyHint === true || annotations.idempotentHint === true) && annotations.destructiveHint !== true;
-}
-
 export const DISPATCH_LABEL_KEY = 'rebelDispatchV1';
 
 export interface DispatchLabelV1 {

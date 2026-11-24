@@ -11,7 +11,6 @@ import {
   USE_TOOL_SOFT_META_PARAMS,
 } from "../types.js";
 import { PackageRegistry } from "../registry.js";
-import { isSafeToReplayNeverSent } from "../dispatchErrors.js";
 import { Catalog, type CachedTool } from "../catalog.js";
 import type { ValidationResult } from "../validator.js";
 import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/types.js";
@@ -2235,8 +2234,7 @@ async function handleUseToolImpl(
       typeof _rebel_meeting_dispatch_capability === 'string' && _rebel_meeting_dispatch_capability.length > 0
       ? { ...args, _rebelMeetingDispatchCapability: _rebel_meeting_dispatch_capability }
       : args;
-    let toolResult = await registry.callTool(package_id, tool_id, connectorArgs, context?.dispatch ?? { kind: "standalone" },
-      { replayNeverSent: isSafeToReplayNeverSent(cachedTool?.tool?.annotations) });
+    let toolResult = await registry.callTool(package_id, tool_id, connectorArgs, context?.dispatch ?? { kind: "standalone" });
     const downstreamIsError = isRecord(toolResult) && toolResult.isError === true;
     const recoveryEvidenceV1 = extractRecoveryEvidenceV1(toolResult);
     toolResult = stripConnectorRecoveryEvidence(toolResult);

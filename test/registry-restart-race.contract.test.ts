@@ -157,19 +157,23 @@ describe('restart contracts through real SDK clients', () => {
     expect(next.received).toHaveLength(1);
   });
 
-  it('a non-read-safe use_tool call leaves real egress with the fixture never_sent verdict and zero connector sends', async () => {
+  it('a write its client never sent is replayed once: the connector runs it exactly once', async () => {
     const { registry, old, next } = await fixture(false, { readOnlyHint: false, destructiveHint: true });
     const call = await routerHost(registry);
     const gate = holdBeforeSdkSend(old.sdk);
-    const outcome = call().catch((error: unknown) => error);
+    const result = call();
+    const settled = result.then(value => ({ value }), error => ({ error }));
     await gate.entered.promise;
     await registry.restartPackage(packageId);
     gate.release.resolve();
-    const error = await outcome;
-    expect(error).toBeInstanceOf(McpError);
-    expect((error as McpError).data).toMatchObject({ rebelDispatchV1: labels.neverSent });
+    const outcome = await settled;
+    expect(outcome).toHaveProperty('value');
+    if (!('value' in outcome)) throw outcome.error;
+    const content = outcome.value.content as Array<{ text: string }>;
+    expect(JSON.parse(content[0].text).result).toEqual(fresh);
+    expect(gate.errors).toEqual([new Error('Not connected')]);
     expect(old.received).toHaveLength(0);
-    expect(next.received).toHaveLength(0);
+    expect(next.received).toHaveLength(1);
   });
 
   it('a read whose never-sent replay fails leaves real egress with the fixture label carrying no verdict or reason', async () => {
@@ -198,7 +202,7 @@ describe('restart contracts through real SDK clients', () => {
   it('closing a real SDK after tools/call was written preserves ConnectionClosed and never sends a replay', async () => {
     const { registry, old, next } = await fixture(true);
     old.holdAnswer();
-    const outcome = registry.callTool(packageId, 'read_item', {}, { kind: 'standalone' }, { replayNeverSent: true })
+    const outcome = registry.callTool(packageId, 'read_item', {}, { kind: 'standalone' })
       .catch((error: unknown) => error);
     await old.written.promise;
     await registry.restartPackage(packageId);
@@ -216,7 +220,7 @@ describe('restart contracts through real SDK clients', () => {
     const controller = new AbortController();
     const cancelled = new Error('Caller cancelled at replay');
     const gate = holdBeforeSdkSend(old.sdk, () => controller.abort(cancelled));
-    const outcome = registry.callTool(packageId, 'read_item', {}, { kind: 'standalone', signal: controller.signal }, { replayNeverSent: true })
+    const outcome = registry.callTool(packageId, 'read_item', {}, { kind: 'standalone', signal: controller.signal })
       .catch((error: unknown) => error);
     await gate.entered.promise;
     await registry.restartPackage(packageId);
@@ -243,7 +247,7 @@ describe('restart contracts through real SDK clients', () => {
       }
       return originalSend(...args);
     });
-    const outcome = registry.callTool(packageId, 'read_item', {}, { kind: 'standalone' }, { replayNeverSent: true });
+    const outcome = registry.callTool(packageId, 'read_item', {}, { kind: 'standalone' });
     const settled = outcome.then(value => ({ value }), error => ({ error }));
     await gate.entered.promise;
     await registry.restartPackage(packageId);
