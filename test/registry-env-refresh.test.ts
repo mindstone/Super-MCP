@@ -149,6 +149,27 @@ describe('PackageRegistry.refreshPackageEnvFromConfigFiles', () => {
     expect(registry.getPackage('QuickBooks')?.env?.QUICKBOOKS_REFRESH_TOKEN).toBe(NEW_TOKEN);
   });
 
+  it('reports env_changed when a refresh observes the unfinished config before its cloud env is restored', async () => {
+    const finishedEnv = {
+      QUICKBOOKS_REFRESH_TOKEN: OLD_TOKEN, QUICKBOOKS_REALM: 'r1',
+      MCP_HOST_BRIDGE_STATE: path.join(dir, 'rebel-inbox-bridge.json'),
+    };
+    await fs.writeFile(configPath, configWith({ qbEnv: finishedEnv }));
+    await registry.refreshPackageEnvFromConfigFiles([configPath]);
+    const live = await registry.getClient('QuickBooks');
+    // The old PUT's first write drops cloud-owned env; the watcher can read it.
+    await fs.writeFile(configPath, configWith());
+    expect(await registry.refreshPackageEnvFromConfigFiles([configPath])).toMatchObject({
+      status: 'ok', updated: [{ packageId: 'QuickBooks', changedKeys: ['MCP_HOST_BRIDGE_STATE'] }],
+    });
+    await fs.writeFile(configPath, configWith({ qbEnv: finishedEnv }));
+    expect(await registry.applyConfigFromFiles([configPath])).toEqual({
+      status: 'ok', added: [], needsReload: [{ packageId: 'QuickBooks', reason: 'env_changed' }],
+    });
+    expect(await registry.getClient('QuickBooks')).toBe(live);
+    expect(spawnsOf('QuickBooks')[0].client.close).not.toHaveBeenCalled();
+  });
+
   it('never logs env values', async () => {
     await fs.writeFile(
       configPath,
