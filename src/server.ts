@@ -723,7 +723,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
                 },
                 args: {
                   type: "object",
-                  description: "Tool-specific arguments matching the schema from get_tool_details or list_tools. Holds the tool's own arguments ONLY — max_output_chars, output_offset, schema_hash, dry_run and result_id are top-level use_tool parameters, not tool arguments, so never nest them inside args.",
+                  description: "Tool-specific arguments matching the schema from get_tool_details or list_tools. Holds the tool's own arguments ONLY — max_output_chars, output_offset, schema_hash, dry_run and result_id are top-level use_tool parameters, not tool arguments, so never nest them inside args. String values are the text itself: a line break in an email, message or document is a real line break, never the two characters backslash and n, which belong only in text meant to contain them (code, JSON).",
                   examples: [
                     { path: "/Users/example/file.txt" },
                     { query: "language:python stars:>100" }
