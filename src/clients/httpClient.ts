@@ -1011,7 +1011,7 @@ export class HttpMcpClient implements McpClient {
 
   private async enqueue<T>(job: (context?: ChildToolCallContext) => Promise<T>, context?: ChildToolCallContext): Promise<T> {
     const signal = this.queueAbort.signal;
-    const progress = context ? this.queueProgress.track(context, this.requestQueue.pending >= this.requestQueue.concurrency) : undefined;
+    const progress = context ? this.queueProgress.track(context, this.requestQueue.pending >= this.requestQueue.concurrency, this.config) : undefined;
     try {
       return await this.requestQueue.add(async () => {
         signal.throwIfAborted();

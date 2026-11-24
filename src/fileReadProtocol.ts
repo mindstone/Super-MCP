@@ -30,7 +30,8 @@ export type AllowedRead = z.infer<typeof allowedReadSchema>;
 export type ReadMode = z.infer<typeof readModeSchema>;
 export type ReadOutcome = z.infer<typeof authorizeReadsResultSchema>;
 export type OriginExtra = Pick<RequestHandlerExtra<Request, Notification>, 'sendRequest' | 'sendNotification' | 'signal'>;
-type ProgressContext = { onprogress?: (progress: Progress) => void | Promise<void> };
+/** MCP progress as relayed: the notification's `_meta` travels with it. */
+type ProgressContext = { onprogress?: (progress: Progress & { _meta?: Record<string, unknown> }) => void | Promise<void> };
 
 /** This is request context, never part of model arguments. */
 export interface ConnectorDispatchEvidence { started: boolean }

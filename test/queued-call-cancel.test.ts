@@ -34,14 +34,14 @@ async function busyConnector(transport: 'stdio' | 'http') {
   const connector = new Server({ name: 'acme', version: '1' }, { capabilities: { tools: {} } });
   const sent: string[] = [];
   const cancelled: string[] = [];
-  const progress = new Map<string, () => Promise<void>>();
+  const progress = new Map<string, (value?: number) => Promise<void>>();
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   connector.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [tool] }));
   connector.setRequestHandler(CallToolRequestSchema, async ({ params }, extra) => {
     const label = String(params.arguments?.label);
     sent.push(label);
-    progress.set(label, () => extra.sendNotification({ method: 'notifications/progress', params: { progressToken: params._meta!.progressToken!, progress: 1 } }));
+    progress.set(label, (value = 1) => extra.sendNotification({ method: 'notifications/progress', params: { progressToken: params._meta!.progressToken!, progress: value } }));
     extra.signal.addEventListener('abort', () => cancelled.push(label), { once: true });
     if (label.startsWith('running')) await held;
     return { content: [{ type: 'text', text: label }] };
@@ -126,16 +126,17 @@ describe.each([
       .then(value => { settled = true; return value; }, error => { settled = true; return error; });
     try {
       await vi.waitFor(() => expect(fixture.internals.requestQueue.size).toBe(1));
+      await vi.waitFor(() => expect(notifications).toHaveLength(1)); // The notice, at once, that it is queued.
       for (let minute = 0; minute < 35; minute++) {
         if (progressing) {
           await fixture.progress.get('running-0')!();
-          await vi.waitFor(() => expect(notifications).toHaveLength(minute + 1));
+          await vi.waitFor(() => expect(notifications).toHaveLength(minute + 2));
         }
         await vi.advanceTimersByTimeAsync(60_000);
       }
       expect(settled).toBe(!progressing);
       if (progressing) expect(notifications.every(item => item.message === undefined)).toBe(true);
-      else { expect(notifications).toEqual([]); expect(await next).toBeInstanceOf(Error); }
+      else { expect(notifications).toHaveLength(1); expect(await next).toBeInstanceOf(Error); }
       stop.abort();
       await Promise.all(running);
       if (progressing) {
@@ -154,19 +155,54 @@ describe.each([
     await vi.waitFor(() => expect(fixture.sent).toEqual(['running-first']));
     const second = fixture.call('running-second', { onprogress: progress => seen.push(progress) }).catch(error => error);
     await waitingInQueue(fixture);
+    await vi.waitFor(() => expect(seen).toHaveLength(1)); // The notice, at once, that it is queued.
     await fixture.progress.get('running-first')!();
     await fixture.progress.get('running-first')!();
-    await vi.waitFor(() => expect(seen).toHaveLength(2));
+    await vi.waitFor(() => expect(seen).toHaveLength(3));
     stop.abort();
     expect(await first).toBeInstanceOf(Error);
     await vi.waitFor(() => expect(fixture.sent).toContain('running-second'));
-    await vi.waitFor(() => expect(seen).toHaveLength(4)); // The first call's settlement, then its own admission.
-    await fixture.progress.get('running-second')!(); // The connector's own value is 1.
-    await vi.waitFor(() => expect(seen).toHaveLength(5));
+    await vi.waitFor(() => expect(seen).toHaveLength(5)); // The first call's settlement, then its own admission.
+    await fixture.progress.get('running-second')!(0); // A connector may start counting at 0.
+    await vi.waitFor(() => expect(seen).toHaveLength(6));
     const values = seen.map(item => item.progress);
     expect(values.every((value, i) => i === 0 || value > values[i - 1])).toBe(true);
     fixture.release();
     await second;
+  });
+
+  it('tells a waiting caller at once that it is queued behind another request, then that the connector took it', async () => {
+    const fixture = await throughPackageEndpoint();
+    fixture.internals.requestQueue.concurrency = 1;
+    const stop = new AbortController(), seen: { progress: number; _meta?: Record<string, unknown> }[] = [];
+    const first = fixture.call('running-first', { signal: stop.signal }).catch(error => error);
+    await vi.waitFor(() => expect(fixture.sent).toEqual(['running-first']));
+    const second = fixture.call('running-second', { onprogress: progress => seen.push(progress) }).catch(error => error);
+    await waitingInQueue(fixture);
+    // The running call is silent, yet the waiting caller hears why it waits.
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0]._meta?.['com.mindstone/connectorWait']).toEqual({ version: 1, phase: 'queued', name: 'Acme' });
+    stop.abort();
+    expect(await first).toBeInstanceOf(Error);
+    await vi.waitFor(() => expect(seen.some(item => (item._meta?.['com.mindstone/connectorWait'] as { phase?: string } | undefined)?.phase === 'admitted')).toBe(true));
+    const admittedAt = seen.length;
+    await fixture.progress.get('running-second')!();
+    await vi.waitFor(() => expect(seen).toHaveLength(admittedAt + 1));
+    expect(seen.at(-1)?._meta?.['com.mindstone/connectorWait']).toBeUndefined(); // The connector's own progress carries no wait marker.
+    fixture.release();
+    await second;
+  });
+
+  it('says nothing about waiting to a call that a free slot takes at once', async () => {
+    const fixture = await throughPackageEndpoint();
+    const seen: { _meta?: Record<string, unknown> }[] = [];
+    const call = fixture.call('running-alone', { onprogress: progress => seen.push(progress) }).catch(error => error);
+    await vi.waitFor(() => expect(fixture.sent).toEqual(['running-alone']));
+    await fixture.progress.get('running-alone')!();
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen.every(item => item._meta?.['com.mindstone/connectorWait'] === undefined)).toBe(true);
+    fixture.release();
+    await call;
   });
 
   it('runs the next two calls when the first of three parallel calls hangs and is cancelled', async () => {
