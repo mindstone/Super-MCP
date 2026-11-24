@@ -13,13 +13,12 @@ export class RequestQueueProgress {
     for (const notify of this.waiting) notify();
   }
 
-  /** The connector's display name is sent so the caller can say what the call waits for; a name that is only its id is not. */
-  track(context: ChildToolCallContext, queued: boolean, connector: Pick<PackageConfig, 'id' | 'name'>) {
-    const name = connector.name !== connector.id ? connector.name : undefined;
+  /** The connector's name is sent so the caller can say what the call waits for, in its own words. */
+  track(context: ChildToolCallContext, queued: boolean, connector: Pick<PackageConfig, 'name'>) {
     let count = 0;
     const notify = async (phase: 'queued' | 'admitted') => {
       if (context.signal?.aborted) return;
-      try { await context.onprogress?.({ progress: ++count, _meta: { [CONNECTOR_WAIT_META]: { version: 1, phase, ...(name ? { name } : {}) } } }); }
+      try { await context.onprogress?.({ progress: ++count, _meta: { [CONNECTOR_WAIT_META]: { version: 1, phase, ...(connector.name ? { name: connector.name } : {}) } } }); }
       catch (error) {
         getLogger().warn({ error_type: error instanceof Error ? error.name : typeof error }, 'Queue progress forwarding failed');
       }
