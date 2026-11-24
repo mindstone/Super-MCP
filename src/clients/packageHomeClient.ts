@@ -3,7 +3,9 @@ import { assertDispatchActive, authorizeReads, DECLARED_FORWARDING, hasReadAutho
 import { effectiveInputBases } from '../fileReadPreflight.js';
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
+import { McpError, ErrorCode, isJSONRPCRequest } from "@modelcontextprotocol/sdk/types.js";
+import { PackageHomeRefusedError } from "../dispatchErrors.js";
+import { ADMISSION_HEADER, HOME_MARKER_GUARD, HOME_MARKER_KEY, isRegistryClosedMarker, NOT_ADMITTED_V1, readNotAdmitted } from "../homeAdmission.js";
 import type { McpClient, PackageConfig, PackageHome } from "../types.js";
 import { getToolTimeout } from "../types.js";
 import { getMcpClientInfo } from "../clientIdentity.js";
@@ -11,6 +13,46 @@ import { collectForwardedFiles, forwardedFilesTooLargeMessage, getWorkspacePath,
 import { getLogger } from "../logging.js";
 import { installReturnedFiles, returnedFileFailure, stripReturnedFiles } from "../returnedFiles.js";
 import { failDroppedAnswers } from "./failDroppedAnswers.js";
+
+function isSingleToolCall(init?: RequestInit): boolean {
+  if (init?.method !== "POST" || typeof init.body !== "string") return false;
+  try {
+    const message: unknown = JSON.parse(init.body);
+    return isJSONRPCRequest(message) && message.method === "tools/call";
+  } catch { return false; }
+}
+
+/**
+ * Turn the cloud's refusal of a tool call into `PackageHomeRefusedError`, thrown to that call only. It counts only as
+ * the answer to the SDK's own POST to `url`: the SDK sends that to the transport's URL object, and a redirect it
+ * follows to a new URL object, even one back to the same address, so a refusal after any hop is not honoured.
+ */
+function failRefusedCalls(baseFetch: typeof fetch, url: URL, connectorName: string, onRedirect: () => void): typeof fetch {
+  return async (input, init) => {
+    const response = await baseFetch(input, init);
+    const redirected = input !== url || response.redirected;
+    if (redirected) onRedirect();
+    if (redirected || response.status !== 503 ||
+        response.headers.get(ADMISSION_HEADER) !== NOT_ADMITTED_V1 || !isSingleToolCall(init)) return response;
+    const body: unknown = await response.clone().json().catch(() => undefined);
+    const reason = readNotAdmitted(body);
+    if (!reason) return response;
+    await response.body?.cancel().catch(() => undefined);
+    throw new PackageHomeRefusedError(reason, connectorName);
+  };
+}
+
+/**
+ * The cloud router's own "registry closed" refusal of this one call, which the cloud marks in the error's data. It is
+ * proof only from an endpoint that declared it guards the marker, and only if this client has never followed a
+ * redirect: an older cloud passes a connector's marker on, and a later hop says nothing of what the first did.
+ */
+function refusedByClosedRegistry(error: unknown, connectorName: string, trusted: boolean): unknown {
+  return trusted && error instanceof McpError && error.data !== null && typeof error.data === "object" &&
+    isRegistryClosedMarker((error.data as Record<string, unknown>)[HOME_MARKER_KEY])
+    ? new PackageHomeRefusedError("registry_closed", connectorName)
+    : error;
+}
 
 /**
  * Why a package's cloud home failed a call, as a closed value. `unreachable`: the
@@ -30,11 +72,13 @@ export class PackageHomeClient implements McpClient {
   private client = new Client(getMcpClientInfo());
   private transport: StreamableHTTPClientTransport;
   private connected = false;
+  private redirected = false;
 
   constructor(private config: PackageConfig, home: PackageHome) {
-    this.transport = new StreamableHTTPClientTransport(new URL(home.url), {
+    const url = new URL(home.url);
+    this.transport = new StreamableHTTPClientTransport(url, {
       requestInit: { headers: home.headers },
-      fetch: failDroppedAnswers((input, init) => fetch(input, init), (request) => getLogger().warn("Answer stream ended before the answer", { package_id: this.config.id, method: request.method, tool_name: request.params?.name })),
+      fetch: failRefusedCalls(failDroppedAnswers((input, init) => fetch(input, init), (request) => getLogger().warn("Answer stream ended before the answer", { package_id: this.config.id, method: request.method, tool_name: request.params?.name })), url, config.name, () => { this.redirected = true; }),
     });
     this.client.onclose = () => { this.connected = false; };
   }
@@ -43,6 +87,8 @@ export class PackageHomeClient implements McpClient {
     try {
       return await run();
     } catch (error) {
+      // Only this call was refused; the connection and any other call on it carry on.
+      if (error instanceof PackageHomeRefusedError) throw error;
       if (error instanceof StreamableHTTPError && error.code === 413) throw new Error(`Rebel couldn't send that to ${this.config.name}, so nothing was sent. An update may be finishing, which needs nothing from you; try again in a few minutes.`, { cause: error });
       if (error instanceof StreamableHTTPError && (error.code === 401 || error.code === 404)) {
         this.connected = false;
@@ -113,6 +159,9 @@ export class PackageHomeClient implements McpClient {
       }, undefined, {
         // Stop reaches the home, so a call still queued there is never sent.
         timeout, ...options,
+      }).catch((error: unknown) => {
+        const guard = this.client.getServerCapabilities()?.experimental?.[HOME_MARKER_GUARD];
+        throw refusedByClosedRegistry(error, this.config.name, !this.redirected && matchesFileVersion(guard));
       });
     }, this.client.transport));
     // Delivery failures describe an already-finished action; never enter request/replay logic.

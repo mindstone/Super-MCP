@@ -3,7 +3,8 @@ import { effectiveInputBases } from './fileReadPreflight.js';
 import { assertDispatchActive, captureToolDispatch, DECLARED_FORWARDING, FileReadAdmissionError } from './fileReadProtocol.js';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema, McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
-import type { PackageRegistry } from "./registry.js";
+import { RegistryClosedError, type PackageRegistry } from "./registry.js";
+import { HOME_MARKER_GUARD, HOME_MARKER_KEY, REGISTRY_CLOSED_MARKER } from "./homeAdmission.js";
 import { assertToolAccess } from "./toolAccess.js";
 import { getSecurityPolicy } from "./security.js";
 import { safetyBlock } from "./safetyDisabledTools.js";
@@ -13,7 +14,9 @@ import { ERROR_CODES } from "./types.js";
 import { getLogger } from "./logging.js";
 
 export function createPackageServer(registry: PackageRegistry, packageId: string, workspacePath = getWorkspacePath()): Server {
-  const server = new Server({ name: "super-mcp-package", version: "1.0.0" }, { capabilities: { tools: {}, resources: {}, ...(registry.getPackage(packageId)?.transport === 'stdio' ? { experimental: { [DECLARED_FORWARDING]: { version: 1 } } } : {}) } });
+  const server = new Server({ name: "super-mcp-package", version: "1.0.0" }, { capabilities: { tools: {}, resources: {}, experimental: {
+    [HOME_MARKER_GUARD]: { version: 1 }, ...(registry.getPackage(packageId)?.transport === 'stdio' ? { [DECLARED_FORWARDING]: { version: 1 } } : {}),
+  } } });
   const allowed = (name: string) => {
     const policy = getSecurityPolicy();
     const pkg = registry.getPackage(packageId);
@@ -25,6 +28,24 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
     (await registry.connectForCatalog(packageId)).kind === "auth_required"
       ? Object.assign(new Error(errorText(error)), { code: ERROR_CODES.AUTH_REQUIRED, data: { package_id: packageId, status: "auth_required" } })
       : error;
+  // Only this endpoint's own closed registry may carry the marker. Any other
+  // error reaching a handler, from a connector (parsed JSON) or our own code,
+  // loses it, without mutating the caught value. In-process code is trusted; a
+  // hostile object built here is out of scope.
+  const ownRefusals = new WeakSet<McpError>();
+  const withoutMarker = (error: unknown): unknown => {
+    if (typeof error !== "object" || error === null || ownRefusals.has(error as McpError)) return error;
+    const caught = error as { code?: unknown; message?: unknown; data?: unknown; stack?: unknown };
+    if (typeof caught.data !== "object" || caught.data === null || !(HOME_MARKER_KEY in caught.data)) return error;
+    const { [HOME_MARKER_KEY]: _marker, ...data } = caught.data as Record<string, unknown>;
+    if (error instanceof McpError) return Object.assign(new McpError(error.code, ""), { message: error.message, data, stack: error.stack });
+    return Object.assign(new Error(), { message: caught.message, data, stack: caught.stack }, "code" in caught ? { code: caught.code } : {});
+  };
+  const guarded = <A extends unknown[], R>(handler: (...args: A) => Promise<R>) =>
+    async (...args: A): Promise<R> => {
+      try { return await handler(...args); }
+      catch (error) { throw withoutMarker(error); }
+    };
   const tools = async () => {
     try { return await (await registry.getClient(packageId)).listTools(); }
     catch (error) { throw await withSignInState(error); }
@@ -33,11 +54,11 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
     const owners = toolList.filter(tool => tool._meta?.ui?.resourceUri === uri);
     return owners.length === 0 || owners.some(tool => allowed(tool.name));
   };
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
+  server.setRequestHandler(ListToolsRequestSchema, guarded(async () => {
     assertToolAccess(registry, packageId);
     return { tools: (await tools()).filter(tool => allowed(tool.name)) };
-  });
-  server.setRequestHandler(CallToolRequestSchema, async ({ params }, extra) => {
+  }));
+  server.setRequestHandler(CallToolRequestSchema, guarded(async ({ params }, extra) => {
     try {
       assertToolAccess(registry, packageId, params.name, params.arguments);
     } catch (error) {
@@ -73,25 +94,31 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
         }, workspacePath, config?.name ?? packageId, operands);
     } catch (error) {
       if (error instanceof FileReadAdmissionError) return { isError: true, content: [{ type: 'text', text: error.message }] };
+      // Before the sign-in lookup, which can itself throw once the registry is closed.
+      if (error instanceof RegistryClosedError) {
+        const refusal = new McpError(ErrorCode.InternalError, error.message, { [HOME_MARKER_KEY]: REGISTRY_CLOSED_MARKER });
+        ownRefusals.add(refusal);
+        throw refusal;
+      }
       const typed = await withSignInState(error);
       if (typed !== error) throw typed;
       if (error instanceof McpError && error.code === ErrorCode.ConnectionClosed) throw error;
       return { isError: true, content: [{ type: "text", text: errorText(error) }] };
     }
-  });
-  server.setRequestHandler(ListResourcesRequestSchema, async () => {
+  }));
+  server.setRequestHandler(ListResourcesRequestSchema, guarded(async () => {
     assertToolAccess(registry, packageId);
     const client = await registry.getClient(packageId);
     const result = client.listResources ? await client.listResources() : { resources: [] };
     const toolList = await tools();
     return { ...result, resources: result.resources.filter(resource => resourceAllowed(resource.uri, toolList)) };
-  });
-  server.setRequestHandler(ReadResourceRequestSchema, async ({ params }) => {
+  }));
+  server.setRequestHandler(ReadResourceRequestSchema, guarded(async ({ params }) => {
     assertToolAccess(registry, packageId);
     if (!resourceAllowed(params.uri, await tools())) throw new McpError(ErrorCode.InvalidRequest, "Resource access denied");
     const client = await registry.getClient(packageId);
     if (!client.readResource) throw new McpError(ErrorCode.MethodNotFound, "Resources are not supported");
     return { ...await client.readResource(params.uri) };
-  });
+  }));
   return server;
 }

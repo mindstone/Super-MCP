@@ -1,0 +1,12 @@
+{
+  "ready": { "status": "ready", "generation": 1 },
+  "authRequired": { "status": "auth_required" },
+  "setupIncomplete": { "status": "setup_incomplete" },
+  "failed": { "status": "failed" },
+  "notReadyRefreshInProgress": { "status": "not_ready", "reason": "refresh_in_progress" },
+  "notReadyClientBusy": { "status": "not_ready", "reason": "client_busy" },
+  "notReadyTimedOut": { "status": "not_ready", "reason": "timed_out" },
+  "notReadySuperseded": { "status": "not_ready", "reason": "superseded" },
+  "notReadyConnectFailed": { "status": "not_ready", "reason": "connect_failed" },
+  "notReadyListFailed": { "status": "not_ready", "reason": "list_failed" }
+}

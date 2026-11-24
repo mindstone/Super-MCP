@@ -1,0 +1,5 @@
+{
+  "status": 503,
+  "headers": { "retry-after": "30", "rebel-admission": "not-admitted; v=1" },
+  "body": { "admission": { "v": 1, "disposition": "not_admitted", "reason": "shutting_down", "retryAfterMs": 30000 } }
+}

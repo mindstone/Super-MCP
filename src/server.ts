@@ -33,6 +33,7 @@ import {
   handleAuthenticate,
   handleGetHelp,
   handleRestartPackage,
+  handleProbePackageHome,
   handleSearchTools,
   handleReadResource,
   handleRecordToolNote,
@@ -51,6 +52,8 @@ import {
   drainInFlightTokenRefreshes,
 } from "./auth/tokenRefreshLock.js";
 import { createPackageServer } from "./packageEndpoint.js";
+import { buildDispatchLabel, withDispatchLabel } from "./dispatchErrors.js";
+import type { UseToolDispatchFacts } from "./handlers/useTool.js";
 import { resolveToolTarget } from "./toolTargetResolution.js";
 
 // FM6 (260706_mcp-oauth-fm6-graceful-drain): give an in-flight single-use
@@ -1014,6 +1017,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
 
     server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const { name, arguments: args } = request.params;
+      const dispatchFacts: UseToolDispatchFacts = {};
       const evidence = { started: false };
 
       try {
@@ -1036,7 +1040,7 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
                 callerSessionId: typeof request.params._meta?.['rebel/callerSessionId'] === 'string'
                   ? request.params._meta['rebel/callerSessionId'] : undefined,
                 callerAutomation: readCallerAutomation(request.params._meta?.['rebel/callerAutomation']),
-                dispatch: { ...captureToolDispatch(server.getClientCapabilities()?.experimental?.['files/readAuthority'], request.params._meta, extra), connectorDispatch: evidence } });
+                dispatch: { ...captureToolDispatch(server.getClientCapabilities()?.experimental?.['files/readAuthority'], request.params._meta, extra), connectorDispatch: evidence }, dispatchFacts });
 
           case "bulk_export":
             return await handleBulkExport(args as any, registry, catalog, extra?.signal,
@@ -1064,6 +1068,10 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           case "restart_package":
             return await handleRestartPackage(args as any, registry, catalog, catalogRefresher);
 
+          // Not listed by ListTools: only the app asks it, never the model.
+          case "probe_package_home":
+            return await handleProbePackageHome(args as any, registry, catalogRefresher, extra?.signal);
+
           case "search_tools":
             return await withDiscoveryWatchdog("search_tools", () =>
               handleSearchTools(args as any, registry, catalog, catalogRefresher));
@@ -1083,7 +1091,12 @@ Use detail="lite" for lightweight browsing (names + descriptions only), or detai
           error: oauthErrorLogText(error, formatError(error)),
         });
 
-        throw toolCallFailure(name, error, registry.getPackages({ safe_only: false }), name === "use_tool" && !evidence.started);
+        // Added after redaction, which cannot then rewrite it. Only use_tool resolves a package to label.
+        const { packageId } = dispatchFacts;
+        const label = name === "use_tool" && packageId !== undefined
+          ? buildDispatchLabel(packageId, registry.isPackageHomed(packageId), dispatchFacts.error)
+          : undefined;
+        throw withDispatchLabel(toolCallFailure(name, error, registry.getPackages({ safe_only: false }), name === "use_tool" && !evidence.started) as object, label);
       }
     });
 

@@ -1,0 +1,8 @@
+{
+  "cloud": { "v": 1, "home": "cloud", "packageId": "Notes-work" },
+  "local": { "v": 1, "home": "local", "packageId": "Acme" },
+  "neverSentRegistryClosed": { "v": 1, "home": "cloud", "packageId": "Notes-work", "verdict": "never_sent", "reason": "registry_closed" },
+  "neverSent": { "v": 1, "home": "local", "packageId": "Acme", "verdict": "never_sent" },
+  "refusedShuttingDown": { "v": 1, "home": "cloud", "packageId": "Notes-work", "verdict": "refused_before_running", "reason": "shutting_down" },
+  "refusedRegistryClosed": { "v": 1, "home": "cloud", "packageId": "Notes-work", "verdict": "refused_before_running", "reason": "registry_closed" }
+}

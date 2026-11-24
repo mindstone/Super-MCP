@@ -28,7 +28,10 @@ import { isAuthLikeError } from "./auth/authLikeVocabulary.js";
 import { getLogger } from "./logging.js";
 import { SecurityPolicy, SecurityConfig, setSecurityPolicy } from "./security.js";
 import { assertNotSafetyDisabled } from "./safetyDisabledTools.js";
+import { NeverSentError, RegistryClosedError } from "./dispatchErrors.js";
 import { connectorCommandLabel, connectorUrlLabel } from "./connectorLabels.js";
+
+export { RegistryClosedError };
 
 const logger = getLogger();
 
@@ -431,16 +434,11 @@ export interface ChildCatalogStatsView {
   };
 }
 
-export class RegistryClosedError extends Error {
-  readonly code = "ERR_REGISTRY_CLOSED";
-
-  constructor(packageId?: string) {
-    super(
-      packageId
-        ? `MCP package registry is closed; cannot admit '${packageId}'`
-        : "MCP package registry is closed",
-    );
-    this.name = "RegistryClosedError";
+/** FOX-11496: a readiness probe met a client a call is using, or an eviction in progress, and left both alone. */
+export class ProbeBusyError extends Error {
+  constructor(packageId: string) {
+    super(`MCP package '${packageId}' is in use; the probe left it alone`);
+    this.name = "ProbeBusyError";
   }
 }
 
@@ -1726,9 +1724,13 @@ export class PackageRegistry {
     return run;
   }
 
+  /**
+   * `forProbe` (FOX-11496, never with `forceReconnect`): a pending eviction, or an unhealthy client a call is
+   * using, is answered `transient_failure` with a `ProbeBusyError` instead of being waited on or closed.
+   */
   async connectForCatalog(
     packageId: string,
-    options: { forceReconnect?: boolean } = {},
+    options: { forceReconnect?: boolean; forProbe?: boolean } = {},
   ): Promise<ConnectOutcome> {
     if (this.terminal) return this.terminalConnectOutcome(packageId);
     const config = this.getPackage(packageId);
@@ -1749,6 +1751,7 @@ export class PackageRegistry {
     }
 
     try {
+      if (options.forProbe && this.evictionPromises.has(packageId)) throw new ProbeBusyError(packageId);
       // A restart in progress keeps the retiring client: wait for it (FOX-9654).
       for (let barrier = this.evictionPromises.get(packageId); barrier; barrier = this.evictionPromises.get(packageId)) {
         await barrier;
@@ -1758,7 +1761,7 @@ export class PackageRegistry {
       if (!this.clients.has(packageId) && !this.clientPromises.has(packageId)) {
         this.discoveryOnlyClients.add(packageId);
       }
-      const client = await this.acquireClient(packageId);
+      const client = await this.acquireClient(packageId, options.forProbe);
       const health = await client.healthCheck?.();
       if (this.terminal) return this.terminalConnectOutcome(packageId);
       if (health === "needs_auth") {
@@ -1778,6 +1781,7 @@ export class PackageRegistry {
       if (error instanceof RegistryClosedError || this.terminal) {
         return this.terminalConnectOutcome(packageId);
       }
+      if (error instanceof ProbeBusyError) return { kind: "transient_failure", failureClass: "unknown", error };
       if (!this.isPackageHomed(packageId) && isAuthConnectFailure(config, error)) {
         const client = this.clients.get(packageId);
         if (client) {
@@ -1817,7 +1821,12 @@ export class PackageRegistry {
     return this.acquireClient(packageId);
   }
 
-  private async acquireClient(packageId: string): Promise<McpClient> {
+  /**
+   * `forProbe`: an unhealthy client is removed only if it is still current, no eviction is pending and no lease is
+   * bound to it, all read with no `await` before the removal; after any await the probe starts again from the top,
+   * so every client it meets passes this check.
+   */
+  private async acquireClient(packageId: string, forProbe = false): Promise<McpClient> {
     this.assertAdmissionOpen(packageId);
     const setupReason = this.setupBlockReason(packageId);
     if (setupReason) {
@@ -1857,6 +1866,12 @@ export class PackageRegistry {
         // guard they would both increment `evictionCounts`, causing drift.
         // `Map.delete()` returns `true` iff the entry was present, so only
         // the first concurrent caller bumps the counter.
+        if (forProbe) {
+          if (this.clients.get(packageId) !== client) return this.acquireClient(packageId, true);
+          if (this.evictionPromises.has(packageId) || this.activeLeaseClients.get(packageId)?.get(client)) {
+            throw new ProbeBusyError(packageId);
+          }
+        }
         const deleted = this.clients.delete(packageId);
         if (deleted) {
           try {
@@ -1878,6 +1893,7 @@ export class PackageRegistry {
             reason: "unhealthy",
           });
         }
+        if (forProbe) return this.acquireClient(packageId, true);
         client = undefined;
       } else {
         // Update activity for stdio clients
@@ -2108,10 +2124,26 @@ export class PackageRegistry {
    * happens ONLY when `isTransportClosed()` is true before `client.callTool` is
    * invoked. An in-flight close propagates unchanged; only a home's session
    * 404 is retried once, because the home refused it before dispatch.
+   *
+   * FOX-11496: a call leased just before a restart closed its client is never
+   * sent (`NeverSentError`). With `replayNeverSent` (the caller knows the tool
+   * is safe to repeat) it runs once more, only after the failed attempt has
+   * released its lease: a forced refresh's eviction waits for that lease, and
+   * a new lease waits for the eviction.
   */
-  async callTool(packageId: string, toolId: string, args: any, context: ToolDispatchContext): Promise<any> {
+  async callTool(packageId: string, toolId: string, args: any, context: ToolDispatchContext, options?: { replayNeverSent?: boolean }): Promise<any> {
     // Runtime compatibility for existing embedders; typed callers must select a mode.
     context ??= { kind: "standalone" };
+    try {
+      return await this.callToolOnce(packageId, toolId, args, context);
+    } catch (error) {
+      if (!(error instanceof NeverSentError) || options?.replayNeverSent !== true) throw error;
+      logger.info("Replaying a call that was never sent because its connector restarted", { package_id: packageId, tool_id: toolId });
+      return await this.callToolOnce(packageId, toolId, args, context);
+    }
+  }
+
+  private async callToolOnce(packageId: string, toolId: string, args: any, context: ToolDispatchContext): Promise<any> {
     assertDispatchActive(context);
     // Backstop: every route to a connector ends here, so a safety-disabled tool never runs.
     assertNotSafetyDisabled(this.getPackage(packageId), packageId, toolId, args);
@@ -2135,10 +2167,21 @@ export class PackageRegistry {
       }
       const dispatch = async () => {
         assertDispatchActive(context);
-        if (client instanceof PackageHomeClient) return client.callToolFromOrigin(toolId, args, context);
-        const config = this.getPackage(packageId)!;
-        const prepared = await preflightLocalTool(client, config, toolId, args, context);
-        return client.callTool(toolId, prepared.args, prepared.context);
+        const dispatchedOn = client;
+        try {
+          if (dispatchedOn instanceof PackageHomeClient) return await dispatchedOn.callToolFromOrigin(toolId, args, context);
+          const config = this.getPackage(packageId)!;
+          const prepared = await preflightLocalTool(dispatchedOn, config, toolId, args, context);
+          return await dispatchedOn.callTool(toolId, prepared.args, prepared.context);
+        } catch (error) {
+          // The SDK rejects a request on a closed client with exactly this, before writing anything.
+          // Only a client a restart has already taken out of the map counts; a current one is not this race.
+          if (error instanceof Error && error.constructor === Error && error.message === "Not connected" &&
+              this.clients.get(packageId) !== dispatchedOn) {
+            throw new NeverSentError(this.getPackage(packageId)?.name ?? packageId, { cause: error });
+          }
+          throw error;
+        }
       };
       try {
         return await dispatch();
@@ -2640,7 +2683,8 @@ export class PackageRegistry {
     }
 
     // Close existing client if any. It leaves the map first, so nothing arriving picks
-    // it up; calls already running on it settle as they did before (not replayed).
+    // it up. Calls already sent on it settle as before; one that holds it but was not
+    // yet sent fails as NeverSentError (see callTool).
     const client = this.clients.get(packageId);
     if (client) {
       this.clients.delete(packageId);

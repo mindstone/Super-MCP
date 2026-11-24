@@ -19,6 +19,7 @@ import { handleListTools } from '../src/handlers/listTools.js';
 import { handleReadResource } from '../src/handlers/readResource.js';
 import { SecurityPolicy, setSecurityPolicy } from '../src/security.js';
 import { ERROR_CODES } from '../src/types.js';
+import { PackageHomeRefusedError } from '../src/dispatchErrors.js';
 import { toolCallFailure } from '../src/toolCallFailure.js';
 
 const logger = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() }));
@@ -145,6 +146,23 @@ describe('package homes over in-memory streamable HTTP', () => {
     await catalog.ensurePackageLoaded('notebook');
     expect(await (await registry.getClient('notebook')).callTool('write_note', { text: 'failed' })).toMatchObject({ isError: true, content: [{ type: 'text', text: 'boom' }] });
     expect(catalog.getPackageStatus('notebook')).toBe('ready');
+  });
+
+  it('a closed cloud registry reaches the desktop caller as a refusal; a connector\'s own marker does not', async () => {
+    const marker = { rebelHome: { v: 1, disposition: 'registry_closed' } };
+    const cloud = keep(new PackageRegistry({ mcpServers: { notebook: entry } }));
+    const upstream = await cloud.getClient('notebook');
+    harness(cloud);
+    const client = await desktop().getClient('notebook');
+    const callTool = vi.spyOn(upstream, 'callTool').mockRejectedValueOnce(new McpError(ErrorCode.ConnectionClosed, 'Connection closed', { ...marker, detail: 'kept' }));
+    const own = await client.callTool('write_note', { text: 'once' }).catch((error: unknown) => error);
+    expect(own).toBeInstanceOf(McpError);
+    expect(own).not.toBeInstanceOf(PackageHomeRefusedError);
+    expect(own).toMatchObject({ code: ErrorCode.ConnectionClosed, data: { detail: 'kept' } });
+    expect(callTool).toHaveBeenCalledOnce();
+    await cloud.closeAll();
+    await expect(client.callTool('write_note', { text: 'twice' })).rejects.toMatchObject({ name: 'PackageHomeRefusedError', reason: 'registry_closed' });
+    expect(callTool).toHaveBeenCalledOnce();
   });
 
   it('wraps a homed connector closing mid-call with its structured MCP code', async () => {

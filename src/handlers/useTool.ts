@@ -11,6 +11,7 @@ import {
   USE_TOOL_SOFT_META_PARAMS,
 } from "../types.js";
 import { PackageRegistry } from "../registry.js";
+import { isSafeToReplayNeverSent } from "../dispatchErrors.js";
 import { Catalog, type CachedTool } from "../catalog.js";
 import type { ValidationResult } from "../validator.js";
 import { McpError, ErrorCode as SdkErrorCode } from "@modelcontextprotocol/sdk/types.js";
@@ -539,9 +540,12 @@ interface SuperMcpProducerMeta extends SuperMcpTelemetryMeta {
   progressDigestV1?: ProgressDigestV1;
 }
 
+/** What the server's egress needs for its dispatch label: the package id as resolved, and the error dispatch threw before any rewriting. */
+export interface UseToolDispatchFacts { packageId?: string; error?: unknown }
 export interface UseToolCallContext {
   captureProgressDigest?: true;
   dispatch?: ToolDispatchContext;
+  dispatchFacts?: UseToolDispatchFacts;
   /** Host request metadata, never read from the model's arguments. */
   callerSessionId?: string;
   /** The automation the caller's run belongs to, resolved by the host. */
@@ -1764,6 +1768,8 @@ async function handleUseToolImpl(
       },
     };
   }
+  // A name that matches no connector gets no label: the error says nothing about where it would have run.
+  if (context?.dispatchFacts && registry.getPackage(package_id)) context.dispatchFacts.packageId = package_id;
 
   // The raw arguments; the dispatch backstop checks them again after alias repair.
   assertToolAccess(registry, package_id, tool_id, args);
@@ -2229,7 +2235,8 @@ async function handleUseToolImpl(
       typeof _rebel_meeting_dispatch_capability === 'string' && _rebel_meeting_dispatch_capability.length > 0
       ? { ...args, _rebelMeetingDispatchCapability: _rebel_meeting_dispatch_capability }
       : args;
-    let toolResult = await registry.callTool(package_id, tool_id, connectorArgs, context?.dispatch ?? { kind: "standalone" });
+    let toolResult = await registry.callTool(package_id, tool_id, connectorArgs, context?.dispatch ?? { kind: "standalone" },
+      { replayNeverSent: isSafeToReplayNeverSent(cachedTool?.tool?.annotations) });
     const downstreamIsError = isRecord(toolResult) && toolResult.isError === true;
     const recoveryEvidenceV1 = extractRecoveryEvidenceV1(toolResult);
     toolResult = stripConnectorRecoveryEvidence(toolResult);
@@ -2546,6 +2553,7 @@ async function handleUseToolImpl(
         : {}),
     });
   } catch (error) {
+    if (context?.dispatchFacts) context.dispatchFacts.error = error;
     // The dispatch backstop's safety refusal is the answer as it stands: an argument
     // renamed by key repair above reaches it only there.
     if (isRecord(error) && error.code === ERROR_CODES.TOOL_BLOCKED) throw error;

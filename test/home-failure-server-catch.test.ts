@@ -66,7 +66,8 @@ describe("the registered tools/call catch forwards a paused home's marker", () =
       await expect(callUseTool()).rejects.toEqual({
         code: ERROR_CODES.PACKAGE_UNAVAILABLE,
         message: `${paused}. Run 'health_check_all()' to diagnose the issue.`,
-        data: { package_id: "notebook", status: "error", home_failure: "unreachable", "superMcp/neverDispatched": true },
+        data: { package_id: "notebook", status: "error", home_failure: "unreachable", "superMcp/neverDispatched": true,
+          rebelDispatchV1: { v: 1, home: "cloud", packageId: "notebook" } },
       });
     }
   });
@@ -79,7 +80,8 @@ describe("the registered tools/call catch forwards a paused home's marker", () =
     await expect(callUseTool()).rejects.toEqual({
       code: ERROR_CODES.INTERNAL_ERROR,
       message: expect.stringContaining(paused),
-      data: { tool_name: "use_tool", home_failure: "unreachable", "superMcp/neverDispatched": true },
+      data: { tool_name: "use_tool", home_failure: "unreachable", "superMcp/neverDispatched": true,
+        rebelDispatchV1: { v: 1, home: "cloud", packageId: "notebook" } },
     });
   });
 

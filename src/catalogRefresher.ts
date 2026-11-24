@@ -5,6 +5,7 @@ import {
 } from "./catalog.js";
 import {
   PackageRegistry,
+  ProbeBusyError,
   type RegistryLifecycleEvent,
 } from "./registry.js";
 import {
@@ -12,6 +13,7 @@ import {
   type TransientConnectFailureClass,
 } from "./types.js";
 import { getLogger } from "./logging.js";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const logger = getLogger();
 
@@ -90,6 +92,10 @@ interface QueuedRefresh {
 interface InFlightRefresh {
   promise: Promise<void>;
   forceReconnect: boolean;
+  /** Set when the run in this slot is a readiness probe (FOX-11496). */
+  probe?: Promise<PackageProbeAnswer>;
+  /** A registry event that arrived under the probe, handed to an ordinary refresh unless the probe proves ready. */
+  eventDuringProbe?: boolean;
 }
 
 interface CatalogRegistrySeam {
@@ -102,6 +108,17 @@ interface CatalogRegistrySeam {
   ): () => void;
   releaseAfterDiscovery?(packageId: string): Promise<void>;
 }
+
+/** FOX-11496: the readiness probe's answer, from what its own run proved. */
+export type PackageProbeAnswer =
+  | { status: "ready"; generation: number }
+  | {
+      status: "not_ready";
+      reason: "client_busy" | "connect_failed" | "list_failed" | "refresh_in_progress" | "timed_out" | "superseded";
+    }
+  | { status: "auth_required" }
+  | { status: "setup_incomplete" }
+  | { status: "failed" };
 
 export interface CatalogRefresherOptions {
   concurrency?: number;
@@ -221,6 +238,114 @@ export class CatalogRefresher {
       : this.getDueRefresh(packageId, request.reason ?? "passive");
     if (!refresh) return Promise.resolve();
     return this.enqueueAndWait(packageId, refresh);
+  }
+
+  /**
+   * FOX-11496: is this connector reachable now? Safe to ask every few seconds. A probe runs in the package's refresh
+   * slot, so it never runs beside an ordinary refresh: one in the slot answers `refresh_in_progress`, and a probe in
+   * the slot is joined. It never evicts or waits on an eviction, commits only what it proved, and is bounded by the
+   * refresh time limit. An aborted `signal` answers `timed_out` at once; the run carries on for the others.
+   */
+  probeNow(packageId: string, options: { signal?: AbortSignal } = {}): Promise<PackageProbeAnswer> {
+    if (this.disposed || !this.registry.getPackage(packageId)) {
+      return Promise.reject(new Error(`Package '${packageId}' cannot be probed`));
+    }
+    const running = this.inFlight.get(packageId);
+    if (running && !running.probe) return Promise.resolve({ status: "not_ready", reason: "refresh_in_progress" });
+    // A joined answer is as old as the run it joins (at most the refresh time limit), never kept once the slot frees.
+    const probe = running?.probe ?? this.startProbe(packageId);
+    const { signal } = options;
+    if (!signal) return probe;
+    const timedOut: PackageProbeAnswer = { status: "not_ready", reason: "timed_out" };
+    if (signal.aborted) return Promise.resolve(timedOut);
+    return new Promise<PackageProbeAnswer>((resolve, reject) => {
+      const onAbort = () => resolve(timedOut);
+      signal.addEventListener("abort", onAbort, { once: true });
+      probe.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+    });
+  }
+
+  private startProbe(packageId: string): Promise<PackageProbeAnswer> {
+    this.activeCount += 1;
+    let answer: PackageProbeAnswer | undefined;
+    const probe = this.runProbe(packageId).then((result) => (answer = result)).finally(() => {
+      this.activeCount -= 1;
+      // A registry event under a probe that did not prove ready is handed over, but only while the catalog still says
+      // ready: nothing else would refresh it. Any other state has the ordinary refresh's retry schedule, not to be skipped.
+      const handOver = this.inFlight.get(packageId)?.eventDuringProbe === true && answer?.status !== "ready" &&
+        this.catalog.getPackageStatus(packageId) === "ready";
+      this.inFlight.delete(packageId);
+      // After the delete: notify("registry") does nothing while the slot is held.
+      if (handOver) this.notify(packageId, "registry");
+      this.updateReadiness();
+      this.armWakeTimer();
+      this.drainQueue();
+    });
+    this.inFlight.set(packageId, { promise: probe.then(() => undefined, () => undefined), forceReconnect: false, probe });
+    return probe;
+  }
+
+  private async runProbe(packageId: string): Promise<PackageProbeAnswer> {
+    const generation = this.catalog.beginRefresh(packageId, "probe");
+    let attemptActive = true;
+    let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+    let disposeAttempt: (() => void) | null = null;
+    const operation = this.performProbe(packageId, generation, () =>
+      attemptActive && !this.disposed && generation === this.catalog.getConfigurationGeneration());
+    operation.catch(() => undefined);
+    // Unlike an ordinary refresh's, the probe's time limit evicts nothing: the client may be carrying calls.
+    const timeout = new Promise<PackageProbeAnswer>((resolve) => {
+      timeoutHandle = setTimeout(() => resolve({ status: "not_ready", reason: "timed_out" }), this.refreshTimeoutMs);
+    });
+    const disposed = new Promise<PackageProbeAnswer>((resolve) => {
+      disposeAttempt = () => resolve({ status: "not_ready", reason: "superseded" });
+      this.disposeAttempts.add(disposeAttempt);
+    });
+    try {
+      return await Promise.race([operation, timeout, disposed]);
+    } finally {
+      attemptActive = false;
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+      if (disposeAttempt) this.disposeAttempts.delete(disposeAttempt);
+      this.catalog.finishRefreshWithoutChange(packageId, generation);
+    }
+  }
+
+  /** A failure that may pass (busy, connect or listing failed) commits nothing: the retry schedule is the refresh's. */
+  private async performProbe(
+    packageId: string,
+    generation: number,
+    isCurrent: () => boolean,
+  ): Promise<PackageProbeAnswer> {
+    const superseded: PackageProbeAnswer = { status: "not_ready", reason: "superseded" };
+    for (let attempt = 0; ; attempt++) {
+      const outcome = await this.registry.connectForCatalog(packageId, { forProbe: true });
+      if (!isCurrent()) return superseded;
+      if (outcome.kind === "transient_failure") {
+        return { status: "not_ready", reason: outcome.error instanceof ProbeBusyError ? "client_busy" : "connect_failed" };
+      }
+      if (outcome.kind !== "connected") {
+        this.commitConnectFailure(packageId, generation, outcome);
+        return outcome.kind === "permanent_failure" ? { status: "failed" } : { status: outcome.kind };
+      }
+      let tools: unknown[];
+      try {
+        tools = await outcome.client.listTools();
+      } catch (error) {
+        if (!isCurrent()) return superseded;
+        // The home's session 404 is answered before anything runs: replace that client and list once more.
+        if (attempt === 0 && error instanceof StreamableHTTPError && error.code === 404 &&
+            this.registry.isPackageHomed(packageId)) continue;
+        if (this.catalog.categorizeError(packageId, error).status !== "auth_required") {
+          return { status: "not_ready", reason: "list_failed" };
+        }
+        this.recordTransientFailure(packageId, generation, error);
+        return { status: "auth_required" };
+      }
+      if (!isCurrent() || !this.catalog.commitReady(packageId, tools, generation)) return superseded;
+      await this.registry.releaseAfterDiscovery(packageId);
+      return { status: "ready", generation };
+    }
   }
 
   notify(
@@ -436,6 +561,14 @@ export class CatalogRefresher {
       await (this.registry as PackageRegistry & CatalogRegistrySeam).releaseAfterDiscovery?.(packageId);
       return;
     }
+    this.commitConnectFailure(packageId, generation, outcome);
+  }
+
+  private commitConnectFailure(
+    packageId: string,
+    generation: number,
+    outcome: Exclude<ConnectOutcome, { kind: "connected" }>,
+  ): void {
     if (outcome.kind === "auth_required") {
       this.catalog.commitFailure(packageId, generation, {
         status: "auth_required",
@@ -602,12 +735,14 @@ export class CatalogRefresher {
   }
 
   private handleRegistryEvent(event: RegistryLifecycleEvent): void {
-    if (this.inFlight.has(event.packageId)) return;
     if (event.type === "auth_outcome" && event.outcome !== "authenticated") return;
     if (
       event.type === "client_evicted" &&
       (event.reason === "idle" || event.reason === "restart" || event.reason === "shutdown")
     ) return;
+    const running = this.inFlight.get(event.packageId);
+    if (running?.probe) running.eventDuringProbe = true;
+    if (running) return;
     this.notify(event.packageId, "registry");
   }
 
