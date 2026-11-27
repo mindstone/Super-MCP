@@ -4,12 +4,14 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
-import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
+import { McpError, ErrorCode, CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { PackageRegistry } from '../src/registry.js';
 import { HttpMcpClient } from '../src/clients/httpClient.js';
 import { handleRestartPackage } from '../src/handlers/restartPackage.js';
 import { StdioMcpClient } from '../src/clients/stdioClient.js';
 import { createPackageServer } from '../src/packageEndpoint.js';
+import { PackageHomeClient } from '../src/clients/packageHomeClient.js';
 import { Catalog } from '../src/catalog.js';
 import { CatalogRefresher } from '../src/catalogRefresher.js';
 import { getDiscoveryPackageState } from '../src/catalogFormatters.js';
@@ -632,5 +634,131 @@ describe('package homes over in-memory streamable HTTP', () => {
     expect(await registry.getClient('journal')).toBe(other);
     expect(closeOther).not.toHaveBeenCalled();
     expect(JSON.parse(await readFile(file, 'utf8')).mcpServers.notebook).toEqual(entry);
+  });
+});
+
+// FOX-11595: a failed health check never closes a client a call still holds.
+describe('a failed health check sets a leased client aside', () => {
+  function gate<T = void>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>(res => { resolve = res; });
+    return { promise, resolve };
+  }
+  const replayLog = 'Replaying a call the cloud refused because its session was gone';
+
+  it('(A) two concurrent calls whose home session answers 404 both get their own answers', async () => {
+    const cloud = keep(new PackageRegistry({ mcpServers: { notebook: entry } }));
+    const adapter = harness(cloud);
+    const registry = desktop();
+    await registry.callTool('notebook', 'write_note', { text: 'warm' });
+    const oldHome = (registry as any).clients.get('notebook') as PackageHomeClient;
+    const oldSession = adapter.requests.find(req => req.headers.get('mcp-session-id'))!.headers.get('mcp-session-id');
+    const executed = vi.mocked(StdioMcpClient.prototype.callTool);
+    executed.mockClear();
+    const closed = vi.spyOn(PackageHomeClient.prototype, 'close');
+
+    // Hold each call on the old session, then refuse it with the 404 the home gives an expired session.
+    const refusals = [gate(), gate()];
+    const arrived = [gate(), gate()];
+    let arrivals = 0;
+    const transport = globalThis.fetch;
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      if (request.method === 'POST' && request.headers.get('mcp-session-id') === oldSession &&
+          (await request.clone().json()).method === 'tools/call') {
+        const index = arrivals++;
+        arrived[index].resolve();
+        await refusals[index].promise;
+        return new Response('Session not found', { status: 404 });
+      }
+      return transport(input, init);
+    });
+
+    const first = registry.callTool('notebook', 'write_note', { text: 'first' });
+    const second = registry.callTool('notebook', 'write_note', { text: 'second' });
+    const secondOutcome = second.then(value => value, (error: unknown) => error);
+    let closedWhileHeld: boolean | undefined;
+    try {
+      await Promise.all(arrived.map(({ promise }) => promise));
+      refusals[0].resolve();
+      expect(await first).toMatchObject({ content: [{ text: 'first' }] });
+      closedWhileHeld = closed.mock.contexts.includes(oldHome);
+    } finally {
+      refusals[1].resolve();
+    }
+    expect(await secondOutcome).toMatchObject({ content: [{ text: 'second' }] });
+    expect(closedWhileHeld).toBe(false);
+
+    expect(executed.mock.calls.map(([, args]) => args)).toEqual([{ text: 'first' }, { text: 'second' }]);
+    expect(closed.mock.contexts.filter(context => context === oldHome)).toHaveLength(1);
+    expect(logger.info.mock.calls.filter(([message]) => message === replayLog)).toEqual([
+      [replayLog, { package_id: 'notebook', tool_id: 'write_note' }],
+      [replayLog, { package_id: 'notebook', tool_id: 'write_note' }],
+    ]);
+  });
+
+  it('(B) a held cloud HTTP call keeps its answer when a concurrent health listing fails', async () => {
+    const slowEntered = gate();
+    const slowAnswer = gate();
+    const executions: string[] = [];
+    let failNextListing = false;
+    const upstreamSessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
+    const upstream = async (request: Request) => {
+      const body = request.method === 'POST' ? await request.clone().json() : undefined;
+      let transport = upstreamSessions.get(request.headers.get('mcp-session-id') ?? '');
+      if (body?.method === 'initialize') {
+        const server = new Server({ name: 'fictional-upstream', version: '1.0.0' }, { capabilities: { tools: {} } });
+        server.setRequestHandler(ListToolsRequestSchema, async () => {
+          if (failNextListing) {
+            failNextListing = false;
+            throw new McpError(ErrorCode.InternalError, 'listing hiccup');
+          }
+          return { tools: [{ name: 'slow', inputSchema: { type: 'object' } }] };
+        });
+        server.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
+          executions.push(params.name);
+          slowEntered.resolve();
+          await slowAnswer.promise;
+          return { content: [{ type: 'text', text: 'original answer' }] };
+        });
+        transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: randomUUID, enableJsonResponse: true });
+        await server.connect(transport);
+        cleanup.push(() => server.close());
+      }
+      if (!transport) return new Response('Session not found', { status: 404 });
+      const response = await transport.handleRequest(request);
+      const id = response.headers.get('mcp-session-id');
+      if (id) upstreamSessions.set(id, transport);
+      return response;
+    };
+    const cloud = keep(new PackageRegistry({ mcpServers: { notebook: { url: 'https://upstream.example.test/mcp', name: 'Fictional Notes' } } }));
+    harness(cloud);
+    const home = globalThis.fetch;
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      return new URL(request.url).hostname === 'upstream.example.test' ? upstream(request) : home(input, init);
+    });
+    const oldCloud = await cloud.getClient('notebook');
+    expect(oldCloud).toBeInstanceOf(HttpMcpClient);
+    const closed = vi.spyOn(HttpMcpClient.prototype, 'close');
+    const registry = desktop();
+
+    const call = registry.callTool('notebook', 'slow', {});
+    const callOutcome = call.then(value => value, (error: unknown) => error);
+    let closedWhileHeld: boolean | undefined;
+    try {
+      await Promise.race([slowEntered.promise, callOutcome]);
+      failNextListing = true;
+      expect((await (await registry.getClient('notebook')).listTools()).map(tool => tool.name)).toEqual(['slow']);
+      expect(await cloud.getClient('notebook')).not.toBe(oldCloud);
+      closedWhileHeld = closed.mock.contexts.includes(oldCloud);
+    } finally {
+      slowAnswer.resolve();
+    }
+    expect(await callOutcome).toMatchObject({ content: [{ type: 'text', text: 'original answer' }] });
+    expect(closedWhileHeld).toBe(false);
+    expect(executions).toEqual(['slow']);
+    await vi.waitFor(() => expect(closed.mock.contexts.filter(context => context === oldCloud)).toHaveLength(1), { timeout: 5000 });
+    expect(cloud.getChildStats()[0]).toMatchObject({ eviction_count: 1 });
   });
 });

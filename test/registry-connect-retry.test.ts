@@ -1172,9 +1172,10 @@ describe("PackageRegistry connect retry", () => {
     },
   );
 
-  it.each(["unhealthy eviction", "restart"] as const)(
-    "rejects a queued stdio call without sending it and drains its lease after a pre-latch %s",
-    async (closeRoute) => {
+  // An unhealthy eviction no longer closes a client calls hold (FOX-11595): see the next test.
+  it(
+    "rejects a queued stdio call without sending it and drains its lease after a pre-latch restart",
+    async () => {
       const packageId = "GoogleWorkspace-acme";
       const registry = createRegistry(packageId);
       const internals = registry as unknown as RegistryInternals;
@@ -1217,11 +1218,7 @@ describe("PackageRegistry connect retry", () => {
       vi.spyOn(client, "healthCheck").mockImplementation(() => {
         healthCheckCount += 1;
         if (healthCheckCount === 2) secondHealthChecked.resolve(undefined);
-        return Promise.resolve(
-          closeRoute === "unhealthy eviction" && healthCheckCount === 3
-            ? "error"
-            : "ok",
-        );
+        return Promise.resolve("ok");
       });
       const closeSpy = vi.spyOn(client, "close");
       internals.clients.set(packageId, client);
@@ -1267,14 +1264,10 @@ describe("PackageRegistry connect retry", () => {
       let reentrantShutdownOutcome: Promise<void> | undefined;
 
       try {
-        if (closeRoute === "unhealthy eviction") {
-          await expect(registry.getClient(packageId)).resolves.toBe(replacement);
-        } else {
-          await expect(registry.restartPackage(packageId)).resolves.toEqual({
-            success: true,
-            message: `Package '${packageId}' restarted. Next tool call will reconnect with fresh configuration.`,
-          });
-        }
+        await expect(registry.restartPackage(packageId)).resolves.toEqual({
+          success: true,
+          message: `Package '${packageId}' restarted. Next tool call will reconnect with fresh configuration.`,
+        });
         await runningOutcome;
         await Promise.resolve();
         await Promise.resolve();
@@ -1289,13 +1282,8 @@ describe("PackageRegistry connect retry", () => {
         expect(sdkCallTool.mock.calls[0][0]).toEqual({ name: "running", arguments: {}, _meta: { "files/readMode": { version: 1, mode: "standalone" } } });
         expect(internals.activeLeases.has(packageId)).toBe(false);
         expect(internals.activeLeaseClients?.has(packageId)).toBe(false);
-        if (closeRoute === "unhealthy eviction") {
-          expect(internals.clients.get(packageId)).toBe(replacement);
-          expect(createSpy).toHaveBeenCalledOnce();
-        } else {
-          expect(internals.clients.has(packageId)).toBe(false);
-          expect(createSpy).not.toHaveBeenCalled();
-        }
+        expect(internals.clients.has(packageId)).toBe(false);
+        expect(createSpy).not.toHaveBeenCalled();
 
         const reentrantClient = createMockClient({
           close: vi.fn().mockImplementation(() => {
@@ -1387,6 +1375,117 @@ describe("PackageRegistry connect retry", () => {
           secondShutdownOutcome,
           reentrantShutdownOutcome,
         ]);
+      }
+    },
+  );
+
+  it.each(["last call", "shutdown"] as const)(
+    "keeps a stdio client calls hold, after a pre-latch unhealthy eviction, until its %s closes it",
+    async (closeBy) => {
+      const packageId = "GoogleWorkspace-acme";
+      const registry = createRegistry(packageId);
+      const internals = registry as unknown as RegistryInternals & {
+        retiringClients?: Map<McpClient, string>;
+      };
+      const config = registry.getPackage(packageId);
+      if (!config) throw new Error(`Missing package config for ${packageId}`);
+
+      const runningRequest = deferred<unknown>();
+      const runningStarted = deferred<void>();
+      const secondHealthChecked = deferred<void>();
+      const transportClosedError = new Error("transport closed by shutdown");
+      let healthCheckCount = 0;
+
+      const client = new StdioMcpClient(packageId, config);
+      const stdioInternals = client as unknown as {
+        client: {
+          callTool: (...args: unknown[]) => Promise<unknown>;
+          close: () => Promise<void>;
+        };
+        transport: { pid: number | null };
+        requestQueue: { pending: number; size: number; once: (event: "add", listener: () => void) => void };
+      };
+      const sdkCallTool = vi.fn()
+        .mockImplementationOnce(() => {
+          runningStarted.resolve(undefined);
+          return runningRequest.promise;
+        })
+        .mockResolvedValueOnce({ content: [{ type: "text", text: "queued" }] });
+      stdioInternals.client = {
+        callTool: sdkCallTool,
+        close: vi.fn().mockImplementation(() => {
+          runningRequest.reject(transportClosedError);
+          return Promise.resolve();
+        }),
+      };
+      stdioInternals.transport = { pid: null };
+      vi.spyOn(client, "isTransportClosed").mockReturnValue(false);
+      vi.spyOn(client, "healthCheck").mockImplementation(() => {
+        healthCheckCount += 1;
+        if (healthCheckCount === 2) secondHealthChecked.resolve(undefined);
+        return Promise.resolve(healthCheckCount === 3 ? "error" : "ok");
+      });
+      const closeSpy = vi.spyOn(client, "close");
+      internals.clients.set(packageId, client);
+
+      const replacement = createMockClient();
+      const createSpy = vi.spyOn(internals, "createAndConnectClient").mockResolvedValue(replacement);
+
+      const runningOutcome = registry.callTool(packageId, "running", {}).then(
+        (value: unknown) => ({ status: "fulfilled" as const, value }),
+        (error: unknown) => ({ status: "rejected" as const, error }),
+      );
+      await runningStarted.promise;
+      const queuedEntered = deferred<void>();
+      stdioInternals.requestQueue.once("add", () => queuedEntered.resolve(undefined));
+      const queuedOutcome = registry.callTool(packageId, "queued", {}).then(
+        (value: unknown) => ({ status: "fulfilled" as const, value }),
+        (error: unknown) => ({ status: "rejected" as const, error }),
+      );
+      await secondHealthChecked.promise;
+      await queuedEntered.promise;
+      expect({ pending: stdioInternals.requestQueue.pending, size: stdioInternals.requestQueue.size }).toEqual({ pending: 1, size: 1 });
+      expect(internals.activeLeaseClients?.get(packageId)?.get(client)).toBe(2);
+
+      try {
+        await expect(registry.getClient(packageId)).resolves.toBe(replacement);
+        expect(closeSpy).not.toHaveBeenCalled();
+        expect(internals.retiringClients?.get(client)).toBe(packageId);
+        expect(internals.clients.get(packageId)).toBe(replacement);
+        expect(createSpy).toHaveBeenCalledOnce();
+        expect(internals.activeLeases.get(packageId)).toBe(2);
+        expect(internals.activeLeaseClients?.get(packageId)?.get(client)).toBe(2);
+
+        if (closeBy === "last call") {
+          runningRequest.resolve({ content: [{ type: "text", text: "running" }] });
+          await expect(runningOutcome).resolves.toEqual({ status: "fulfilled", value: { content: [{ type: "text", text: "running" }] } });
+          await expect(queuedOutcome).resolves.toEqual({ status: "fulfilled", value: { content: [{ type: "text", text: "queued" }] } });
+          expect(sdkCallTool).toHaveBeenCalledTimes(2);
+          expect(sdkCallTool.mock.calls[1][0]).toMatchObject({ name: "queued" });
+          expect(closeSpy).toHaveBeenCalledOnce();
+          await expect(registry.closeAll()).resolves.toBeUndefined();
+          expect(closeSpy).toHaveBeenCalledOnce();
+        } else {
+          await expect(registry.closeAll()).resolves.toBeUndefined();
+          await expect(runningOutcome).resolves.toEqual({ status: "rejected", error: transportClosedError });
+          const queued = await queuedOutcome;
+          expect(queued).toMatchObject({ status: "rejected", error: { code: -32000, message: "MCP error -32000: Connection closed" } });
+          expect(sdkCallTool).toHaveBeenCalledOnce();
+          expect(closeSpy).toHaveBeenCalledOnce();
+        }
+
+        expect(client.hasPendingRequests()).toBe(false);
+        expect(replacement.close).toHaveBeenCalledOnce();
+        expect(internals.retiringClients?.size ?? 0).toBe(0);
+        expect(internals.activeCloseOperations.size).toBe(0);
+        expect(internals.activeLeases.size).toBe(0);
+        expect(internals.activeLeaseClients?.size ?? 0).toBe(0);
+        expect(internals.leaseDrainWaiters.size).toBe(0);
+        expect(internals.terminalCleanupFailures).toEqual([]);
+        expect(registry.getChildStats()[0]).toMatchObject({ eviction_count: 1 });
+      } finally {
+        runningRequest.resolve({ content: [] });
+        await Promise.allSettled([runningOutcome, queuedOutcome, registry.closeAll()]);
       }
     },
   );

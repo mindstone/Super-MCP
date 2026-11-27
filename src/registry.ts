@@ -415,8 +415,13 @@ export interface ChildStatsEntry {
   connect_retry_failed_count: number;
   /** Cumulative initial failures not retried because they were known-permanent. */
   connect_retry_skipped_permanent_count: number;
-  /** Cumulative pre-send liveness re-establishes in `callTool` (closed-transport recovery). */
+  /** Cumulative pre-send liveness re-establishes in `callTool` (closed-transport recovery); a caller that only adopts a replacement already published is not counted. */
   reestablish_count: number;
+  /**
+   * Unhealthy clients set aside while calls still hold them, waiting for those calls to
+   * finish (FOX-11595). Excludes closes still settling after they left.
+   */
+  retiring_count: number;
   /** Confirmed dead-grant refresh refusals since this router process started. */
   refresh_refused_count: number;
   catalog_status: CatalogStatus;
@@ -481,6 +486,11 @@ export class PackageRegistry {
   private terminalCleanupFailures: ClientCleanupFailure[] = [];
   /** Per-client counts for leases from cached-client acquisition through tool dispatch. */
   private activeLeaseClients = new Map<string, Map<McpClient, number>>();
+  /**
+   * Unhealthy clients taken out of `clients` while calls still hold leases on them (FOX-11595).
+   * Each closes when its last bound lease leaves, or at shutdown.
+   */
+  private retiringClients = new Map<McpClient, string>();
   private terminal = false;
   private closeBarrier: Promise<void> | null = null;
 
@@ -510,7 +520,8 @@ export class PackageRegistry {
   // `reestablishCounts` — incremented exactly once per pre-send liveness
   //   re-establish in `callTool` (the `isTransportClosed()` branch: a stdio
   //   transport closed BEFORE any bytes were sent, so we delete + recreate the
-  //   client). Surfaced in `getChildStats()` so diagnostics can distinguish
+  //   client). A caller that finds another caller's replacement already
+  //   published removes nothing and is not counted. Surfaced in `getChildStats()` so diagnostics can distinguish
   //   healthy idle-reap recovery (occasional) from thrashing on a broken
   //   connector (rapidly climbing). NOT a spawn-substitute: the re-establish's
   //   downstream `getClient()` separately bumps `spawnCounts` when it actually
@@ -633,6 +644,13 @@ export class PackageRegistry {
         () => undefined,
       );
     }
+
+    for (const [client, packageId] of this.retiringClients) {
+      void this.closeClientExactlyOnce(packageId, client, "shutdown_retiring").catch(
+        () => undefined,
+      );
+    }
+    this.retiringClients.clear();
   }
 
   private reconcileNonDrainableTerminalLeases(): void {
@@ -728,6 +746,7 @@ export class PackageRegistry {
         pending.length === 0 &&
         this.clients.size === 0 &&
         this.constructedClients.size === 0 &&
+        this.retiringClients.size === 0 &&
         this.activeLeases.size === 0 &&
         this.activeLeaseClients.size === 0
       ) {
@@ -757,6 +776,7 @@ export class PackageRegistry {
     this.evictionPromises.clear();
     this.activeCloseOperations.clear();
     this.activeLeaseClients.clear();
+    this.retiringClients.clear();
 
     if (this.terminalCleanupFailures.length > 0) {
       const failures = this.terminalCleanupFailures.splice(0);
@@ -1675,8 +1695,7 @@ export class PackageRegistry {
       if (this.terminal) return;
 
       const client = this.clients.get(packageId);
-      if (!client) return;
-      if (!this.clients.delete(packageId)) return;
+      if (!client || !this.removeClientIfCurrent(packageId, client)) return;
       if (reason === "unhealthy") {
         this.evictionCounts.set(
           packageId,
@@ -1857,44 +1876,44 @@ export class PackageRegistry {
           this.notifyAuthOutcome(packageId, "auth_required");
           return client;
         }
-        // Client exists but not healthy, remove it.
-        // Stage 4b: counts as an eviction (unhealthy replacement, not user-initiated, not reap).
-        //
-        // Stage 4b M3 refinement: race-safe eviction counting. Two
-        // simultaneous `getClient()` callers can both await the same
-        // unhealthy `healthCheck`; without the `Map.delete()` return-value
-        // guard they would both increment `evictionCounts`, causing drift.
-        // `Map.delete()` returns `true` iff the entry was present, so only
-        // the first concurrent caller bumps the counter.
-        if (forProbe) {
-          if (this.clients.get(packageId) !== client) return this.acquireClient(packageId, true);
-          if (this.evictionPromises.has(packageId) || this.activeLeaseClients.get(packageId)?.get(client)) {
-            throw new ProbeBusyError(packageId);
-          }
+        // Client exists but not healthy: replace it. Only the caller that still finds this
+        // very client current removes it, so two callers awaiting the same health check
+        // count one eviction, and a late result never removes a replacement.
+        if (this.clients.get(packageId) !== client) return this.acquireClient(packageId, forProbe);
+        if (forProbe && (this.evictionPromises.has(packageId) || this.activeLeaseClients.get(packageId)?.get(client))) {
+          throw new ProbeBusyError(packageId);
         }
-        const deleted = this.clients.delete(packageId);
-        if (deleted) {
+        // FOX-11595: closing rejects every request still on the client, so one call's failed
+        // health check would lose another call's answer. A client calls still hold is set
+        // aside and closes when its last bound lease leaves (`unbindLeaseFromClient`). Who
+        // owns it is settled before the event: a listener may shut the registry down.
+        this.removeClientIfCurrent(packageId, client);
+        let closing: Promise<void> | undefined;
+        const boundLeases = this.activeLeaseClients.get(packageId)?.get(client) ?? 0;
+        if (boundLeases > 0) {
+          this.retiringClients.set(client, packageId);
+          logger.info("Set aside an unhealthy MCP client until the calls holding it finish", {
+            package_id: packageId,
+            bound_leases: boundLeases,
+          });
+        } else {
+          closing = this.closeClientExactlyOnce(packageId, client, "unhealthy");
+        }
+        // Stage 4b: counts as an eviction (unhealthy replacement, not user-initiated, not reap).
+        this.evictionCounts.set(packageId, (this.evictionCounts.get(packageId) ?? 0) + 1);
+        this.emitLifecycle({ type: "client_evicted", packageId, reason: "unhealthy" });
+        if (closing) {
           try {
-            await this.closeClientExactlyOnce(packageId, client, "unhealthy");
+            await closing;
           } catch (error) {
             logger.warn("Failed to close unhealthy MCP client", {
               package_id: packageId,
               error: error instanceof Error ? error.message : String(error),
             });
           }
-          this.assertAdmissionOpen(packageId);
-          this.evictionCounts.set(
-            packageId,
-            (this.evictionCounts.get(packageId) ?? 0) + 1,
-          );
-          this.emitLifecycle({
-            type: "client_evicted",
-            packageId,
-            reason: "unhealthy",
-          });
         }
-        if (forProbe) return this.acquireClient(packageId, true);
-        client = undefined;
+        // Read the map again: another caller may have published a replacement meanwhile.
+        return this.acquireClient(packageId, forProbe);
       } else {
         // Update activity for stdio clients
         const config = this.getPackage(packageId);
@@ -2060,6 +2079,16 @@ export class PackageRegistry {
     });
   }
 
+  /**
+   * The only way a client leaves `clients` by key (shutdown clears the whole map): only
+   * while `expected` is still the current one, so a stale caller never removes a
+   * replacement. Removing never closes; each caller keeps its own close duty.
+   */
+  private removeClientIfCurrent(packageId: string, expected: McpClient): boolean {
+    if (this.clients.get(packageId) !== expected) return false;
+    return this.clients.delete(packageId);
+  }
+
   private bindLeaseToClient(packageId: string, client: McpClient): void {
     const clients = this.activeLeaseClients.get(packageId) ?? new Map<McpClient, number>();
     clients.set(client, (clients.get(client) ?? 0) + 1);
@@ -2072,6 +2101,14 @@ export class PackageRegistry {
     const next = (clients.get(client) ?? 0) - 1;
     if (next <= 0) {
       clients.delete(client);
+      if (this.retiringClients.delete(client)) {
+        void this.closeClientExactlyOnce(packageId, client, "unhealthy_deferred").catch((error) => {
+          logger.warn("Failed to close an unhealthy MCP client after its last call", {
+            package_id: packageId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
     } else {
       clients.set(client, next);
     }
@@ -2161,8 +2198,11 @@ export class PackageRegistry {
           package_id: packageId,
           tool_id: toolId,
         });
-        this.reestablishCounts.set(packageId, (this.reestablishCounts.get(packageId) ?? 0) + 1);
-        this.clients.delete(packageId);
+        // Another caller may already have published a replacement: leave that in place, and
+        // count only a removal this caller made (adopting that replacement re-establishes nothing).
+        if (this.removeClientIfCurrent(packageId, client)) {
+          this.reestablishCounts.set(packageId, (this.reestablishCounts.get(packageId) ?? 0) + 1);
+        }
         client = await this.getClient(packageId, true);
         leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
       }
@@ -2176,7 +2216,8 @@ export class PackageRegistry {
           return await dispatchedOn.callTool(toolId, prepared.args, prepared.context);
         } catch (error) {
           // The SDK rejects a request on a closed client with exactly this, before writing anything.
-          // Only a client a restart has already taken out of the map counts; a current one is not this race.
+          // Only a client a restart or an unhealthy set-aside has already taken out of the map
+          // counts; a current one is not this race.
           if (error instanceof Error && error.constructor === Error && error.message === "Not connected" &&
               this.clients.get(packageId) !== dispatchedOn) {
             throw new NeverSentError(this.getPackage(packageId)?.name ?? packageId, { cause: error });
@@ -2189,6 +2230,7 @@ export class PackageRegistry {
       } catch (error) {
         // A home session 404 is returned before dispatch, so one replay is safe.
         if (!(client instanceof PackageHomeClient && error instanceof StreamableHTTPError && error.code === 404)) throw error;
+        logger.info("Replaying a call the cloud refused because its session was gone", { package_id: packageId, tool_id: toolId });
         client = await this.getClient(packageId, true);
         leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
         return await dispatch();
@@ -2336,7 +2378,7 @@ export class PackageRegistry {
     }
 
     // Detach synchronously, after the checks, so no caller can pick it up mid-close.
-    this.clients.delete(packageId);
+    if (!this.removeClientIfCurrent(packageId, client)) return null;
     this.lastActivity.delete(packageId);
     this.emitLifecycle({ type: "client_evicted", packageId, reason: "idle" });
     // Stage 4b: count this closure (reap_count in /stats).
@@ -2684,11 +2726,11 @@ export class PackageRegistry {
     }
 
     // Close existing client if any. It leaves the map first, so nothing arriving picks
-    // it up. Calls already sent on it settle as before; one that holds it but was not
-    // yet sent fails as NeverSentError (see callTool).
+    // it up. A forced restart closes it at once, so calls already sent on it can be
+    // interrupted (unchanged by FOX-11595, which sets an unhealthy client aside instead);
+    // one that holds it but was not yet sent fails as NeverSentError (see callTool).
     const client = this.clients.get(packageId);
-    if (client) {
-      this.clients.delete(packageId);
+    if (client && this.removeClientIfCurrent(packageId, client)) {
       try {
         await this.closeClientExactlyOnce(packageId, client, "restart");
         logger.debug("Closed existing client", { package_id: packageId });
@@ -2782,6 +2824,10 @@ export class PackageRegistry {
    */
   getChildStats(catalog?: ChildCatalogStatsView): ChildStatsEntry[] {
     const now = Date.now();
+    const retiringCounts = new Map<string, number>();
+    for (const packageId of this.retiringClients.values()) {
+      retiringCounts.set(packageId, (retiringCounts.get(packageId) ?? 0) + 1);
+    }
     return this.packages.map((pkg) => {
       const client = this.clients.get(pkg.id);
       const lastActivity = this.lastActivity.get(pkg.id) ?? null;
@@ -2819,6 +2865,7 @@ export class PackageRegistry {
         connect_retry_skipped_permanent_count:
           this.connectRetrySkippedPermanentCounts.get(pkg.id) ?? 0,
         reestablish_count: this.reestablishCounts.get(pkg.id) ?? 0,
+        retiring_count: retiringCounts.get(pkg.id) ?? 0,
         catalog_status: catalogDiagnostics?.status === "unknown"
           ? "connecting"
           : catalogDiagnostics?.status ?? "connecting",

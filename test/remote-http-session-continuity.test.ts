@@ -389,10 +389,23 @@ async function mintHandle(
   return handle;
 }
 
+/**
+ * Passes while at least one continuity check in `checks` fails (the documented,
+ * unresolved defect below); fails once they all hold.
+ */
+function expectKnownBreak(checks: () => void): void {
+  expect(checks).toThrow();
+}
+
 describe("remote HTTP MCP session continuity", () => {
   // ── KNOWN-FAILING BY DESIGN (red repro) ───────────────────────────────────
-  // These use `it.fails`: they PASS while the defect exists and go RED the
-  // moment it is fixed — at which point convert them to plain `it(...)`.
+  // Both tests below. Setup and the calls run as ordinary test steps, so a
+  // broken server or registry fails the test. Only the desired continuity
+  // checks are wrapped in `expectKnownBreak`, which passes while at least one
+  // of them fails and goes RED the moment all hold; then assert them directly.
+  // The persistent-probe test also asserts the defect's signature (fresh
+  // sessions, evictions) as plain expectations outside the wrapper, which go
+  // RED once the defect is fixed; then delete or invert them.
   //
   // Defect: `PackageRegistry.getClient()` runs a pre-dispatch `healthCheck()`
   // that, for HTTP clients, is a full `listTools()` round-trip. A single
@@ -404,7 +417,7 @@ describe("remote HTTP MCP session continuity", () => {
   // Field-verified: this probe ran 1:1 before each tool call. No fix is
   // scheduled. Stripe's `stripe_context` is not an example of this defect: it is
   // a stable account ID that survives session rotation and re-auth.
-  it.fails("preserves a session-bound handle after a transient health-probe failure", async () => {
+  it("preserves a session-bound handle after a transient health-probe failure (known break)", async () => {
     const scenario = await createScenario("session-continuity");
     const lifecycleEvents: RegistryLifecycleEvent[] = [];
     scenario.registry.subscribeLifecycle((event) =>
@@ -436,23 +449,22 @@ describe("remote HTTP MCP session continuity", () => {
     const evictionDelta =
       evictionCount(scenario.registry, scenario.packageId) - evictionsBefore;
 
-    // RED on current code: the failed tools/list probe evicts the live client,
+    // Fails on current code: the failed tools/list probe evicts the live client,
     // creates a new session, and turns this desired successful use into
-    // "Invalid handle". The soft assertions expose every link in that chain.
-    expect.soft(useResult.isError).toBe(false);
-    expect.soft(firstText(useResult)).toBe("Handle accepted");
-    expect.soft(useSession).toBe(mintSession);
-    expect.soft(unhealthyEvictions).toEqual([]);
-    expect.soft(evictionDelta).toBe(0);
-
-    expect.soft(scenario.server.assignedSessionIds()).toHaveLength(1);
-    expect
-      .soft(new Set(scenario.server.observedSessionIds()))
-      .toEqual(new Set([mintSession]));
+    // "Invalid handle". The checks name every link in that chain.
+    expectKnownBreak(() => {
+      expect(useResult.isError).toBe(false);
+      expect(firstText(useResult)).toBe("Handle accepted");
+      expect(useSession).toBe(mintSession);
+      expect(unhealthyEvictions).toEqual([]);
+      expect(evictionDelta).toBe(0);
+      expect(scenario.server.assignedSessionIds()).toHaveLength(1);
+      expect(new Set(scenario.server.observedSessionIds())).toEqual(new Set([mintSession]));
+    });
   });
 
-  it.fails(
-    "under a PERSISTENT (not one-shot) probe failure, every call after the first gets a fresh session — a deterministic, not intermittent, break",
+  it(
+    "under a PERSISTENT (not one-shot) probe failure, every call after the first gets a fresh session — a deterministic, not intermittent, break (known break)",
     async () => {
       // This generic lifecycle defect is real and field-verified: the probe ran
       // 1:1 before each tool call. No fix is scheduled. Stripe's `stripe_context`
@@ -492,20 +504,21 @@ describe("remote HTTP MCP session continuity", () => {
 
       // Desired green behavior: session identity survives regardless of how
       // many times the probe fails, so every one of these succeeds.
-      expect.soft(useResult1.isError).toBe(false);
-      expect.soft(firstText(useResult1)).toBe("Handle accepted");
-      expect.soft(useResult2.isError).toBe(false);
-      expect.soft(firstText(useResult2)).toBe("Handle accepted");
+      expectKnownBreak(() => {
+        expect(useResult1.isError).toBe(false);
+        expect(firstText(useResult1)).toBe("Handle accepted");
+        expect(useResult2.isError).toBe(false);
+        expect(firstText(useResult2)).toBe("Handle accepted");
+      });
 
-      // The deterministic signature: with a persistent probe failure, EVERY
-      // call after the first lands in a brand-new session — not just the one
-      // that happened to straddle a transient blip.
-      expect.soft(scenario.server.listToolsFailureCount()).toBeGreaterThanOrEqual(2);
-      expect.soft(scenario.server.assignedSessionIds().length).toBeGreaterThanOrEqual(4);
-      expect.soft(session3).not.toBe(session1);
-      expect
-        .soft(evictionCount(scenario.registry, scenario.packageId))
-        .toBeGreaterThanOrEqual(2);
+      // The defect's deterministic signature, asserted directly: with a
+      // persistent probe failure, EVERY call after the first lands in a
+      // brand-new session, not just the one that straddled a transient blip.
+      // These hold only while the defect does, so they go red once it is fixed.
+      expect(scenario.server.listToolsFailureCount()).toBeGreaterThanOrEqual(2);
+      expect(scenario.server.assignedSessionIds().length).toBeGreaterThanOrEqual(4);
+      expect(session3).not.toBe(session1);
+      expect(evictionCount(scenario.registry, scenario.packageId)).toBeGreaterThanOrEqual(2);
     },
   );
 });
