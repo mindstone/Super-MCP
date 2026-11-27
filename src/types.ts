@@ -387,12 +387,13 @@ export interface ReadResourceResult {
 
 export interface McpClient {
   connect(): Promise<void>;
-  listTools(): Promise<any[]>;
+  listTools(waiting?: ChildToolCallContext): Promise<any[]>;
   callTool(name: string, args: any, context: ChildToolCallContext): Promise<any>;
-  getToolMetadata?(name: string): Promise<Record<string, unknown> | undefined>;
+  getToolMetadata?(name: string, waiting?: ChildToolCallContext): Promise<Record<string, unknown> | undefined>;
   getFileInputBases?(): InputBases;
   close(): Promise<void>;
-  healthCheck?(): Promise<'ok' | 'error' | 'needs_auth'>;
+  /** `waiting`: the call this check comes before, told if the check has to wait in the connector's queue. */
+  healthCheck?(waiting?: ChildToolCallContext): Promise<'ok' | 'error' | 'needs_auth'>;
   requiresAuth?(): Promise<boolean>;
   isAuthenticated?(): Promise<boolean>;
   readResource?(uri: string): Promise<ReadResourceResult>;

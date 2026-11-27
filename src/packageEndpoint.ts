@@ -1,6 +1,7 @@
 import { expandReadInputs, getReadInputs } from './fileReadInputs.js';
 import { effectiveInputBases } from './fileReadPreflight.js';
-import { assertDispatchActive, captureToolDispatch, DECLARED_FORWARDING, FileReadAdmissionError } from './fileReadProtocol.js';
+import { assertDispatchActive, captureToolDispatch, childCallContext, DECLARED_FORWARDING, FileReadAdmissionError, type ChildToolCallContext, type OriginExtra } from './fileReadProtocol.js';
+import { risingProgress } from './clients/requestQueueProgress.js';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, ListResourcesRequestSchema, ReadResourceRequestSchema, McpError, ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { RegistryClosedError, type PackageRegistry } from "./registry.js";
@@ -46,17 +47,24 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
       try { return await handler(...args); }
       catch (error) { throw withoutMarker(error); }
     };
-  const tools = async () => {
-    try { return await (await registry.getClient(packageId)).listTools(); }
+  // Each step of one request (finding a healthy client, a listing, the call) may wait in the connector's queue;
+  // one rising sequence keeps their progress numbers in order.
+  const capture = (authority: unknown, metadata: Record<string, unknown> | undefined, extra: OriginExtra) => {
+    const captured = captureToolDispatch(authority, metadata, extra);
+    return captured.onprogress ? { ...captured, onprogress: risingProgress(captured.onprogress) } : captured;
+  };
+  const tools = async (waiting?: ChildToolCallContext) => {
+    try { return await (await registry.getClient(packageId, false, waiting)).listTools(waiting); }
     catch (error) { throw await withSignInState(error); }
   };
   const resourceAllowed = (uri: string, toolList: Awaited<ReturnType<typeof tools>>) => {
     const owners = toolList.filter(tool => tool._meta?.ui?.resourceUri === uri);
     return owners.length === 0 || owners.some(tool => allowed(tool.name));
   };
-  server.setRequestHandler(ListToolsRequestSchema, guarded(async () => {
+  server.setRequestHandler(ListToolsRequestSchema, guarded(async ({ params }, extra) => {
     assertToolAccess(registry, packageId);
-    return { tools: (await tools()).filter(tool => allowed(tool.name)) };
+    // A call that needs the tool's details first lists them here: it hears if the listing waits.
+    return { tools: (await tools(childCallContext(capture(undefined, params?._meta, extra)))).filter(tool => allowed(tool.name)) };
   }));
   server.setRequestHandler(CallToolRequestSchema, guarded(async ({ params }, extra) => {
     try {
@@ -65,15 +73,15 @@ export function createPackageServer(registry: PackageRegistry, packageId: string
       return { isError: true, content: [{ type: "text", text: errorText(error) }] };
     }
     try {
-      const context = captureToolDispatch(server.getClientCapabilities()?.experimental?.['files/readAuthority'], params._meta, extra);
+      const context = capture(server.getClientCapabilities()?.experimental?.['files/readAuthority'], params._meta, extra);
       assertDispatchActive(context);
       const forwarded = params._meta?.["rebel/forwardedFiles"];
       if (forwarded !== undefined && !forwardedFilesSchema.safeParse(forwarded).success) throw new Error('Invalid forwarded files');
       const config = registry.getPackage(packageId);
       let operands;
       if (forwarded !== undefined && config?.transport === 'stdio') {
-        const client = await registry.getClient(packageId);
-        const declaration = getReadInputs(await client.getToolMetadata?.(params.name));
+        const client = await registry.getClient(packageId, false, childCallContext(context));
+        const declaration = getReadInputs(await client.getToolMetadata?.(params.name, childCallContext(context)));
         if (declaration) operands = await expandReadInputs(params.arguments ?? {}, declaration, effectiveInputBases(config, client));
       }
       // Package-home senders have no originating home authority. Their child

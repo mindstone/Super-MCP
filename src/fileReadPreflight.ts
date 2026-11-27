@@ -31,7 +31,7 @@ export async function preflightLocalTool(client: McpClient, config: PackageConfi
   const workspace = bases.workspace?.trim();
   const connectorInputBase = !config.cwd && workspace ? path.resolve(bases.connectorCwd, workspace) : bases.connectorCwd;
   if (!central && connectorInputBase === bases.connectorCwd) return { args, context: childCallContext(context, mode) };
-  const declaration = getReadInputs(await client.getToolMetadata?.(name));
+  const declaration = getReadInputs(await client.getToolMetadata?.(name, childCallContext(context)));
   const selected = declaration && (central ? declaration : { ...declaration, inputs: declaration.inputs.filter(input =>
     input.base === 'connectorCwd' || input.base === 'connectorCwdNative') });
   const operands = selected ? await expandReadInputs(args, selected, bases, connectorInputBase, central) : [];

@@ -10,7 +10,9 @@ import { PackageRegistry } from '../src/registry.js';
 import { StdioMcpClient } from '../src/clients/stdioClient.js';
 import { HttpMcpClient } from '../src/clients/httpClient.js';
 import { createPackageServer } from '../src/packageEndpoint.js';
-import { captureToolDispatch } from '../src/fileReadProtocol.js';
+import { CONNECTOR_WAIT_META } from '../src/clients/requestQueueProgress.js';
+import { captureToolDispatch, type ToolDispatchContext } from '../src/fileReadProtocol.js';
+import { preflightLocalTool } from '../src/fileReadPreflight.js';
 import { handleUseTool } from '../src/handlers/useTool.js';
 import { Catalog } from '../src/catalog.js';
 import { Validator } from '../src/validator.js';
@@ -27,7 +29,7 @@ afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await c
 const tool = { name: 'write', inputSchema: { type: 'object' as const, properties: { label: { type: 'string' } } } };
 
 /** A connector whose every slot is held by a running call, so the next call has to queue. */
-async function busyConnector(transport: 'stdio' | 'http') {
+async function busyConnector(transport: 'stdio' | 'http', { registered = false } = {}) {
   const config: PackageConfig = transport === 'stdio'
     ? { id: 'acme', name: 'Acme', transport, visibility: 'default', command: 'unused', cwd: '/connector' }
     : { id: 'acme', name: 'Acme', transport, visibility: 'default', base_url: 'https://connector.example/mcp' };
@@ -54,9 +56,11 @@ async function busyConnector(transport: 'stdio' | 'http') {
   if (local instanceof StdioMcpClient) vi.spyOn(local, 'isTransportClosed').mockReturnValue(false);
   const registry = new PackageRegistry({ mcpServers: { acme: transport === 'stdio'
     ? { command: 'unused', cwd: '/connector' } : { url: 'https://connector.example/mcp' } } });
-  vi.spyOn(registry, 'getClient').mockResolvedValue(local);
+  // `registered` keeps the registry's own client lookup, health check included, as a real call meets it.
+  if (registered) (registry as unknown as { clients: Map<string, unknown> }).clients.set('acme', local);
+  else vi.spyOn(registry, 'getClient').mockResolvedValue(local);
   cleanup.push(() => connector.close(), () => internals.client.close(), () => registry.closeAll());
-  return { registry, sent, cancelled, release, internals, progress };
+  return { registry, sent, cancelled, release, internals, progress, connector, local, config };
 }
 
 /** Fills every connector slot through `call`, then waits until each running call has reached the connector. */
@@ -284,5 +288,198 @@ describe.each(['stdio', 'http'] as const)('%s connector: a queued use_tool call 
     fixture.release();
     await queued;
     expect(fixture.sent).not.toContain('queued-write');
+  });
+});
+
+describe.each(['stdio', 'http'] as const)('%s connector, looked up as a real call looks it up', transport => {
+  it('tells a call that arrives while the connector is busy that it waits, before the busy call ends', async () => {
+    const fixture = await busyConnector(transport, { registered: true });
+    fixture.internals.requestQueue.concurrency = 1;
+    const router = createPackageServer(fixture.registry, 'acme');
+    const host = new Client({ name: 'host', version: '1' });
+    const [hostSide, routerSide] = InMemoryTransport.createLinkedPair();
+    await Promise.all([host.connect(hostSide), router.connect(routerSide)]);
+    cleanup.push(() => router.close(), () => host.close());
+    const stop = new AbortController(), seen: Array<{ progress: number; _meta?: Record<string, unknown> }> = [];
+    const first = host.callTool({ name: 'write', arguments: { label: 'running-first' } }, undefined, { signal: stop.signal }).catch(error => error);
+    await vi.waitFor(() => expect(fixture.sent).toEqual(['running-first']));
+    const second = host.callTool({ name: 'write', arguments: { label: 'running-second' } }, undefined, { onprogress: progress => seen.push(progress) }).catch(error => error);
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0]._meta?.[CONNECTOR_WAIT_META]).toEqual({ version: 1, phase: 'queued', name: 'Acme' });
+    stop.abort();
+    expect(await first).toBeInstanceOf(Error);
+    await vi.waitFor(() => expect(fixture.sent).toEqual(['running-first', 'running-second']));
+    await fixture.progress.get('running-second')!(1);
+    await vi.waitFor(() => expect(seen.at(-1)?._meta?.[CONNECTOR_WAIT_META]).toBeUndefined());
+    fixture.release();
+    await second;
+    // The wait ends before the call goes out (the first call's error path may queue it once more), and
+    // the connector's own progress carries on from the last number sent.
+    const phases = seen.map(progress => (progress._meta?.[CONNECTOR_WAIT_META] as { phase?: string } | undefined)?.phase);
+    expect(phases.slice(-2)).toEqual(['admitted', undefined]);
+    seen.slice(1).forEach((progress, i) => expect(progress.progress).toBeGreaterThan(seen[i].progress));
+  });
+
+  it('keeps the client when a caller leaves while its health check waits', async () => {
+    const fixture = await busyConnector(transport, { registered: true });
+    fixture.internals.requestQueue.concurrency = 1;
+    const clients = (fixture.registry as unknown as { clients: Map<string, unknown> }).clients;
+    const client = clients.get('acme');
+    const router = createPackageServer(fixture.registry, 'acme');
+    const host = new Client({ name: 'host', version: '1' });
+    const [hostSide, routerSide] = InMemoryTransport.createLinkedPair();
+    await Promise.all([host.connect(hostSide), router.connect(routerSide)]);
+    cleanup.push(() => router.close(), () => host.close());
+    const leave = new AbortController(), seen: unknown[] = [];
+    const first = host.callTool({ name: 'write', arguments: { label: 'running-first' } });
+    await vi.waitFor(() => expect(fixture.sent).toEqual(['running-first']));
+    const left = host.callTool({ name: 'write', arguments: { label: 'left' } }, undefined, { signal: leave.signal, onprogress: progress => { seen.push(progress); } }).catch(error => error);
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    leave.abort();
+    expect(await left).toBeInstanceOf(Error);
+    fixture.release();
+    await first;
+    expect(clients.get('acme')).toBe(client);
+    expect(await host.callTool({ name: 'write', arguments: { label: 'after' } })).toMatchObject({ content: [{ text: 'after' }] });
+    expect(fixture.sent).toEqual(['running-first', 'after']);
+  });
+});
+
+type Seen = { progress: number; _meta?: Record<string, unknown> };
+const phase = (progress: Seen) => (progress._meta?.[CONNECTOR_WAIT_META] as { phase?: string } | undefined)?.phase;
+const rises = (seen: Seen[]) => seen.slice(1).forEach((progress, i) => expect(progress.progress).toBeGreaterThan(seen[i].progress));
+
+async function hostFor(registry: PackageRegistry) {
+  const router = createPackageServer(registry, 'acme');
+  const host = new Client({ name: 'host', version: '1' });
+  const [hostSide, routerSide] = InMemoryTransport.createLinkedPair();
+  await Promise.all([host.connect(hostSide), router.connect(routerSide)]);
+  cleanup.push(() => router.close(), () => host.close());
+  return host;
+}
+
+describe('stdio connector: the steps before a call also tell it that it waits', () => {
+  it('tells a call carrying forwarded files, whose tool details are looked up first', async () => {
+    const fixture = await busyConnector('stdio', { registered: true });
+    const host = await hostFor(fixture.registry);
+    const first = host.callTool({ name: 'write', arguments: { label: 'running-first' } });
+    await vi.waitFor(() => expect(fixture.sent).toEqual(['running-first']));
+    const seen: Seen[] = [];
+    const second = host.callTool({ name: 'write', arguments: { label: 'forwarded' }, _meta: { 'rebel/forwardedFiles': [] } }, undefined, { onprogress: progress => { seen.push(progress); } });
+    await vi.waitFor(() => expect(seen).not.toHaveLength(0));
+    expect(phase(seen[0])).toBe('queued');
+    fixture.release();
+    await first;
+    expect(await second).toMatchObject({ content: [{ text: 'forwarded' }] });
+    rises(seen);
+  });
+
+  it('tells a call whose file inputs are read from tool details not yet listed', async () => {
+    const fixture = await busyConnector('stdio');
+    const first = fixture.local.callTool('write', { label: 'running-first' });
+    await vi.waitFor(() => expect(fixture.sent).toEqual(['running-first']));
+    const seen: Seen[] = [];
+    const context = { kind: 'origin', authority: { version: 1 }, signal: new AbortController().signal, sendRequest: vi.fn(), sendNotification: vi.fn(),
+      metadata: { 'files/invocation': { version: 1, invocationId: 'active' } }, onprogress: (progress: Seen) => { seen.push(progress); } } as unknown as ToolDispatchContext;
+    const prepared = preflightLocalTool(fixture.local, fixture.config, 'write', { label: 'x' }, context);
+    await vi.waitFor(() => expect(seen).not.toHaveLength(0));
+    expect(phase(seen[0])).toBe('queued');
+    fixture.release();
+    await first;
+    await prepared;
+  });
+
+  it('tells a call sent to a package home whose tool details are listed there first', async () => {
+    const fixture = await busyConnector('stdio', { registered: true });
+    const router = packageHome(fixture.registry);
+    const first = fixture.registry.callTool('acme', 'write', { label: 'running-first' }, { kind: 'standalone' });
+    await vi.waitFor(() => expect(fixture.sent).toEqual(['running-first']));
+    const seen: Seen[] = [];
+    // A path in the arguments makes the router list the home's tools before the call.
+    const second = router.callTool('acme', 'write', { label: 'home', note: '/elsewhere/notes.txt' }, { kind: 'standalone', onprogress: progress => { seen.push(progress); } });
+    await vi.waitFor(() => expect(seen).not.toHaveLength(0));
+    expect(phase(seen[0])).toBe('queued');
+    fixture.release();
+    await first;
+    expect(await second).toMatchObject({ content: [{ text: 'home' }] });
+    rises(seen);
+  });
+
+  it('keeps a call\'s progress rising when it waits again on a replacement client', async () => {
+    const old = await busyConnector('stdio', { registered: true });
+    const replacement = await busyConnector('stdio');
+    vi.spyOn(old.registry as unknown as { createAndConnectClient: () => Promise<unknown> }, 'createAndConnectClient').mockResolvedValue(replacement.local);
+    const host = await hostFor(old.registry);
+    const first = host.callTool({ name: 'write', arguments: { label: 'running-a' } });
+    await vi.waitFor(() => expect(old.sent).toEqual(['running-a']));
+    // From now on the old connector fails its health checks, so the next calls move to a replacement.
+    old.connector.setRequestHandler(ListToolsRequestSchema, async () => { throw new Error('connector stopped answering'); });
+    const replaced = host.callTool({ name: 'write', arguments: { label: 'running-b' } });
+    await vi.waitFor(() => expect(old.internals.requestQueue.size).toBe(1));
+    const seen: Seen[] = [];
+    // Straight to the registry, as `use_tool` calls it, without the router's own ordering.
+    const late = old.registry.callTool('acme', 'write', { label: 'late' }, { kind: 'standalone', onprogress: progress => { seen.push(progress); } });
+    await vi.waitFor(() => expect(seen).not.toHaveLength(0));
+    old.release();
+    await first;
+    await vi.waitFor(() => expect(replacement.sent).toEqual(['running-b']));
+    await vi.waitFor(() => expect(seen.slice(1).some(progress => phase(progress) === 'queued' && seen.some((earlier, i) => i < seen.indexOf(progress) && phase(earlier) === 'admitted'))).toBe(true));
+    replacement.release();
+    await replaced;
+    expect(await late).toMatchObject({ content: [{ text: 'late' }] });
+    rises(seen);
+  });
+});
+
+describe('http connector whose session expires while every slot is busy', () => {
+  it('opens a fresh session for a waiting call and tells it that it waits', async () => {
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const sent: string[] = [];
+    const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
+    let opened = 0;
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const body = request.method === 'POST' ? await request.clone().json() : undefined;
+      let transport = sessions.get(request.headers.get('mcp-session-id') ?? '');
+      if (body?.method === 'initialize') {
+        opened += 1;
+        const connector = new Server({ name: 'acme', version: '1' }, { capabilities: { tools: {} } });
+        connector.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [tool] }));
+        connector.setRequestHandler(CallToolRequestSchema, async ({ params }) => {
+          const label = String(params.arguments?.label);
+          sent.push(label);
+          if (label.startsWith('running')) await held;
+          return { content: [{ type: 'text', text: label }] };
+        });
+        transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: randomUUID });
+        await connector.connect(transport);
+        cleanup.push(() => connector.close());
+      }
+      if (!transport) return new Response('Session not found', { status: 404 });
+      const response = await transport.handleRequest(request);
+      const id = response.headers.get('mcp-session-id');
+      if (id) sessions.set(id, transport);
+      return response;
+    });
+    const registry = new PackageRegistry({ mcpServers: { acme: { url: 'https://connector.example/mcp' } } });
+    cleanup.push(() => registry.closeAll());
+    const router = createPackageServer(registry, 'acme');
+    const host = new Client({ name: 'host', version: '1' });
+    const [hostSide, routerSide] = InMemoryTransport.createLinkedPair();
+    await Promise.all([host.connect(hostSide), router.connect(routerSide)]);
+    cleanup.push(() => router.close(), () => host.close());
+    await host.callTool({ name: 'write', arguments: { label: 'first' } });
+    const running = Array.from({ length: 5 }, (_, i) => host.callTool({ name: 'write', arguments: { label: `running-${i}` } }));
+    await vi.waitFor(() => expect(sent).toHaveLength(6));
+    sessions.clear();
+    const seen: Seen[] = [];
+    const late = host.callTool({ name: 'write', arguments: { label: 'late' } }, undefined, { onprogress: progress => { seen.push(progress); } });
+    await vi.waitFor(() => expect(seen).toHaveLength(1));
+    expect(seen[0]._meta?.[CONNECTOR_WAIT_META]).toMatchObject({ version: 1, phase: 'queued' });
+    release();
+    await Promise.all(running);
+    expect(await late).toMatchObject({ content: [{ text: 'late' }] });
+    expect(opened).toBe(2);
   });
 });

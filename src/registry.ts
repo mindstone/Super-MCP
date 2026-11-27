@@ -1,5 +1,6 @@
 import { preflightLocalTool } from './fileReadPreflight.js';
-import { assertDispatchActive, type ToolDispatchContext } from './fileReadProtocol.js';
+import { assertDispatchActive, childCallContext, type ChildToolCallContext, type ToolDispatchContext } from './fileReadProtocol.js';
+import { risingProgress } from './clients/requestQueueProgress.js';
 import { getRefreshRefusalCount } from "./auth/refreshRefusals.js";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -1828,16 +1829,17 @@ export class PackageRegistry {
    * out a restart or eviction of the package first, so it never hands out the
    * retiring client (FOX-9654). `leaseHeld` is only for `callTool()`, which
    * already holds a lease: an eviction waits for that lease, so waiting for the
-   * eviction there would deadlock.
+   * eviction there would deadlock. `waiting` is the call this lookup is for: if the health check has to
+   * wait in the connector's queue, that call is told it waits.
    */
-  async getClient(packageId: string, leaseHeld = false): Promise<McpClient> {
+  async getClient(packageId: string, leaseHeld = false, waiting?: ChildToolCallContext): Promise<McpClient> {
     if (!leaseHeld) {
       for (let barrier = this.evictionPromises.get(packageId); barrier; barrier = this.evictionPromises.get(packageId)) {
         await barrier;
       }
     }
     this.discoveryOnlyClients.delete(packageId);
-    return this.acquireClient(packageId);
+    return this.acquireClient(packageId, false, waiting);
   }
 
   /**
@@ -1845,7 +1847,7 @@ export class PackageRegistry {
    * bound to it, all read with no `await` before the removal; after any await the probe starts again from the top,
    * so every client it meets passes this check.
    */
-  private async acquireClient(packageId: string, forProbe = false): Promise<McpClient> {
+  private async acquireClient(packageId: string, forProbe = false, waiting?: ChildToolCallContext): Promise<McpClient> {
     this.assertAdmissionOpen(packageId);
     const setupReason = this.setupBlockReason(packageId);
     if (setupReason) {
@@ -1859,7 +1861,7 @@ export class PackageRegistry {
     if (client) {
       // For HTTP clients, check if they're actually connected
       if (client.healthCheck) {
-        const health = await client.healthCheck();
+        const health = await client.healthCheck(waiting);
         this.assertAdmissionOpen(packageId);
         if (health === "ok") {
           if (this.authRequiredPackages.has(packageId)) {
@@ -1879,7 +1881,7 @@ export class PackageRegistry {
         // Client exists but not healthy: replace it. Only the caller that still finds this
         // very client current removes it, so two callers awaiting the same health check
         // count one eviction, and a late result never removes a replacement.
-        if (this.clients.get(packageId) !== client) return this.acquireClient(packageId, forProbe);
+        if (this.clients.get(packageId) !== client) return this.acquireClient(packageId, forProbe, waiting);
         if (forProbe && (this.evictionPromises.has(packageId) || this.activeLeaseClients.get(packageId)?.get(client))) {
           throw new ProbeBusyError(packageId);
         }
@@ -1913,7 +1915,7 @@ export class PackageRegistry {
           }
         }
         // Read the map again: another caller may have published a replacement meanwhile.
-        return this.acquireClient(packageId, forProbe);
+        return this.acquireClient(packageId, forProbe, waiting);
       } else {
         // Update activity for stdio clients
         const config = this.getPackage(packageId);
@@ -2172,6 +2174,9 @@ export class PackageRegistry {
   async callTool(packageId: string, toolId: string, args: any, context: ToolDispatchContext): Promise<any> {
     // Runtime compatibility for existing embedders; typed callers must select a mode.
     context ??= { kind: "standalone" };
+    // Every step below (finding a healthy client, then the call, then a replay) tells the caller if it waits
+    // in the connector's queue; one rising sequence keeps their progress numbers in order.
+    if (context.onprogress) context = { ...context, onprogress: risingProgress(context.onprogress) };
     try {
       return await this.callToolOnce(packageId, toolId, args, context);
     } catch (error) {
@@ -2186,8 +2191,10 @@ export class PackageRegistry {
     // Backstop: every route to a connector ends here, so a safety-disabled tool never runs.
     assertNotSafetyDisabled(this.getPackage(packageId), packageId, toolId, args);
     let leaseClient = await this.acquireLease(packageId);
+    // Finding a healthy client may wait in the connector's queue behind other calls: the caller is told so.
+    const acquire = () => this.getClient(packageId, true, childCallContext(context));
     try {
-      let client = await this.getClient(packageId, true);
+      let client = await acquire();
       leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
       // Pre-send liveness re-check: the lease blocks the reaper, but the client
       // could already have a dead transport (e.g. closed between a prior reap
@@ -2203,7 +2210,7 @@ export class PackageRegistry {
         if (this.removeClientIfCurrent(packageId, client)) {
           this.reestablishCounts.set(packageId, (this.reestablishCounts.get(packageId) ?? 0) + 1);
         }
-        client = await this.getClient(packageId, true);
+        client = await acquire();
         leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
       }
       const dispatch = async () => {
@@ -2231,7 +2238,7 @@ export class PackageRegistry {
         // A home session 404 is returned before dispatch, so one replay is safe.
         if (!(client instanceof PackageHomeClient && error instanceof StreamableHTTPError && error.code === 404)) throw error;
         logger.info("Replaying a call the cloud refused because its session was gone", { package_id: packageId, tool_id: toolId });
-        client = await this.getClient(packageId, true);
+        client = await acquire();
         leaseClient = this.moveLeaseToClient(packageId, leaseClient, client);
         return await dispatch();
       }

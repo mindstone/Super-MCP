@@ -1,3 +1,4 @@
+import type { Progress } from '@modelcontextprotocol/sdk/types.js';
 import type { ChildToolCallContext } from '../fileReadProtocol.js';
 import { getLogger } from '../logging.js';
 import type { PackageConfig } from '../types.js';
@@ -38,4 +39,20 @@ export class RequestQueueProgress {
       } } satisfies ChildToolCallContext,
     };
   }
+}
+
+/**
+ * One call's progress across its steps (health listings, a tool-details listing, the call itself), any of
+ * which may count again from its own start. A value that would not rise past the last one sent moves past it,
+ * its total with it, so the caller's progress only increases, as MCP requires.
+ */
+export function risingProgress(forward: (progress: Progress & { _meta?: Record<string, unknown> }) => void | Promise<void>) {
+  let sent: number | undefined, offset = 0;
+  return async (progress: Progress & { _meta?: Record<string, unknown> }) => {
+    if (sent !== undefined && progress.progress + offset <= sent) offset = sent + 1 - progress.progress;
+    sent = progress.progress + offset;
+    await forward(offset === 0 ? progress : {
+      ...progress, progress: sent, ...(progress.total === undefined ? {} : { total: progress.total + offset }),
+    });
+  };
 }

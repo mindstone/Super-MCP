@@ -1023,7 +1023,7 @@ export class HttpMcpClient implements McpClient {
     } finally { progress?.dispose(); }
   }
 
-  async listTools(): Promise<any[]> {
+  async listTools(waiting?: ChildToolCallContext): Promise<any[]> {
     if (!this.isConnected) {
       throw new Error(`Package '${this.packageId}' is not connected`);
     }
@@ -1048,7 +1048,7 @@ export class HttpMcpClient implements McpClient {
         });
         throw this.isRequestAuthFailure(error) ? this.authRequiredError(error) : error;
       }
-    }) as Promise<any[]>;
+    }, waiting) as Promise<any[]>;
   }
 
   async callTool(name: string, args: any, context: ChildToolCallContext = { readMode: "unnegotiated" }): Promise<any> {
@@ -1113,15 +1113,17 @@ export class HttpMcpClient implements McpClient {
     }
   }
 
-  async healthCheck(): Promise<"ok" | "error" | "needs_auth"> {
+  async healthCheck(waiting?: ChildToolCallContext): Promise<"ok" | "error" | "needs_auth"> {
     if (!this.isConnected) {
       return "needs_auth";
     }
 
     try {
-      await this.listTools();
+      await this.listTools(waiting);
       return "ok";
     } catch (error) {
+      // A caller that left while the listing waited says nothing about the connector.
+      if (waiting?.signal?.aborted) throw error;
       if (isAuthLikeError(error)) {
         return "needs_auth";
       }

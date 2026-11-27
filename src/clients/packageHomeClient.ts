@@ -1,7 +1,8 @@
 import { expandReadInputs, getReadInputs } from '../fileReadInputs.js';
-import { assertDispatchActive, authorizeReads, DECLARED_FORWARDING, hasReadAuthority, matchesFileVersion, relayToolProgress, standaloneDispatch, type ChildToolCallContext, type ToolDispatchContext } from '../fileReadProtocol.js';
+import { assertDispatchActive, authorizeReads, childCallContext, DECLARED_FORWARDING, hasReadAuthority, matchesFileVersion, relayToolProgress, standaloneDispatch, type ChildToolCallContext, type ToolDispatchContext } from '../fileReadProtocol.js';
 import { effectiveInputBases } from '../fileReadPreflight.js';
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { DEFAULT_REQUEST_TIMEOUT_MSEC } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import { StreamableHTTPClientTransport, StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { McpError, ErrorCode, isJSONRPCRequest } from "@modelcontextprotocol/sdk/types.js";
 import { PackageHomeRefusedError } from "../dispatchErrors.js";
@@ -125,9 +126,12 @@ export class PackageHomeClient implements McpClient {
     this.connected = true;
   }
   private toolMetadata = new Map<string, Record<string, unknown> | undefined>();
-  async listTools() {
+  async listTools(waiting?: ChildToolCallContext) {
     return this.request(async () => {
-      const tools = (await this.client.listTools()).tools;
+      // A call that needs the tool's details first hears from the home if this listing waits there.
+      const tools = (waiting?.onprogress
+        ? await relayToolProgress(waiting, DEFAULT_REQUEST_TIMEOUT_MSEC, options => this.client.listTools(undefined, options), this.client.transport)
+        : await this.client.listTools()).tools;
       this.toolMetadata = new Map(tools.map(tool => [tool.name, tool._meta]));
       return tools;
     });
@@ -139,7 +143,7 @@ export class PackageHomeClient implements McpClient {
     assertDispatchActive(context);
     const timeout = getToolTimeout(this.config);
     const exact = matchesFileVersion(this.client.getServerCapabilities()?.experimental?.[DECLARED_FORWARDING]);
-    if (exact && !this.toolMetadata.has(name) && hasAbsoluteForwardingInput(args)) await this.listTools();
+    if (exact && !this.toolMetadata.has(name) && hasAbsoluteForwardingInput(args)) await this.listTools(childCallContext(context));
     const declaration = exact ? getReadInputs(this.toolMetadata.get(name)) : undefined;
     const operands = declaration ? await expandReadInputs(args, declaration, effectiveInputBases(this.config)) : undefined;
     const { files, bytes, tooLarge } = await collectForwardedFiles(args, getWorkspacePath(), {

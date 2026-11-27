@@ -910,12 +910,12 @@ export class StdioMcpClient implements McpClient {
 
   private toolMetadata = new Map<string, Record<string, unknown> | undefined>();
 
-  async getToolMetadata(name: string): Promise<Record<string, unknown> | undefined> {
-    if (!this.toolMetadata.has(name)) await this.listTools();
+  async getToolMetadata(name: string, waiting?: ChildToolCallContext): Promise<Record<string, unknown> | undefined> {
+    if (!this.toolMetadata.has(name)) await this.listTools(waiting);
     return this.toolMetadata.get(name);
   }
 
-  async listTools(): Promise<any[]> {
+  async listTools(waiting?: ChildToolCallContext): Promise<any[]> {
     const timeout = parseInt(process.env.SUPER_MCP_LIST_TOOLS_TIMEOUT || '10000');
 
     logger.info("Listing tools from stdio MCP", {
@@ -943,7 +943,7 @@ export class StdioMcpClient implements McpClient {
         });
         throw error;
       }
-    }) as Promise<any[]>;
+    }, waiting) as Promise<any[]>;
   }
 
   async callTool(name: string, args: any, context: ChildToolCallContext = { readMode: { version: 1, mode: "standalone" } }): Promise<any> {
@@ -1054,12 +1054,14 @@ export class StdioMcpClient implements McpClient {
     }
   }
 
-  async healthCheck(): Promise<"ok" | "error"> {
+  async healthCheck(waiting?: ChildToolCallContext): Promise<"ok" | "error"> {
     try {
       // Try to list tools as a health check
-      await this.listTools();
+      await this.listTools(waiting);
       return "ok";
     } catch (error) {
+      // A caller that left while the listing waited says nothing about the connector.
+      if (waiting?.signal?.aborted) throw error;
       logger.warn("Health check failed for stdio MCP", {
         package_id: this.packageId,
         error: error instanceof Error ? error.message : String(error),

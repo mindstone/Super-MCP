@@ -142,17 +142,29 @@ describe.each(routes)('progress through $kind (home $home)', ({ kind, home }) =>
   it('isolates concurrent calls with the same tool name', async () => {
     const { registry } = await setup(kind, home); const client = await topClient(registry);
     const first = await workspace('first'); const second = await workspace('second');
-    const counts = new Map<string | number, number>(); const ready = deferred();
+    // A call that waits for the connector first hears that it waits; its own progress follows the last such notice.
+    const seen = new Map<string | number, { progress: number; waiting: boolean }[]>(); const ready = deferred();
+    const own = (token: string | number) => {
+      const items = seen.get(token) ?? [];
+      return items.slice(items.reduce((last, item, index) => item.waiting ? index + 1 : last, 0)).length;
+    };
     client.setNotificationHandler(ProgressNotificationSchema, item => {
-      counts.set(item.params.progressToken, item.params.progress);
-      if (counts.get(0) === 4) ready.resolve();
+      const waiting = item.params._meta?.['com.mindstone/connectorWait'] !== undefined;
+      seen.set(item.params.progressToken, [...seen.get(item.params.progressToken) ?? [], { progress: item.params.progress, waiting }]);
+      if (own(0) === 4) ready.resolve();
     });
     const one = client.callTool({ name: 'stream-files', arguments: first, _meta: { progressToken: 0 } }); await ready.promise;
     const two = client.callTool({ name: 'stream-files', arguments: second, _meta: { progressToken: 'other' } });
-    if (kind === 'http') await vi.waitFor(() => expect(counts.get('other')).toBe(4));
+    if (kind === 'http') await vi.waitFor(() => expect(own('other')).toBe(4));
+    else await vi.waitFor(() => expect(seen.get('other')?.[0]?.waiting).toBe(true)); // One process at a time: it waits, and is told.
     await writeFile(first.releaseFile, 'go'); await one;
-    await vi.waitFor(() => expect(counts.get('other')).toBe(4)); expect(counts.get(0), JSON.stringify([...counts])).toBe(6);
-    await writeFile(second.releaseFile, 'go'); await two; expect([...counts.entries()]).toEqual([[0, 6], ['other', 6]]);
+    await vi.waitFor(() => expect(own('other')).toBe(4));
+    expect(seen.get(0)?.map(item => item.progress), JSON.stringify([...seen])).toEqual([1, 2, 3, 4, 5, 6]);
+    await writeFile(second.releaseFile, 'go'); await two;
+    expect(own('other')).toBe(6);
+    expect(seen.get(0)).toHaveLength(6);
+    const other = seen.get('other')!.map(item => item.progress);
+    expect(other.every((value, index) => index === 0 || value > other[index - 1])).toBe(true);
   });
   it('drains a delayed upstream sender before settling the real child call', async () => {
     const { registry } = await setup(kind, home); const args = await workspace('delayed');
