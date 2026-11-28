@@ -1,6 +1,6 @@
 import { preflightLocalTool } from './fileReadPreflight.js';
 import { assertDispatchActive, childCallContext, type ChildToolCallContext, type ToolDispatchContext } from './fileReadProtocol.js';
-import { risingProgress } from './clients/requestQueueProgress.js';
+import { RequestQueueProgress, risingProgress } from './clients/requestQueueProgress.js';
 import { getRefreshRefusalCount } from "./auth/refreshRefusals.js";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -537,6 +537,9 @@ export class PackageRegistry {
   // a client mid-flight with `McpError(ConnectionClosed)` = -32000.
   // Invariant: leased (count > 0) ⇒ not reaped.
   private activeLeases: Map<string, number> = new Map();
+  /** Callers told while a package's client waits for its running calls before it closes (`tellWhileClosing`). */
+  private closingWatchers: Map<string, Set<(waiting: boolean) => void>> = new Map();
+  private closingBehindCalls: Set<string> = new Set();
 
   constructor(config: SuperMcpConfig) {
     this.config = config;
@@ -1750,7 +1753,7 @@ export class PackageRegistry {
    */
   async connectForCatalog(
     packageId: string,
-    options: { forceReconnect?: boolean; forProbe?: boolean } = {},
+    options: { forceReconnect?: boolean; forProbe?: boolean; waiting?: ChildToolCallContext } = {},
   ): Promise<ConnectOutcome> {
     if (this.terminal) return this.terminalConnectOutcome(packageId);
     const config = this.getPackage(packageId);
@@ -1766,23 +1769,25 @@ export class PackageRegistry {
       return { kind: "setup_incomplete", reason: setupReason };
     }
     if (options.forceReconnect) {
-      await this.evictClient(packageId, "explicit");
+      await this.tellWhileClosing(packageId, options.waiting, () => this.evictClient(packageId, "explicit"));
       if (this.terminal) return this.terminalConnectOutcome(packageId);
     }
 
     try {
       if (options.forProbe && this.evictionPromises.has(packageId)) throw new ProbeBusyError(packageId);
       // A restart in progress keeps the retiring client: wait for it (FOX-9654).
-      for (let barrier = this.evictionPromises.get(packageId); barrier; barrier = this.evictionPromises.get(packageId)) {
-        await barrier;
-      }
+      await this.tellWhileClosing(packageId, options.waiting, async () => {
+        for (let barrier = this.evictionPromises.get(packageId); barrier; barrier = this.evictionPromises.get(packageId)) {
+          await barrier;
+        }
+      });
       // Marked before the await, so a caller joining this connection clears it for good.
       // A client kept from an earlier discovery attempt keeps whatever mark it has.
       if (!this.clients.has(packageId) && !this.clientPromises.has(packageId)) {
         this.discoveryOnlyClients.add(packageId);
       }
-      const client = await this.acquireClient(packageId, options.forProbe);
-      const health = await client.healthCheck?.();
+      const client = await this.acquireClient(packageId, options.forProbe, options.waiting);
+      const health = await client.healthCheck?.(options.waiting);
       if (this.terminal) return this.terminalConnectOutcome(packageId);
       if (health === "needs_auth") {
         const error = new Error(`Authentication required for MCP package '${packageId}'`);
@@ -2046,8 +2051,43 @@ export class PackageRegistry {
   }
 
   private async waitForActiveLeases(packageId: string): Promise<void> {
-    while ((this.activeLeases.get(packageId) ?? 0) > 0) {
-      await this.waitForLeaseAccountingChange(packageId);
+    if ((this.activeLeases.get(packageId) ?? 0) === 0) return;
+    this.closingBehindCalls.add(packageId);
+    try {
+      while ((this.activeLeases.get(packageId) ?? 0) > 0) {
+        for (const watch of this.closingWatchers.get(packageId) ?? []) watch(true);
+        await this.waitForLeaseAccountingChange(packageId);
+      }
+    } finally {
+      this.closingBehindCalls.delete(packageId);
+      for (const watch of this.closingWatchers.get(packageId) ?? []) watch(false);
+    }
+  }
+
+  /**
+   * Runs `wait`, which may hold a call until this package's client has closed, and that close first waits for the
+   * package's running calls. While it does, the caller is told it waits for another request, as a queued call is.
+   */
+  async tellWhileClosing<T>(packageId: string, context: ChildToolCallContext | undefined, wait: () => Promise<T>): Promise<T> {
+    if (!context?.onprogress) return wait();
+    const told: ChildToolCallContext = { ...context, onprogress: risingProgress(context.onprogress) };
+    const connector = { name: this.getPackage(packageId)?.name ?? '' };
+    const queue = new RequestQueueProgress();
+    let notice: ReturnType<RequestQueueProgress['track']> | undefined;
+    const watch = (waiting: boolean) => {
+      if (waiting && notice) queue.moved();
+      else if (waiting) notice = queue.track(told, true, connector);
+      else { notice?.admit(); notice = undefined; }
+    };
+    const watchers = this.closingWatchers.get(packageId) ?? new Set();
+    this.closingWatchers.set(packageId, watchers.add(watch));
+    if (this.closingBehindCalls.has(packageId)) watch(true);
+    try {
+      return await wait();
+    } finally {
+      watch(false);
+      watchers.delete(watch);
+      if (watchers.size === 0 && this.closingWatchers.get(packageId) === watchers) this.closingWatchers.delete(packageId);
     }
   }
 
@@ -2190,7 +2230,7 @@ export class PackageRegistry {
     assertDispatchActive(context);
     // Backstop: every route to a connector ends here, so a safety-disabled tool never runs.
     assertNotSafetyDisabled(this.getPackage(packageId), packageId, toolId, args);
-    let leaseClient = await this.acquireLease(packageId);
+    let leaseClient = await this.tellWhileClosing(packageId, childCallContext(context), () => this.acquireLease(packageId));
     // Finding a healthy client may wait in the connector's queue behind other calls: the caller is told so.
     const acquire = () => this.getClient(packageId, true, childCallContext(context));
     try {

@@ -41,6 +41,52 @@ export class RequestQueueProgress {
   }
 }
 
+type Notice = Progress & { _meta?: Record<string, unknown> };
+
+/**
+ * Work several callers wait on together, such as a connector's catalog refresh. Each attempt at the work runs with
+ * the context `begin()` gives it; each caller waiting on it is told what it waits for, a caller that joins while it
+ * waits behind another request included.
+ */
+export class SharedWait {
+  private callers = new Set<(progress: Notice) => Promise<void>>();
+  private queued: Notice | undefined;
+  private attempt = 0;
+
+  /** A new attempt: what an earlier one reports from now on (one that ran out of time, say) is no longer told. */
+  begin(): ChildToolCallContext {
+    const attempt = ++this.attempt;
+    this.queued = undefined;
+    return { readMode: 'unnegotiated', onprogress: async (progress: Notice) => {
+      if (attempt !== this.attempt) return;
+      const phase = (progress._meta?.[CONNECTOR_WAIT_META] as { phase?: unknown } | undefined)?.phase;
+      if (phase === 'queued') this.queued = progress;
+      else if (phase === 'admitted') this.queued = undefined;
+      await Promise.all([...this.callers].map(tell => tell(progress)));
+    } };
+  }
+
+  /** Tells `caller` about the shared work until `work` settles. */
+  async during<T>(caller: ChildToolCallContext, work: Promise<T>): Promise<T> {
+    const forward = caller.onprogress;
+    if (!forward) return work;
+    const rising = risingProgress(forward);
+    const tell = async (progress: Notice) => {
+      if (caller.signal?.aborted) return;
+      try { await rising(progress); }
+      catch (error) {
+        getLogger().warn({ error_type: error instanceof Error ? error.name : typeof error }, 'Queue progress forwarding failed');
+      }
+    };
+    this.callers.add(tell);
+    if (this.queued) void tell(this.queued);
+    try { return await work; } finally { this.callers.delete(tell); }
+  }
+
+  /** The attempt ended: a wait it was told about is over, and what it reports later is not told. */
+  ended(): void { this.attempt++; this.queued = undefined; }
+}
+
 /**
  * One call's progress across its steps (health listings, a tool-details listing, the call itself), any of
  * which may count again from its own start. A value that would not rise past the last one sent moves past it,

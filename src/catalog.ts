@@ -6,6 +6,7 @@ import {
   type TransientConnectFailureClass,
 } from "./types.js";
 import { PackageRegistry } from "./registry.js";
+import type { ChildToolCallContext } from "./fileReadProtocol.js";
 import { argsSkeleton, createSchemaHash } from "./summarize.js";
 import { getLogger } from "./logging.js";
 import { oauthErrorLogText } from "./auth/oauthErrorLogging.js";
@@ -99,6 +100,8 @@ export interface CatalogPackageDiagnostics {
 export interface CatalogRefreshRequest {
   forceReconnect?: boolean;
   reason?: "passive" | "explicit" | "authentication" | "restart" | "configuration";
+  /** The call waiting for this refresh: told while the refresh waits for the connector's running calls. */
+  waiting?: ChildToolCallContext;
 }
 
 export interface CatalogRefreshController extends CatalogRefreshScheduler {

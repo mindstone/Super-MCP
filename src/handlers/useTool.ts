@@ -1,4 +1,5 @@
-import { FileReadAdmissionError, type ToolDispatchContext } from '../fileReadProtocol.js';
+import { childCallContext, FileReadAdmissionError, type ToolDispatchContext } from '../fileReadProtocol.js';
+import { risingProgress } from '../clients/requestQueueProgress.js';
 import { setupIncompleteMessage } from "../utils/setupIncompleteMessage.js";
 import { randomUUID } from "crypto";
 import { computeProgressDigest, type ProgressDigestV1 } from './progressDigest.js';
@@ -1544,7 +1545,9 @@ function buildRepairTicket(
 export async function handleUseTool(...params: Parameters<typeof handleUseToolImpl>): Promise<any> {
   const context = params[4];
   const evidence = context?.dispatch?.connectorDispatch ?? { started: false };
-  params[4] = { ...context, dispatch: { ...(context?.dispatch ?? { kind: 'standalone' }), connectorDispatch: evidence } };
+  const dispatch = context?.dispatch ?? { kind: 'standalone' };
+  // One rising progress sequence for every step of the call, from loading the connector to the call itself.
+  params[4] = { ...context, dispatch: { ...dispatch, connectorDispatch: evidence, ...(dispatch.onprogress ? { onprogress: risingProgress(dispatch.onprogress) } : {}) } };
   const result = await handleUseToolImpl(...params);
   if (result.isError === true && !evidence.started) {
     result._meta = { ...result._meta, superMcp: { ...result._meta?.superMcp, neverDispatched: true } };
@@ -1773,9 +1776,11 @@ async function handleUseToolImpl(
   // The raw arguments; the dispatch backstop checks them again after alias repair.
   assertToolAccess(registry, package_id, tool_id, args);
 
+  // A connector that is not ready is loaded again first; the call is told while that waits for its running calls.
   await catalog.ensurePackageLoaded(package_id, {
     forceReconnect: catalog.getPackageStatus(package_id) !== "ready",
     reason: "explicit",
+    waiting: childCallContext(context?.dispatch ?? { kind: "standalone" }),
   });
   const packageStatus = catalog.getPackageStatus(package_id);
   if (packageStatus === "auth_required") {

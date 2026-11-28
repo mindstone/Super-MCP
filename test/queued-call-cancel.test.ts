@@ -15,6 +15,7 @@ import { captureToolDispatch, type ToolDispatchContext } from '../src/fileReadPr
 import { preflightLocalTool } from '../src/fileReadPreflight.js';
 import { handleUseTool } from '../src/handlers/useTool.js';
 import { Catalog } from '../src/catalog.js';
+import { CatalogRefresher } from '../src/catalogRefresher.js';
 import { Validator } from '../src/validator.js';
 import type { PackageConfig } from '../src/types.js';
 
@@ -55,7 +56,7 @@ async function busyConnector(transport: 'stdio' | 'http', { registered = false }
   internals.isConnected = true;
   if (local instanceof StdioMcpClient) vi.spyOn(local, 'isTransportClosed').mockReturnValue(false);
   const registry = new PackageRegistry({ mcpServers: { acme: transport === 'stdio'
-    ? { command: 'unused', cwd: '/connector' } : { url: 'https://connector.example/mcp' } } });
+    ? { name: 'Acme', command: 'unused', cwd: '/connector' } : { name: 'Acme', url: 'https://connector.example/mcp' } } });
   // `registered` keeps the registry's own client lookup, health check included, as a real call meets it.
   if (registered) (registry as unknown as { clients: Map<string, unknown> }).clients.set('acme', local);
   else vi.spyOn(registry, 'getClient').mockResolvedValue(local);
@@ -481,5 +482,102 @@ describe('http connector whose session expires while every slot is busy', () => 
     await Promise.all(running);
     expect(await late).toMatchObject({ content: [{ text: 'late' }] });
     expect(opened).toBe(2);
+  });
+});
+
+describe.each(['stdio', 'http'] as const)('%s connector closed and opened again while another call runs', transport => {
+  /** A busy connector, each of whose later clients is a fresh one, so closing the old client has to wait for its running call. */
+  async function reconnecting() {
+    const old = await busyConnector(transport, { registered: true });
+    old.internals.requestQueue.concurrency = 1;
+    const replacements: Array<Awaited<ReturnType<typeof busyConnector>>> = [];
+    vi.spyOn(old.registry as unknown as { createAndConnectClient: () => Promise<unknown> }, 'createAndConnectClient').mockImplementation(async () => {
+      replacements.push(await busyConnector(transport));
+      return replacements.at(-1)!.local;
+    });
+    const later = () => replacements.flatMap(replacement => replacement.sent);
+    const first = old.registry.callTool('acme', 'write', { label: 'running-first' }, { kind: 'standalone' });
+    await vi.waitFor(() => expect(old.sent).toEqual(['running-first']));
+    return { old, later, first };
+  }
+
+  it('tells a use_tool call to a connector the router no longer counts as ready that it waits for the running call', async () => {
+    const { old, later, first } = await reconnecting();
+    const catalog = new Catalog(old.registry);
+    catalog.commitReady('acme', [tool], catalog.getConfigurationGeneration());
+    const refresher = new CatalogRefresher(catalog, old.registry);
+    refresher.start();
+    cleanup.push(() => refresher.dispose());
+    // Not ready any more (for example after a health check cleared an old error), so the call reconnects first.
+    catalog.clearPackage('acme');
+    const seen: Seen[] = [];
+    const second = handleUseTool({ package_id: 'acme', tool_id: 'write', args: { label: 'second' } }, old.registry, catalog, new Validator(),
+      { dispatch: { kind: 'standalone', onprogress: progress => { seen.push(progress); } } });
+    await vi.waitFor(() => expect(seen).not.toHaveLength(0));
+    expect(seen[0]._meta?.[CONNECTOR_WAIT_META]).toEqual({ version: 1, phase: 'queued', name: 'Acme' });
+    old.release();
+    await first;
+    expect(await second).not.toMatchObject({ isError: true });
+    expect(later()).toEqual(['second']);
+    expect(phase(seen.at(-1)!)).toBe('admitted');
+    rises(seen);
+  });
+
+  it('tells a use_tool call that joins a refresh whose listing waits behind the running call', async () => {
+    const { old, later, first } = await reconnecting();
+    const catalog = new Catalog(old.registry);
+    const refresher = new CatalogRefresher(catalog, old.registry);
+    refresher.start();
+    cleanup.push(() => refresher.dispose());
+    // The connector's first listing queues behind the running call.
+    await vi.waitFor(() => expect(old.internals.requestQueue.size).toBe(1));
+    const seen: Seen[] = [];
+    const second = handleUseTool({ package_id: 'acme', tool_id: 'write', args: { label: 'second' } }, old.registry, catalog, new Validator(),
+      { dispatch: { kind: 'standalone', onprogress: progress => { seen.push(progress); } } });
+    await vi.waitFor(() => expect(seen).not.toHaveLength(0));
+    expect(seen[0]._meta?.[CONNECTOR_WAIT_META]).toEqual({ version: 1, phase: 'queued', name: 'Acme' });
+    old.release();
+    await first;
+    expect(await second).not.toMatchObject({ isError: true });
+    expect([...old.sent, ...later()]).toEqual(['running-first', 'second']);
+    rises(seen);
+  });
+
+  it('tells a use_tool call that waits behind a readiness probe whose listing waits behind the running call', async () => {
+    const { old, later, first } = await reconnecting();
+    const catalog = new Catalog(old.registry);
+    const refresher = new CatalogRefresher(catalog, old.registry);
+    cleanup.push(() => refresher.dispose());
+    // A connector not ready yet is probed; the probe's listing queues behind the running call.
+    const probe = refresher.probeNow('acme');
+    await vi.waitFor(() => expect(old.internals.requestQueue.size).toBe(1));
+    refresher.start();
+    const seen: Seen[] = [];
+    const second = handleUseTool({ package_id: 'acme', tool_id: 'write', args: { label: 'second' } }, old.registry, catalog, new Validator(),
+      { dispatch: { kind: 'standalone', onprogress: progress => { seen.push(progress); } } });
+    await vi.waitFor(() => expect(seen).not.toHaveLength(0));
+    expect(seen[0]._meta?.[CONNECTOR_WAIT_META]).toEqual({ version: 1, phase: 'queued', name: 'Acme' });
+    old.release();
+    await first;
+    await probe;
+    expect(await second).not.toMatchObject({ isError: true });
+    expect([...old.sent, ...later()]).toEqual(['running-first', 'second']);
+    rises(seen);
+  });
+
+  it('tells a call that arrives while the connector waits to close that it waits for the running call', async () => {
+    const { old, later, first } = await reconnecting();
+    const closing = old.registry.evictClient('acme', 'explicit');
+    const seen: Seen[] = [];
+    const second = old.registry.callTool('acme', 'write', { label: 'second' }, { kind: 'standalone', onprogress: progress => { seen.push(progress); } });
+    await vi.waitFor(() => expect(seen).not.toHaveLength(0));
+    expect(seen[0]._meta?.[CONNECTOR_WAIT_META]).toEqual({ version: 1, phase: 'queued', name: 'Acme' });
+    old.release();
+    await first;
+    await closing;
+    expect(await second).toMatchObject({ content: [{ text: 'second' }] });
+    expect(later()).toEqual(['second']);
+    expect(phase(seen.at(-1)!)).toBe('admitted');
+    rises(seen);
   });
 });

@@ -13,6 +13,8 @@ import {
   type TransientConnectFailureClass,
 } from "./types.js";
 import { getLogger } from "./logging.js";
+import { SharedWait } from "./clients/requestQueueProgress.js";
+import type { ChildToolCallContext } from "./fileReadProtocol.js";
 import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 const logger = getLogger();
@@ -101,7 +103,7 @@ interface InFlightRefresh {
 interface CatalogRegistrySeam {
   connectForCatalog?(
     packageId: string,
-    options?: { forceReconnect?: boolean },
+    options?: { forceReconnect?: boolean; waiting?: ChildToolCallContext },
   ): Promise<ConnectOutcome>;
   subscribeLifecycle?(
     listener: (event: RegistryLifecycleEvent) => void,
@@ -138,6 +140,8 @@ export class CatalogRefresher {
   private readonly random: () => number;
   private readonly queue = new Map<string, QueuedRefresh>();
   private readonly inFlight = new Map<string, InFlightRefresh>();
+  /** Per connector, the callers waiting on its refreshes, told while a refresh or probe in its slot waits behind the connector's running calls. */
+  private readonly waits = new Map<string, SharedWait>();
   private activeCount = 0;
   private started = false;
   private disposed = false;
@@ -217,6 +221,17 @@ export class CatalogRefresher {
     request: CatalogRefreshRequest = { reason: "passive" },
   ): Promise<void> {
     if (this.disposed || !this.registry.getPackage(packageId)) return Promise.resolve();
+    const refreshed = this.startRefreshNow(packageId, request);
+    return request.waiting ? this.sharedWait(packageId).during(request.waiting, refreshed) : refreshed;
+  }
+
+  private sharedWait(packageId: string): SharedWait {
+    let wait = this.waits.get(packageId);
+    if (!wait) this.waits.set(packageId, wait = new SharedWait());
+    return wait;
+  }
+
+  private startRefreshNow(packageId: string, request: CatalogRefreshRequest): Promise<void> {
     const forceByIntent = request.reason === "authentication" ||
       request.reason === "restart" ||
       request.reason === "configuration";
@@ -275,6 +290,7 @@ export class CatalogRefresher {
       const handOver = this.inFlight.get(packageId)?.eventDuringProbe === true && answer?.status !== "ready" &&
         this.catalog.getPackageStatus(packageId) === "ready";
       this.inFlight.delete(packageId);
+      this.waits.get(packageId)?.ended();
       // After the delete: notify("registry") does nothing while the slot is held.
       if (handOver) this.notify(packageId, "registry");
       this.updateReadiness();
@@ -318,8 +334,9 @@ export class CatalogRefresher {
     isCurrent: () => boolean,
   ): Promise<PackageProbeAnswer> {
     const superseded: PackageProbeAnswer = { status: "not_ready", reason: "superseded" };
+    const waiting = this.sharedWait(packageId).begin();
     for (let attempt = 0; ; attempt++) {
-      const outcome = await this.registry.connectForCatalog(packageId, { forProbe: true });
+      const outcome = await this.registry.connectForCatalog(packageId, { forProbe: true, waiting });
       if (!isCurrent()) return superseded;
       if (outcome.kind === "transient_failure") {
         return { status: "not_ready", reason: outcome.error instanceof ProbeBusyError ? "client_busy" : "connect_failed" };
@@ -330,7 +347,7 @@ export class CatalogRefresher {
       }
       let tools: unknown[];
       try {
-        tools = await outcome.client.listTools();
+        tools = await outcome.client.listTools(waiting);
       } catch (error) {
         if (!isCurrent()) return superseded;
         // The home's session 404 is answered before anything runs: replace that client and list once more.
@@ -489,6 +506,7 @@ export class CatalogRefresher {
         .finally(() => {
           this.activeCount -= 1;
           this.inFlight.delete(packageId);
+          this.waits.get(packageId)?.ended();
           for (const resolve of refresh.waiters) resolve();
           this.updateReadiness();
           this.armWakeTimer();
@@ -550,11 +568,12 @@ export class CatalogRefresher {
     generation: number,
     isCurrent: () => boolean,
   ): Promise<void> {
-    const outcome = await this.connect(packageId, refresh.forceReconnect);
+    const waiting = this.sharedWait(packageId).begin();
+    const outcome = await this.connect(packageId, refresh.forceReconnect, waiting);
     if (!isCurrent()) return;
 
     if (outcome.kind === "connected") {
-      const tools = await outcome.client.listTools();
+      const tools = await outcome.client.listTools(waiting);
       if (!isCurrent()) return;
       this.catalog.commitReady(packageId, tools, generation);
       // Awaited, so the discovery concurrency also caps how many servers it keeps running.
@@ -609,10 +628,10 @@ export class CatalogRefresher {
     );
   }
 
-  private async connect(packageId: string, forceReconnect: boolean): Promise<ConnectOutcome> {
+  private async connect(packageId: string, forceReconnect: boolean, waiting: ChildToolCallContext): Promise<ConnectOutcome> {
     const seam = this.registry as PackageRegistry & CatalogRegistrySeam;
     if (seam.connectForCatalog) {
-      return seam.connectForCatalog(packageId, { forceReconnect });
+      return seam.connectForCatalog(packageId, { forceReconnect, waiting });
     }
 
     const setupReason = this.registry.setupBlockReason(packageId);
@@ -620,8 +639,8 @@ export class CatalogRefresher {
       return { kind: "setup_incomplete", reason: setupReason };
     }
     try {
-      const client = await this.registry.getClient(packageId);
-      const health = await client.healthCheck?.();
+      const client = await this.registry.getClient(packageId, false, waiting);
+      const health = await client.healthCheck?.(waiting);
       if (health === "needs_auth") {
         return {
           kind: "auth_required",

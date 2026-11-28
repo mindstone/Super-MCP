@@ -286,6 +286,65 @@ describe("probe_package_home", () => {
     expect(catalog.getPackageTools(ID).map((entry) => entry.tool.name)).toEqual(["read_item"]);
   });
 
+  it("a call waiting behind a probe hears the live probe's wait, never a timed-out probe's late notices", async () => {
+    vi.useFakeTimers();
+    const listed = [deferred<unknown[]>(), deferred<unknown[]>()];
+    const entered = [deferred<void>(), deferred<void>()];
+    type Context = NonNullable<Parameters<McpClient['listTools']>[0]>;
+    const contexts: Context[] = [];
+    const notice = (phase: 'queued' | 'admitted') => ({
+      progress: 1,
+      _meta: { 'com.mindstone/connectorWait': { version: 1, phase, name: 'Acme' } },
+    });
+    const client = mockClient({ listTools: vi.fn(async waiting => {
+      const i = contexts.push(waiting!) - 1;
+      await waiting!.onprogress!(notice('queued'));
+      entered[i].resolve();
+      return listed[i].promise;
+    }) });
+    const { refresher } = setup([client], { refreshTimeoutMs: 1_000 });
+    const expired = refresher.probeNow(ID);
+    await entered[0].promise;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await expired).toEqual({ status: 'not_ready', reason: 'timed_out' });
+    const stop = new AbortController();
+    const aborted = refresher.probeNow(ID, { signal: stop.signal });
+    await entered[1].promise;
+    const live = refresher.probeNow(ID);
+    stop.abort();
+    expect(await aborted).toEqual({ status: 'not_ready', reason: 'timed_out' });
+    const seen: string[] = [];
+    const waiting: Context = { readMode: 'unnegotiated', onprogress: p => {
+      seen.push((p._meta!['com.mindstone/connectorWait'] as { phase: string }).phase);
+    } };
+    const forced = refresher.refreshNow(ID, { forceReconnect: true, waiting });
+    try {
+      expect(seen).toEqual(['queued']);
+      await contexts[0].onprogress!(notice('admitted'));
+      await contexts[0].onprogress!(notice('queued'));
+      expect(seen).toEqual(['queued']);
+      const late: string[] = [];
+      const joined = refresher.refreshNow(ID, { forceReconnect: true, waiting: {
+        ...waiting, onprogress: p => {
+          late.push((p._meta!['com.mindstone/connectorWait'] as { phase: string }).phase);
+        },
+      } });
+      expect(late).toEqual(['queued']);
+      await contexts[1].onprogress!(notice('queued'));
+      expect(seen).toEqual(['queued', 'queued']);
+      listed[1].resolve([tool]);
+      expect(await live).toMatchObject({ status: 'ready' });
+      await contexts[1].onprogress!(notice('queued'));
+      expect(seen).toEqual(['queued', 'queued']);
+      await refresher.dispose();
+      await joined;
+    } finally {
+      listed.forEach(item => item.resolve([tool]));
+      await refresher.dispose();
+      await forced;
+    }
+  });
+
   it("failed probes write nothing: the retry schedule stays the ordinary refresh's, and a ready entry does not make a failed listing ready", async () => {
     const client = mockClient();
     const now = 1_000_000;
@@ -323,7 +382,7 @@ describe("probe_package_home", () => {
     expect(catalog.getPackageStatus(ID)).toBe("auth_required");
     const connect = vi.spyOn(registry, "connectForCatalog");
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(connect).toHaveBeenCalledWith(ID, { forceReconnect: true });
+    expect(connect).toHaveBeenCalledWith(ID, expect.objectContaining({ forceReconnect: true }));
   });
 
   it("a local connector is refused, and nothing is constructed", async () => {
